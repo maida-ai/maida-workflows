@@ -22,6 +22,7 @@ PUBLIC_MODULES = (
     "maida.workflows.fixture",
     "maida.workflows.ir",
     "maida.workflows.interactions",
+    "maida.workflows.interop",
     "maida.workflows.models",
     "maida.workflows.model",
     "maida.workflows.materialization",

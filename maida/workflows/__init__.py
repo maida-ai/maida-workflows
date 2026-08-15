@@ -70,6 +70,17 @@ from .dynamic import (
 )
 from .fixture import GeneratedPlanRecord, ReplayFixture, ReplayFixtureError, ReplayFixtureImporter
 from .interactions import Approval, ApprovalDecision, Input, WaitForSignal
+from .interop import (
+    ExternalTraceImporter,
+    ExternalWorkflow,
+    ExternalWorkflowImporter,
+    ExternalWorkflowProvider,
+    InteropConnectorAdapter,
+    InteropFidelity,
+    InteropUnsupportedError,
+    VerificationSurface,
+    WorkflowInterop,
+)
 from .ir import (
     BindingIR,
     CompileError,
@@ -192,12 +203,19 @@ __all__ = [
     "ExecutionSpec",
     "Executor",
     "ExecutorCapabilities",
+    "ExternalTraceImporter",
+    "ExternalWorkflow",
+    "ExternalWorkflowImporter",
+    "ExternalWorkflowProvider",
     "GeneratedPlanRecord",
     "Idempotency",
     "Input",
     "InputCommand",
     "InteractionKind",
     "InteractionRequest",
+    "InteropConnectorAdapter",
+    "InteropFidelity",
+    "InteropUnsupportedError",
     "LocalExecutor",
     "MaterializedPlan",
     "ModelAdapter",
@@ -252,6 +270,7 @@ __all__ = [
     "UserplaneASGI",
     "ValidationIssue",
     "VerificationSuite",
+    "VerificationSurface",
     "WaitForSignal",
     "Workflow",
     "WorkflowBundle",
@@ -261,6 +280,7 @@ __all__ = [
     "WorkflowCompilation",
     "WorkflowCoordinator",
     "WorkflowExplanation",
+    "WorkflowInterop",
     "WorkflowPortability",
     "WorkflowRun",
     "WorkflowRunner",
