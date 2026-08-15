@@ -15,15 +15,47 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, cast
 
-from ._canonical import digest_data, schema_digest, value_matches_type
+from ._canonical import _rehydrate_value, digest_data, schema_digest, value_matches_type
 from .authoring import ExecutionContext, Module
-from .models import CapabilityGrant as CapabilityGrant
+from .models import (
+    CapabilityGrant as CapabilityGrant,
+)
+from .models import (
+    StoredValue,
+    _EffectOperation,
+    _EffectOperationConflict,
+    _EffectOperationStatus,
+)
 
 _NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
+_BROKER_AUDIT_EVENT_TYPES = frozenset(
+    {
+        "CAPABILITY_AUTHORIZED",
+        "CAPABILITY_DENIED",
+        "CAPABILITY_FAILED",
+        "CAPABILITY_USED",
+        "EFFECT_DENIED",
+        "EFFECT_FAILED",
+    }
+)
 
 
 class AccessContractError(RuntimeError):
-    """Raised when supported external access lacks a valid runtime broker."""
+    """Raised when supported external access cannot proceed safely.
+
+    Parameters
+    ----------
+    message
+        Credential-free diagnostic suitable for durable attempt history.
+    retryable
+        Whether a fresh physical task attempt may safely retry the operation.
+        Contract, grant, policy, approval, and idempotency denials default to
+        non-retryable; transient adapter failures opt in explicitly.
+    """
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class Idempotency(StrEnum):
@@ -32,6 +64,35 @@ class Idempotency(StrEnum):
     NONE = "none"
     OPTIONAL = "optional"
     REQUIRED = "required"
+
+
+@dataclass(frozen=True)
+class ApprovalEvidence:
+    """Reference one durable approval command for an exact effect request.
+
+    Policies may return this value with an allow decision, but the reference is
+    not trusted on its own. The durable effect store verifies that the same run
+    and task contain a matching ``APPROVAL_REQUIRED`` request and later
+    approving ``APPROVAL_RESOLVED`` event before the adapter is invoked.
+
+    Parameters
+    ----------
+    request_id
+        Stable interaction request identity whose metadata binds the effect
+        name, logical ordinal, and request digest.
+    command_id
+        Idempotency identity of the command that approved that request.
+    """
+
+    request_id: str
+    command_id: str
+
+    def __post_init__(self) -> None:
+        """Reject empty durable event references."""
+        if not isinstance(self.request_id, str) or not self.request_id.strip():
+            raise ValueError("approval request_id must be non-empty")
+        if not isinstance(self.command_id, str) or not self.command_id.strip():
+            raise ValueError("approval command_id must be non-empty")
 
 
 @dataclass(frozen=True)
@@ -50,23 +111,36 @@ class PolicyDecision:
         Stable identity of the policy implementation or configuration.
     reason_code
         Stable machine-readable explanation suitable for audit records.
+    approval
+        Optional durable approval reference. The broker's store validates the
+        referenced request and resolution transactionally before an
+        approval-required effect is attempted. Read authorization ignores it.
     """
 
     allowed: bool
     policy_id: str
     reason_code: str
+    approval: ApprovalEvidence | None = None
 
     def __post_init__(self) -> None:
         """Validate that the decision is safe for canonical audit storage."""
         if type(self.allowed) is not bool:
             raise ValueError("allowed must be a boolean")
+        if self.approval is not None and not isinstance(self.approval, ApprovalEvidence):
+            raise ValueError("approval must be ApprovalEvidence when supplied")
         _validate_identity("policy_id", self.policy_id)
         _validate_identity("reason_code", self.reason_code)
 
     @classmethod
-    def allow(cls, policy_id: str = "default", reason_code: str = "allowed") -> PolicyDecision:
-        """Construct a stable decision permitting an already-granted request."""
-        return cls(True, policy_id, reason_code)
+    def allow(
+        cls,
+        policy_id: str = "default",
+        reason_code: str = "allowed",
+        *,
+        approval: ApprovalEvidence | None = None,
+    ) -> PolicyDecision:
+        """Permit granted access and optionally reference durable approval."""
+        return cls(True, policy_id, reason_code, approval)
 
     @classmethod
     def deny(cls, policy_id: str, reason_code: str) -> PolicyDecision:
@@ -174,16 +248,18 @@ class Capability[RequestT, ResponseT]:
 
 
 class AccessPolicy(Protocol):
-    """Deployment policy that may narrow a compiled task capability grant.
+    """Deployment policy that may narrow a compiled task access grant.
 
     The broker invokes policy only after declaration and grant checks succeed.
-    Returning an allow decision therefore cannot introduce a capability that
-    the workflow definition did not declare or the task was not granted.
+    Returning an allow decision therefore cannot introduce a capability or
+    effect that the workflow definition did not declare or the task was not
+    granted. Approval-required effects additionally require an explicit
+    :class:`ApprovalEvidence` reference that the durable store verifies.
     """
 
     async def authorize(
         self,
-        capability: Capability[Any, Any],
+        access: Capability[Any, Any] | EffectSpec[Any, Any],
         request: Any,
         *,
         grant: CapabilityGrant,
@@ -191,13 +267,13 @@ class AccessPolicy(Protocol):
         task_id: str,
         attempt_id: str,
     ) -> PolicyDecision:
-        """Decide whether one already-granted typed read may proceed.
+        """Decide whether one already-granted typed access may proceed.
 
         Parameters
         ----------
-        capability
-            Exact compiled capability selected by connector, operation, and
-            optional connector version.
+        access
+            Exact compiled capability or effect selected by connector,
+            operation, and optional connector version.
         request
             Typed request available for deployment-specific policy checks. It
             is not included in the broker's audit record.
@@ -229,7 +305,9 @@ class ConnectorAdapter(Protocol):
     connector_version
         Optional exact immutable adapter or configuration identity.
     operations
-        Stable operation names this adapter can execute.
+        Stable read operation names this adapter can execute. Implement
+        :class:`EffectAdapter` as well when one object supplies both access
+        categories.
     """
 
     @property
@@ -252,22 +330,77 @@ class ConnectorAdapter(Protocol):
         ...
 
 
+class EffectAdapter(Protocol):
+    """Provider-neutral implementation of consequential external operations.
+
+    An effect adapter receives a stable idempotency key for every logical
+    operation. Adapters declaring an operation in ``idempotent_effects`` must
+    forward that key to a destination that guarantees repeated calls with the
+    same key do not repeat the external action. Credentials and provider
+    clients remain private adapter state and are never serialized.
+
+    Attributes
+    ----------
+    connector
+        Stable deployment registry identity matching an effect declaration.
+    connector_version
+        Optional exact immutable adapter or configuration identity.
+    effect_operations
+        Stable consequential operation names implemented by the adapter.
+    idempotent_effects
+        Subset of ``effect_operations`` for which the destination honors the
+        supplied stable idempotency key.
+    """
+
+    @property
+    def connector(self) -> str:
+        """Return the stable connector registry identity."""
+        ...
+
+    @property
+    def connector_version(self) -> str | None:
+        """Return the exact adapter version, or ``None`` when unversioned."""
+        ...
+
+    @property
+    def effect_operations(self) -> frozenset[str]:
+        """Return the stable consequential operations this adapter implements."""
+        ...
+
+    @property
+    def idempotent_effects(self) -> frozenset[str]:
+        """Return operations whose destinations honor the supplied stable key."""
+        ...
+
+    async def effect(
+        self,
+        operation: str,
+        request: Any,
+        *,
+        idempotency_key: str,
+    ) -> Any:
+        """Execute one typed effect using the broker's stable logical key."""
+        ...
+
+
 class ConnectorRegistry:
-    """Resolve read adapters by exact connector, operation, and version.
+    """Resolve read and effect adapters by exact operation identity.
 
     Parameters
     ----------
     adapters
-        Optional initial adapters. Duplicate resolution keys are rejected so
-        deployments cannot depend on registration order.
+        Optional initial read, effect, or combined adapters. Duplicate
+        resolution keys are rejected so deployments cannot depend on
+        registration order.
     """
 
-    def __init__(self, adapters: Iterable[ConnectorAdapter] = ()) -> None:
+    def __init__(self, adapters: Iterable[ConnectorAdapter | EffectAdapter] = ()) -> None:
         self._adapters: dict[tuple[str, str, str | None], ConnectorAdapter] = {}
+        self._effect_adapters: dict[tuple[str, str, str | None], EffectAdapter] = {}
         for adapter in adapters:
             self.register(adapter)
 
-    def register(self, adapter: ConnectorAdapter) -> None:
+    def register(self, adapter: ConnectorAdapter | EffectAdapter) -> None:
         """Register an adapter without exposing its client or credentials.
 
         Raises
@@ -278,24 +411,42 @@ class ConnectorRegistry:
         """
         connector = getattr(adapter, "connector", None)
         version = getattr(adapter, "connector_version", None)
-        raw_operations = getattr(adapter, "operations", None)
+        raw_operations: Any = getattr(adapter, "operations", frozenset())
+        raw_effect_operations: Any = getattr(adapter, "effect_operations", frozenset())
+        raw_idempotent_effects: Any = getattr(adapter, "idempotent_effects", frozenset())
         if not isinstance(connector, str):
             raise ValueError("adapter connector must be a stable name")
         _validate_identity("adapter connector", connector)
         if version is not None and (not isinstance(version, str) or not version.strip()):
             raise ValueError("adapter connector_version must be non-empty when supplied")
-        if not isinstance(raw_operations, frozenset) or not raw_operations:
-            raise ValueError("adapter operations must be a non-empty frozenset")
+        if not isinstance(raw_operations, frozenset) or not isinstance(
+            raw_effect_operations, frozenset
+        ):
+            raise ValueError("adapter read and effect operations must be frozensets")
+        if not raw_operations and not raw_effect_operations:
+            raise ValueError("adapter must declare at least one read or effect operation")
+        if not isinstance(raw_idempotent_effects, frozenset):
+            raise ValueError("adapter idempotent_effects must be a frozenset")
+        if not raw_idempotent_effects.issubset(raw_effect_operations):
+            raise ValueError("adapter idempotent_effects must be declared effect operations")
         operations = tuple(sorted(raw_operations))
-        for operation in operations:
+        effect_operations = tuple(sorted(raw_effect_operations))
+        for operation in (*operations, *effect_operations):
             if not isinstance(operation, str):
                 raise ValueError("adapter operations must contain stable names")
             _validate_identity("adapter operation", operation)
         keys = tuple((connector, operation, version) for operation in operations)
+        effect_keys = tuple((connector, operation, version) for operation in effect_operations)
         if any(key in self._adapters for key in keys):
             raise ValueError("an adapter is already registered for this exact access key")
+        if any(key in self._effect_adapters for key in effect_keys):
+            raise ValueError("an adapter is already registered for this exact effect key")
+        if effect_keys and not callable(getattr(adapter, "effect", None)):
+            raise ValueError("an effect-capable adapter must provide async effect()")
         for key in keys:
-            self._adapters[key] = adapter
+            self._adapters[key] = cast(ConnectorAdapter, adapter)
+        for key in effect_keys:
+            self._effect_adapters[key] = cast(EffectAdapter, adapter)
 
     def resolve(
         self,
@@ -322,23 +473,110 @@ class ConnectorRegistry:
             )
         return adapter
 
+    def resolve_effect(
+        self,
+        connector: str,
+        operation: str,
+        *,
+        connector_version: str | None = None,
+    ) -> EffectAdapter:
+        """Return the adapter registered for one exact effect identity.
+
+        Raises
+        ------
+        AccessContractError
+            If no effect adapter is registered for the exact connector,
+            operation, and optional version.
+        """
+        adapter = self._effect_adapters.get((connector, operation, connector_version))
+        if adapter is None:
+            raise AccessContractError(
+                f"effect operation {connector}.{operation} at the requested version "
+                "is not registered"
+            )
+        return adapter
+
+    def effect_is_idempotent(self, adapter: EffectAdapter, operation: str) -> bool:
+        """Return whether an adapter guarantees idempotency for an effect."""
+        declared: Any = getattr(adapter, "idempotent_effects", frozenset())
+        return isinstance(declared, frozenset) and operation in declared
+
+
+class _EffectOperations(Protocol):
+    values: Any
+
+    def _lookup_effect(
+        self,
+        claim: Any,
+        *,
+        effect_name: str,
+        ordinal: int,
+        connector: str,
+        operation: str,
+        connector_version: str | None,
+        idempotency_requirement: str,
+        request_digest: str,
+        result_schema_digest: str,
+    ) -> _EffectOperation | None: ...
+
+    def _reserve_effect(
+        self,
+        claim: Any,
+        *,
+        effect_name: str,
+        ordinal: int,
+        connector: str,
+        operation: str,
+        connector_version: str | None,
+        idempotency_requirement: str,
+        adapter_idempotent: bool,
+        request_digest: str,
+        result_schema_digest: str,
+    ) -> _EffectOperation: ...
+
+    def _mark_effect_attempted(
+        self,
+        claim: Any,
+        operation: _EffectOperation,
+        *,
+        policy_id: str,
+        reason_code: str,
+        approval_required: bool,
+        approval_request_id: str | None,
+        approval_command_id: str | None,
+    ) -> _EffectOperation: ...
+
+    def _commit_effect(
+        self,
+        claim: Any,
+        operation: _EffectOperation,
+        result: StoredValue,
+        *,
+        latency_ms: float,
+    ) -> _EffectOperation: ...
+
 
 class AccessBroker:
-    """Attempt-scoped enforcement point for declared read capabilities.
+    """Attempt-scoped enforcement point for declared reads and effects.
 
     A broker is bound to one durable task attempt and one module definition. It
     checks the compiled declaration, persisted grant, optional narrowing
     policy, exact adapter registration, and request/response contracts around
-    every read. Audit callbacks receive only stable metadata and content
-    digests; request values, response values, credentials, and provider errors
-    are never included.
+    every read. Effects additionally use a durable logical-operation ledger,
+    stable destination idempotency keys, and lease-checked commits. Audit
+    records contain only stable metadata and content digests; request values,
+    response values, credentials, and provider errors are never included.
 
     Parameters
     ----------
     registry
-        Deployment registry containing provider-neutral read adapters.
+        Deployment registry containing provider-neutral read and effect
+        adapters.
     declarations
         Exact capability declarations compiled for the current module.
+    effects
+        Exact effect declarations compiled for the current module. The worker
+        supplies durable effect storage and the active claim internally.
     grant
         Persisted task grant derived from the compiled workflow step.
     run_id, task_id, attempt_id
@@ -348,7 +586,9 @@ class AccessBroker:
     policy
         Optional deployment policy that may deny, but never add, access.
     audit
-        Optional callback receiving ``(event_type, safe_payload)``.
+        Optional callback receiving allowlisted access diagnostics as
+        ``(event_type, safe_payload)``. Control-plane and command events cannot
+        be emitted through this callback.
     metadata
         Optional module metadata mapping. Successful reads append a canonical
         capability trajectory for accepted boundary history and replay.
@@ -359,6 +599,7 @@ class AccessBroker:
         registry: ConnectorRegistry,
         *,
         declarations: Iterable[Capability[Any, Any]],
+        effects: Iterable[EffectSpec[Any, Any]] = (),
         grant: CapabilityGrant,
         run_id: str,
         task_id: str,
@@ -368,6 +609,8 @@ class AccessBroker:
         policy: AccessPolicy | None = None,
         audit: Callable[[str, dict[str, Any]], None] | None = None,
         metadata: dict[str, Any] | None = None,
+        _effect_operations: _EffectOperations | None = None,
+        _claim: Any = None,
     ) -> None:
         declared = tuple(declarations)
         if any(not isinstance(item, Capability) for item in declared):
@@ -384,8 +627,24 @@ class AccessBroker:
             )
         if not set(grant.capabilities).issubset(names):
             raise AccessContractError("task capability grant exceeds compiled module declarations")
+        declared_effects = tuple(effects)
+        if any(not isinstance(item, EffectSpec) for item in declared_effects):
+            raise AccessContractError("access broker effects must contain EffectSpec values")
+        effect_names = tuple(item.name for item in declared_effects)
+        if len(set(effect_names)) != len(effect_names):
+            raise AccessContractError("access broker effect names must be unique")
+        effect_endpoints = tuple(
+            (item.connector, item.operation, item.connector_version) for item in declared_effects
+        )
+        if len(set(effect_endpoints)) != len(effect_endpoints):
+            raise AccessContractError(
+                "access broker effects cannot ambiguously share an exact endpoint"
+            )
+        if not set(grant.effects).issubset(effect_names):
+            raise AccessContractError("task effect grant exceeds compiled module declarations")
         self.registry = registry
         self.declarations = declared
+        self.effect_declarations = declared_effects
         self.grant = grant
         self.run_id = run_id
         self.task_id = task_id
@@ -393,8 +652,13 @@ class AccessBroker:
         self.module_id = module_id
         self.logical_step = logical_step
         self.policy = policy
-        self.audit = audit
+        self._audit = audit
         self.metadata = metadata if metadata is not None else {}
+        self._effect_operations = _effect_operations
+        self._claim = _claim
+        self._effect_ordinals: dict[str, int] = {}
+        self._effect_called = False
+        self._effect_records: list[dict[str, Any]] = []
         self._records: list[dict[str, Any]] = []
 
     @property
@@ -542,7 +806,7 @@ class AccessBroker:
                 "CAPABILITY_FAILED",
                 {**authorized, "reason_code": "adapter-error"},
             )
-            raise AccessContractError("connector adapter read failed") from None
+            raise AccessContractError("connector adapter read failed", retryable=True) from None
         latency_ms = (time.perf_counter() - started) * 1000
         if not value_matches_type(response, capability.output_type):
             self._emit(
@@ -591,6 +855,481 @@ class AccessBroker:
         )
         return response
 
+    async def effect(
+        self,
+        connector: str,
+        operation: str,
+        request: Any,
+        *,
+        connector_version: str | None = None,
+    ) -> Any:
+        """Authorize and durably commit one exact typed external effect.
+
+        The logical identity is the current task, effect declaration name, and
+        deterministic per-name invocation ordinal. Retries reuse the ledger's
+        destination idempotency key. A previously committed result is decoded
+        and returned without invoking the adapter again.
+
+        Parameters
+        ----------
+        connector, operation, connector_version
+            Exact identity of the compiled effect and registered adapter.
+        request
+            Value validated and content-digested before reservation.
+
+        Returns
+        -------
+        Any
+            Newly committed or previously stored typed effect result.
+
+        Raises
+        ------
+        AccessContractError
+            If declaration, grant, policy, approval, adapter idempotency,
+            request/response contracts, or durable identity validation fails.
+
+        Notes
+        -----
+        A previously committed logical result is recovery state, not a new
+        external access attempt. After declaration, grant, request, and durable
+        identity checks, it is restored without consulting a live adapter or
+        re-running deployment policy.
+        """
+        self._effect_called = True
+        matches = tuple(
+            effect
+            for effect in self.effect_declarations
+            if effect.connector == connector
+            and effect.operation == operation
+            and effect.connector_version == connector_version
+        )
+        if len(matches) != 1:
+            self._emit(
+                "EFFECT_DENIED",
+                self._effect_payload(
+                    connector=connector,
+                    operation=operation,
+                    connector_version=connector_version,
+                    reason_code="not-declared",
+                ),
+            )
+            raise AccessContractError("external effect is not declared exactly once by the module")
+        effect = matches[0]
+        if not self.grant.allows_effect(effect.name):
+            self._emit(
+                "EFFECT_DENIED",
+                self._effect_payload(effect=effect, reason_code="not-granted"),
+            )
+            raise AccessContractError(f"task grant denies effect {effect.name}")
+        if not value_matches_type(request, effect.input_type):
+            self._emit(
+                "EFFECT_DENIED",
+                self._effect_payload(effect=effect, reason_code="request-contract"),
+            )
+            raise AccessContractError("effect request violates the declared request contract")
+        try:
+            request_digest = digest_data(request)
+        except Exception as exc:
+            self._emit(
+                "EFFECT_DENIED",
+                self._effect_payload(effect=effect, reason_code="request-not-canonical"),
+            )
+            raise AccessContractError("effect request is not canonically digestible") from exc
+
+        if self._effect_operations is None or self._claim is None:
+            self._emit(
+                "EFFECT_DENIED",
+                self._effect_payload(
+                    effect=effect,
+                    request_digest=request_digest,
+                    reason_code="durability-unavailable",
+                ),
+            )
+            raise AccessContractError("effect execution requires durable worker state")
+        ordinal = self._effect_ordinals.get(effect.name, 0)
+        self._effect_ordinals[effect.name] = ordinal + 1
+        try:
+            existing = self._effect_operations._lookup_effect(
+                self._claim,
+                effect_name=effect.name,
+                ordinal=ordinal,
+                connector=connector,
+                operation=operation,
+                connector_version=connector_version,
+                idempotency_requirement=effect.idempotency.value,
+                request_digest=request_digest,
+                result_schema_digest=effect.output_schema_digest,
+            )
+        except _EffectOperationConflict as exc:
+            self._emit(
+                "EFFECT_DENIED",
+                self._effect_payload(
+                    effect=effect,
+                    ordinal=ordinal,
+                    request_digest=request_digest,
+                    reason_code="identity-conflict",
+                ),
+            )
+            raise AccessContractError(str(exc)) from None
+        if existing is not None and existing.status is _EffectOperationStatus.COMMITTED:
+            response = self._load_effect_result(effect, existing)
+            self._record_effect_attempt(effect, existing)
+            self._record_effect_commit(effect, existing)
+            return response
+
+        decision = PolicyDecision.allow()
+        if self.policy is not None:
+            try:
+                decision = await self.policy.authorize(
+                    effect,
+                    request,
+                    grant=self.grant,
+                    run_id=self.run_id,
+                    task_id=self.task_id,
+                    attempt_id=self.attempt_id,
+                )
+            except Exception:
+                self._emit(
+                    "EFFECT_DENIED",
+                    self._effect_payload(
+                        effect=effect,
+                        request_digest=request_digest,
+                        policy_id="policy-error",
+                        reason_code="policy-error",
+                    ),
+                )
+                raise AccessContractError("effect access policy evaluation failed") from None
+            if not isinstance(decision, PolicyDecision):
+                self._emit(
+                    "EFFECT_DENIED",
+                    self._effect_payload(
+                        effect=effect,
+                        request_digest=request_digest,
+                        policy_id="policy-error",
+                        reason_code="invalid-decision",
+                    ),
+                )
+                raise AccessContractError("effect access policy returned an invalid decision")
+        if not decision.allowed:
+            self._emit(
+                "EFFECT_DENIED",
+                self._effect_payload(
+                    effect=effect,
+                    request_digest=request_digest,
+                    policy_id=decision.policy_id,
+                    reason_code=decision.reason_code,
+                ),
+            )
+            raise AccessContractError(f"access policy denied effect {effect.name}")
+        if effect.approval_required and decision.approval is None:
+            self._emit(
+                "EFFECT_DENIED",
+                self._effect_payload(
+                    effect=effect,
+                    request_digest=request_digest,
+                    policy_id=decision.policy_id,
+                    reason_code="approval-required",
+                ),
+            )
+            raise AccessContractError(f"effect {effect.name} requires durable approval")
+
+        try:
+            adapter = self.registry.resolve_effect(
+                connector,
+                operation,
+                connector_version=connector_version,
+            )
+        except AccessContractError:
+            self._emit(
+                "EFFECT_DENIED",
+                self._effect_payload(
+                    effect=effect,
+                    request_digest=request_digest,
+                    policy_id=decision.policy_id,
+                    reason_code="adapter-not-registered",
+                ),
+            )
+            raise
+        adapter_idempotent = self.registry.effect_is_idempotent(adapter, operation)
+        if effect.idempotency is Idempotency.REQUIRED and not adapter_idempotent:
+            self._emit(
+                "EFFECT_DENIED",
+                self._effect_payload(
+                    effect=effect,
+                    request_digest=request_digest,
+                    policy_id=decision.policy_id,
+                    reason_code="idempotency-required",
+                ),
+            )
+            raise AccessContractError(f"effect {effect.name} requires adapter idempotency support")
+        try:
+            reserved = self._effect_operations._reserve_effect(
+                self._claim,
+                effect_name=effect.name,
+                ordinal=ordinal,
+                connector=connector,
+                operation=operation,
+                connector_version=connector_version,
+                idempotency_requirement=effect.idempotency.value,
+                adapter_idempotent=adapter_idempotent,
+                request_digest=request_digest,
+                result_schema_digest=effect.output_schema_digest,
+            )
+        except _EffectOperationConflict as exc:
+            self._emit(
+                "EFFECT_DENIED",
+                self._effect_payload(
+                    effect=effect,
+                    ordinal=ordinal,
+                    request_digest=request_digest,
+                    policy_id=decision.policy_id,
+                    reason_code="identity-conflict",
+                ),
+            )
+            raise AccessContractError(str(exc)) from None
+
+        if reserved.status is _EffectOperationStatus.COMMITTED:  # pragma: no cover - lookup owns it
+            response = self._load_effect_result(effect, reserved)
+            self._record_effect_attempt(effect, reserved)
+            self._record_effect_commit(effect, reserved)
+            return response
+        if reserved.status is _EffectOperationStatus.ATTEMPTED and not adapter_idempotent:
+            self._emit(
+                "EFFECT_DENIED",
+                self._effect_payload(
+                    effect=effect,
+                    ordinal=ordinal,
+                    request_digest=request_digest,
+                    policy_id=decision.policy_id,
+                    reason_code="unsafe-retry",
+                ),
+            )
+            raise AccessContractError(
+                f"effect {effect.name} unsafe retry denied because the adapter is not idempotent"
+            )
+
+        try:
+            attempted = self._effect_operations._mark_effect_attempted(
+                self._claim,
+                reserved,
+                policy_id=decision.policy_id,
+                reason_code=decision.reason_code,
+                approval_required=effect.approval_required,
+                approval_request_id=(
+                    decision.approval.request_id if decision.approval is not None else None
+                ),
+                approval_command_id=(
+                    decision.approval.command_id if decision.approval is not None else None
+                ),
+            )
+        except _EffectOperationConflict as exc:
+            self._emit(
+                "EFFECT_DENIED",
+                self._effect_payload(
+                    effect=effect,
+                    ordinal=ordinal,
+                    request_digest=request_digest,
+                    policy_id=decision.policy_id,
+                    reason_code="approval-evidence-invalid",
+                ),
+            )
+            raise AccessContractError(str(exc)) from None
+        attempted_payload = self._effect_payload(
+            effect=effect,
+            ordinal=ordinal,
+            request_digest=request_digest,
+            policy_id=decision.policy_id,
+            reason_code=decision.reason_code,
+            idempotency_key=attempted.idempotency_key,
+            adapter_idempotent=adapter_idempotent,
+            approval_request_id=(
+                decision.approval.request_id if decision.approval is not None else None
+            ),
+            approval_command_id=(
+                decision.approval.command_id if decision.approval is not None else None
+            ),
+        )
+        self._remember("EFFECT_ATTEMPTED", attempted_payload)
+        self._record_effect_attempt(effect, attempted)
+        started = time.perf_counter()
+        try:
+            response = await adapter.effect(
+                operation,
+                request,
+                idempotency_key=attempted.idempotency_key,
+            )
+        except Exception:
+            latency_ms = (time.perf_counter() - started) * 1000
+            self._emit(
+                "EFFECT_FAILED",
+                {
+                    **attempted_payload,
+                    "reason_code": "adapter-error",
+                    "latency_ms": latency_ms,
+                },
+            )
+            raise AccessContractError("effect adapter call failed", retryable=True) from None
+        latency_ms = (time.perf_counter() - started) * 1000
+        if not value_matches_type(response, effect.output_type):
+            self._emit(
+                "EFFECT_FAILED",
+                {
+                    **attempted_payload,
+                    "reason_code": "response-contract",
+                    "latency_ms": latency_ms,
+                },
+            )
+            raise AccessContractError("effect response violates the declared response contract")
+        try:
+            stored_result = self._effect_operations.values.encode(
+                response,
+                schema_digest=effect.output_schema_digest,
+            )
+        except Exception as exc:
+            self._emit(
+                "EFFECT_FAILED",
+                {
+                    **attempted_payload,
+                    "reason_code": "response-not-canonical",
+                    "latency_ms": latency_ms,
+                },
+            )
+            raise AccessContractError("effect response is not canonically storable") from exc
+        committed = self._effect_operations._commit_effect(
+            self._claim,
+            attempted,
+            stored_result,
+            latency_ms=latency_ms,
+        )
+        committed_payload = {
+            **attempted_payload,
+            "result_digest": stored_result.digest,
+            "result_schema_digest": stored_result.schema_digest,
+            "latency_ms": latency_ms,
+        }
+        self._remember("EFFECT_COMMITTED", committed_payload)
+        self._record_effect_commit(effect, committed)
+        return response
+
+    def _load_effect_result(
+        self,
+        effect: EffectSpec[Any, Any],
+        operation: _EffectOperation,
+    ) -> Any:
+        if operation.result_value is None:
+            raise AccessContractError("committed effect is missing its durable result reference")
+        if operation.result_value.schema_digest != effect.output_schema_digest:
+            raise AccessContractError("committed effect result schema no longer matches")
+        effect_operations = self._effect_operations
+        if effect_operations is None:  # pragma: no cover - checked before reservation
+            raise AccessContractError("effect execution requires durable worker state")
+        try:
+            decoded = effect_operations.values.decode(operation.result_value)
+            response = _rehydrate_value(decoded, effect.output_type)
+        except Exception:
+            raise AccessContractError("committed effect result could not be restored") from None
+        if not value_matches_type(response, effect.output_type):
+            raise AccessContractError("committed effect result violates its output contract")
+        return response
+
+    def _record_effect_attempt(
+        self,
+        effect: EffectSpec[Any, Any],
+        operation: _EffectOperation,
+    ) -> None:
+        self._effect_records.append(
+            {
+                "kind": "EFFECT_ATTEMPTED",
+                "adapter": effect.connector,
+                "operation": effect.operation,
+                "request_digest": operation.request_digest,
+                "result_digest": None,
+                "effect_name": effect.name,
+                "ordinal": operation.ordinal,
+                "idempotency_key": operation.idempotency_key,
+                "connector_version": effect.connector_version,
+                "_reservation_order": operation.reservation_order,
+            }
+        )
+
+    def _record_effect_commit(
+        self,
+        effect: EffectSpec[Any, Any],
+        operation: _EffectOperation,
+    ) -> None:
+        if operation.result_value is None:
+            raise AccessContractError("committed effect has no result reference")
+        self._effect_records.append(
+            {
+                "kind": "EFFECT_COMMITTED",
+                "adapter": effect.connector,
+                "operation": effect.operation,
+                "request_digest": operation.request_digest,
+                "result_digest": operation.result_value.digest,
+                "effect_name": effect.name,
+                "ordinal": operation.ordinal,
+                "idempotency_key": operation.idempotency_key,
+                "connector_version": effect.connector_version,
+                "_reservation_order": operation.reservation_order,
+            }
+        )
+
+    def _boundary_effect_records(self) -> tuple[dict[str, Any], ...]:
+        kind_order = {"EFFECT_ATTEMPTED": 0, "EFFECT_COMMITTED": 1}
+        grouped: dict[int, list[dict[str, Any]]] = {}
+        for record in self._effect_records:
+            grouped.setdefault(int(record.get("_reservation_order", 0)), []).append(record)
+        complete: list[dict[str, Any]] = []
+        for reservation_order in sorted(grouped):
+            records = sorted(
+                grouped[reservation_order],
+                key=lambda record: kind_order.get(str(record.get("kind")), 2),
+            )
+            if [record.get("kind") for record in records] == [
+                "EFFECT_ATTEMPTED",
+                "EFFECT_COMMITTED",
+            ]:
+                complete.extend(records)
+        return tuple(dict(record) for record in complete)
+
+    def _effect_payload(
+        self,
+        *,
+        effect: EffectSpec[Any, Any] | None = None,
+        connector: str | None = None,
+        operation: str | None = None,
+        connector_version: str | None = None,
+        ordinal: int | None = None,
+        request_digest: str | None = None,
+        policy_id: str | None = None,
+        reason_code: str,
+        idempotency_key: str | None = None,
+        adapter_idempotent: bool | None = None,
+        approval_request_id: str | None = None,
+        approval_command_id: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "attempt_id": self.attempt_id,
+            "module_id": self.module_id,
+            "logical_step": self.logical_step,
+            "effect_name": effect.name if effect is not None else None,
+            "ordinal": ordinal,
+            "connector": effect.connector if effect is not None else connector,
+            "operation": effect.operation if effect is not None else operation,
+            "connector_version": effect.connector_version
+            if effect is not None
+            else connector_version,
+            "request_digest": request_digest,
+            "policy_id": policy_id,
+            "reason_code": reason_code,
+            "idempotency_key": idempotency_key,
+            "adapter_idempotent": adapter_idempotent,
+            "approval_request_id": approval_request_id,
+            "approval_command_id": approval_command_id,
+        }
+
     def _payload(
         self,
         *,
@@ -620,10 +1359,15 @@ class AccessBroker:
         }
 
     def _emit(self, event_type: str, payload: Mapping[str, Any]) -> None:
+        if event_type not in _BROKER_AUDIT_EVENT_TYPES:
+            raise AccessContractError("unsupported access broker audit event type")
         safe = dict(payload)
         self._records.append({"event_type": event_type, **safe})
-        if self.audit is not None:
-            self.audit(event_type, dict(safe))
+        if self._audit is not None:
+            self._audit(event_type, dict(safe))
+
+    def _remember(self, event_type: str, payload: Mapping[str, Any]) -> None:
+        self._records.append({"event_type": event_type, **dict(payload)})
 
 
 @dataclass(frozen=True)
@@ -650,7 +1394,8 @@ class EffectSpec[RequestT, ResponseT]:
     idempotency
         Guarantee required from the selected adapter before live execution.
     approval_required
-        Whether policy must observe a prior approval before dispatch.
+        Whether policy must supply a durable approval reference for the same
+        task and exact effect request before dispatch.
     policy_tags
         Stable tags available to policy hooks and structural verification.
     """
@@ -835,5 +1580,6 @@ class Effect[RequestT, ResponseT](Module[RequestT, ResponseT]):
             effect.connector,
             effect.operation,
             value,
+            connector_version=effect.connector_version,
         )
         return cast(ResponseT, result)

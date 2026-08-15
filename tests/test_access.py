@@ -86,7 +86,14 @@ class FakeBroker:
         self.calls.append((connector, operation, request))
         return {"email": "ada@example.test"}
 
-    async def effect(self, connector: str, operation: str, request: Any) -> Any:
+    async def effect(
+        self,
+        connector: str,
+        operation: str,
+        request: Any,
+        *,
+        connector_version: str | None = None,
+    ) -> Any:
         self.calls.append((connector, operation, request))
         return "receipt-1"
 

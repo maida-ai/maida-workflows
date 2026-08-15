@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
@@ -8,7 +9,14 @@ from typing import Any
 import pytest
 
 from maida.workflows import ExecutionContext, Module, ReplayKey, RuntimeValue, Workflow
-from maida.workflows.fixture import ReplayFixture, ReplayFixtureExporter
+from maida.workflows._canonical import canonical_json
+from maida.workflows.fixture import (
+    FixtureErrorCode,
+    ReplayFixture,
+    ReplayFixtureError,
+    ReplayFixtureExporter,
+    load_fixture,
+)
 from maida.workflows.models import EffectKind, EffectRecord
 from maida.workflows.persistence import PostgresStore
 from maida.workflows.replay import (
@@ -91,6 +99,113 @@ async def captured(postgres_store: PostgresStore) -> ReplayFixture:
     result = await WorkflowRunner(postgres_store).run(SingleWorkflow(), 1)
     history = postgres_store.load_run_history(result.run_id, tenant_id="local")
     return ReplayFixtureExporter(postgres_store.values).project(history)
+
+
+def _managed_effect_pair() -> list[dict[str, Any]]:
+    common = {
+        "adapter": "messaging",
+        "operation": "send",
+        "request_digest": "request-digest",
+        "effect_name": "messaging.send",
+        "ordinal": 0,
+        "idempotency_key": "mwf_test-key",
+        "connector_version": "v1",
+    }
+    return [
+        {"kind": EffectKind.ATTEMPTED.value, "result_digest": None, **common},
+        {"kind": EffectKind.COMMITTED.value, "result_digest": "result-digest", **common},
+    ]
+
+
+def _write_manifest(path: Path, data: dict[str, Any]) -> None:
+    path.write_bytes(canonical_json(data).encode())
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda pair: [
+            {
+                **pair[0],
+                "idempotency_key": None,
+            }
+        ],
+        lambda pair: [
+            {
+                key: value
+                for key, value in pair[0].items()
+                if key not in {"effect_name", "ordinal", "idempotency_key"}
+            }
+        ],
+        lambda pair: [*pair, *pair],
+        lambda pair: [pair[0], {**pair[1], "operation": "different-operation"}],
+        lambda pair: [pair[0]],
+    ],
+    ids=(
+        "partial-identity",
+        "version-only-legacy",
+        "duplicate-identity",
+        "mismatched-pair",
+        "unpaired",
+    ),
+)
+async def test_fixture_rejects_malformed_managed_effect_evidence(
+    postgres_store: PostgresStore,
+    tmp_path: Path,
+    mutate: Callable[[list[dict[str, Any]]], list[dict[str, Any]]],
+) -> None:
+    fixture = await captured(postgres_store)
+    history = postgres_store.load_run_history(fixture.source.run_id, tenant_id="local")
+    bundle = tmp_path / "fixture"
+    ReplayFixtureExporter(postgres_store.values).export(history, bundle)
+    manifest_path = bundle / "manifest.json"
+    manifest: dict[str, Any] = json.loads(manifest_path.read_bytes())
+    manifest["accepted_steps"][0]["effects"] = mutate(_managed_effect_pair())
+    _write_manifest(manifest_path, manifest)
+
+    with pytest.raises(ReplayFixtureError) as captured_error:
+        load_fixture(bundle)
+
+    assert captured_error.value.code is FixtureErrorCode.FIXTURE_INVALID
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_fixture_preserves_legacy_effect_pairs_exactly(
+    postgres_store: PostgresStore,
+    tmp_path: Path,
+) -> None:
+    fixture = await captured(postgres_store)
+    history = postgres_store.load_run_history(fixture.source.run_id, tenant_id="local")
+    bundle = tmp_path / "fixture"
+    ReplayFixtureExporter(postgres_store.values).export(history, bundle)
+    manifest_path = bundle / "manifest.json"
+    manifest: dict[str, Any] = json.loads(manifest_path.read_bytes())
+    legacy_pair = [
+        {
+            "kind": EffectKind.ATTEMPTED.value,
+            "adapter": "legacy",
+            "operation": "execute",
+            "request_digest": "request-digest",
+            "result_digest": None,
+        },
+        {
+            "kind": EffectKind.COMMITTED.value,
+            "adapter": "legacy",
+            "operation": "execute",
+            "request_digest": "request-digest",
+            "result_digest": "result-digest",
+        },
+    ]
+    manifest["accepted_steps"][0]["effects"] = legacy_pair
+    _write_manifest(manifest_path, manifest)
+
+    loaded = load_fixture(bundle)
+
+    assert [effect.to_data() for effect in loaded.boundaries[0].effects] == legacy_pair
+    assert loaded.to_manifest() == manifest
 
 
 @pytest.mark.postgres
@@ -334,6 +449,10 @@ def test_replay_effect_adapter_compares_without_invoking_a_connector() -> None:
         "email",
         "send",
         digest_data(request),
+        connector_version="v1",
+        effect_name="email.send",
+        ordinal=1,
+        idempotency_key="mwf_replay-test",
     )
     adapter = ReplayEffectAdapter()
     assert adapter.validate(
@@ -341,6 +460,9 @@ def test_replay_effect_adapter_compares_without_invoking_a_connector() -> None:
         operation="send",
         request=request,
         recorded=recorded,
+        connector_version="v1",
+        effect_name="email.send",
+        ordinal=1,
     ) == {"replay_ack": True}
     with pytest.raises(ReplayContractError, match="does not match"):
         adapter.validate(
@@ -348,7 +470,42 @@ def test_replay_effect_adapter_compares_without_invoking_a_connector() -> None:
             operation="send",
             request={"message": "changed"},
             recorded=recorded,
+            connector_version="v1",
+            effect_name="email.send",
+            ordinal=1,
         )
+    with pytest.raises(ReplayContractError, match="does not match"):
+        adapter.validate(
+            adapter="email",
+            operation="send",
+            request=request,
+            recorded=recorded,
+            connector_version="v1",
+            effect_name="email.send",
+            ordinal=0,
+        )
+
+    legacy_data: dict[str, Any] = {
+        "kind": "EFFECT_ATTEMPTED",
+        "adapter": "email",
+        "operation": "send",
+        "request_digest": digest_data(request),
+        "result_digest": None,
+    }
+    legacy = EffectRecord(
+        kind=EffectKind(legacy_data["kind"]),
+        adapter=legacy_data["adapter"],
+        operation=legacy_data["operation"],
+        request_digest=legacy_data["request_digest"],
+        result_digest=legacy_data["result_digest"],
+    )
+    assert legacy.to_data() == legacy_data
+    assert adapter.validate(
+        adapter="email",
+        operation="send",
+        request=request,
+        recorded=legacy,
+    ) == {"replay_ack": True}
 
 
 @pytest.mark.asyncio

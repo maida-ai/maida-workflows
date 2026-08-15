@@ -12,15 +12,25 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import time
-import types
-import typing
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, cast
 
-from ._canonical import digest_data, schema_digest, value_matches_type
-from .access import AccessBroker, AccessPolicy, Capability, ConnectorRegistry
+from ._canonical import (
+    _rehydrate_value,
+    digest_data,
+    schema_digest,
+    value_matches_type,
+)
+from .access import (
+    AccessBroker,
+    AccessContractError,
+    AccessPolicy,
+    Capability,
+    ConnectorRegistry,
+    EffectSpec,
+)
 from .authoring import (
     ExecutionContext,
     Module,
@@ -46,8 +56,11 @@ from .models import (
     TaskStatus,
     TrajectoryRecord,
     Usage,
+    _EffectOperation,
 )
 from .persistence import ClaimedTask
+
+_rehydrate = _rehydrate_value
 
 
 class RuntimeExecutionError(RuntimeError):
@@ -121,8 +134,58 @@ class DurableRuntimeStore(Protocol):
         """Persist an immutable checkpoint reference."""
         ...
 
-    def complete_task(self, claim: ClaimedTask, boundary: BoundaryRecord) -> None:
-        """Accept a boundary result using the claim's compare-and-swap token."""
+    def _reserve_effect(
+        self,
+        claim: ClaimedTask,
+        *,
+        effect_name: str,
+        ordinal: int,
+        connector: str,
+        operation: str,
+        connector_version: str | None,
+        idempotency_requirement: str,
+        adapter_idempotent: bool,
+        request_digest: str,
+        result_schema_digest: str,
+    ) -> _EffectOperation: ...
+
+    def _lookup_effect(
+        self,
+        claim: ClaimedTask,
+        *,
+        effect_name: str,
+        ordinal: int,
+        connector: str,
+        operation: str,
+        connector_version: str | None,
+        idempotency_requirement: str,
+        request_digest: str,
+        result_schema_digest: str,
+    ) -> _EffectOperation | None: ...
+
+    def _mark_effect_attempted(
+        self,
+        claim: ClaimedTask,
+        operation: _EffectOperation,
+        *,
+        policy_id: str,
+        reason_code: str,
+        approval_required: bool,
+        approval_request_id: str | None,
+        approval_command_id: str | None,
+    ) -> _EffectOperation: ...
+
+    def _commit_effect(
+        self,
+        claim: ClaimedTask,
+        operation: _EffectOperation,
+        result: StoredValue,
+        *,
+        latency_ms: float,
+    ) -> _EffectOperation: ...
+
+    def complete_task(self, claim: ClaimedTask, boundary: BoundaryRecord) -> BoundaryRecord:
+        """Accept and return the store-authoritative logical boundary."""
         ...
 
     def fail_task(
@@ -157,6 +220,18 @@ class DurableRuntimeStore(Protocol):
         attempt_id: str | None = None,
     ) -> None:
         """Append an ordered run, task, or attempt event."""
+        ...
+
+    def append_access_event(
+        self,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        task_id: str,
+        attempt_id: str,
+    ) -> None:
+        """Append one allowlisted broker diagnostic event."""
         ...
 
     def ready_task(
@@ -305,6 +380,10 @@ def _coerce_effect(value: dict[str, Any]) -> EffectRecord:
         operation=str(value["operation"]),
         request_digest=str(value["request_digest"]),
         result_digest=value.get("result_digest"),
+        effect_name=value.get("effect_name"),
+        ordinal=value.get("ordinal"),
+        idempotency_key=value.get("idempotency_key"),
+        connector_version=value.get("connector_version"),
     )
 
 
@@ -329,9 +408,12 @@ class TaskWorker:
         Isolation modes, images, resources, and executor labels this worker can
         satisfy for placement. These are never connector access grants.
     connectors
-        Provider-neutral read adapters available in this worker deployment.
+        Provider-neutral read and effect adapters available in this worker
+        deployment. Effect adapters receive stable logical idempotency keys;
+        adapter instances and credentials never enter task envelopes.
     access_policy
-        Optional policy that may narrow each task's compiled access grant.
+        Optional policy that may narrow each task's compiled access grant and
+        reference same-task durable approval evidence for protected effects.
     """
 
     def __init__(
@@ -393,9 +475,9 @@ class TaskWorker:
         """Persist a content-addressed checkpoint for a running attempt."""
         self.store.checkpoint_task(envelope._claim(), checkpoint)
 
-    def complete(self, envelope: TaskEnvelope, boundary: BoundaryRecord) -> None:
-        """Accept a logical result using the envelope's lease token."""
-        self.store.complete_task(envelope._claim(), boundary)
+    def complete(self, envelope: TaskEnvelope, boundary: BoundaryRecord) -> BoundaryRecord:
+        """Accept and return the store-authoritative logical result."""
+        return self.store.complete_task(envelope._claim(), boundary)
 
     def fail(
         self,
@@ -567,6 +649,7 @@ class TaskWorker:
             broker = AccessBroker(
                 self.connectors,
                 declarations=cast(tuple[Capability[Any, Any], ...], module.capabilities),
+                effects=cast(tuple[EffectSpec[Any, Any], ...], module.effects),
                 grant=claim.task.capability_grant,
                 run_id=claim.task.run_id,
                 task_id=claim.task.task_id,
@@ -574,7 +657,7 @@ class TaskWorker:
                 module_id=claim.task.module_id,
                 logical_step=claim.task.logical_step,
                 policy=self.access_policy,
-                audit=lambda event_type, payload: self.store.append_event(
+                audit=lambda event_type, payload: self.store.append_access_event(
                     claim.task.run_id,
                     event_type,
                     payload,
@@ -582,6 +665,8 @@ class TaskWorker:
                     attempt_id=str(claim.attempt.attempt_id),
                 ),
                 metadata=metadata,
+                _effect_operations=self.store,
+                _claim=claim,
             )
         except Exception as exc:
             self.fail(
@@ -609,7 +694,9 @@ class TaskWorker:
                     "its output contract"
                 )
         except Exception as exc:
-            retry = claim.attempt.attempt_number < self.max_attempts
+            retry = claim.attempt.attempt_number < self.max_attempts and (
+                not isinstance(exc, AccessContractError) or exc.retryable
+            )
             self.fail(
                 envelope,
                 {"reason": str(exc), "exception_type": type(exc).__qualname__},
@@ -623,8 +710,8 @@ class TaskWorker:
         )
         usage_data = dict(metadata.get("usage", {}))
         usage_data.setdefault("latency_ms", elapsed_ms)
-        effects = [_coerce_effect(item) for item in metadata.get("effects", [])]
-        if module.effectful:
+        effects = [_coerce_effect(item) for item in broker._boundary_effect_records()]
+        if module.effectful and not module.effects and not broker._effect_called:
             effects.extend(
                 (
                     EffectRecord(
@@ -670,8 +757,7 @@ class TaskWorker:
             map_decisions=map_decisions,
             effects=tuple(effects),
         )
-        self.complete(envelope, boundary)
-        return boundary
+        return self.complete(envelope, boundary)
 
 
 class Executor(Protocol):
@@ -1204,18 +1290,19 @@ class WorkflowRunner:
     max_attempts
         Maximum physical attempts allowed for each logical task result.
     connectors
-        Provider-neutral read-adapter registry. The runner creates a fresh
+        Provider-neutral read/effect adapter registry. The runner creates a fresh
         :class:`~maida.workflows.access.AccessBroker` for every task attempt;
         adapters and their credentials are never added to task envelopes.
     access_policy
-        Optional policy that may narrow, but cannot expand, the capability
-        grant compiled and persisted for each task.
+        Optional policy that may narrow, but cannot expand, the access grant
+        compiled and persisted for each task. Approval-required effects also
+        need a durable evidence reference verified against that same task.
 
     Notes
     -----
     ``ExecutionSpec.capabilities`` controls which executor may claim a task. It
     is intentionally separate from connector authorization, which is derived
-    exclusively from the module's compiled capability declarations.
+    exclusively from the module's compiled capability and effect declarations.
     """
 
     def __init__(
@@ -1265,7 +1352,12 @@ class WorkflowRunner:
         )
         last_error: Exception | None = None
         while True:
-            progress = scheduler.advance()
+            try:
+                progress = scheduler.advance()
+            except RuntimeExecutionError:
+                if last_error is not None:
+                    raise last_error from None
+                raise
             if progress.status is RunStatus.SUCCEEDED:
                 return RunResult(scheduler.run_id, progress.output, scheduler.plan.digest)
             if progress.status is RunStatus.FAILED:
@@ -1325,31 +1417,3 @@ def _build_module_registry(
 
 def _unique(values: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
-
-
-def _rehydrate(value: Any, annotation: Any) -> Any:
-    if dataclasses.is_dataclass(annotation) and isinstance(value, dict):
-        hints = typing.get_type_hints(annotation)
-        data_class = cast(Callable[..., Any], annotation)
-        return data_class(
-            **{
-                field.name: _rehydrate(value[field.name], hints.get(field.name, Any))
-                for field in dataclasses.fields(annotation)
-                if field.name in value
-            }
-        )
-    origin = typing.get_origin(annotation)
-    args = typing.get_args(annotation)
-    if origin is list and isinstance(value, list):
-        return [_rehydrate(item, args[0] if args else Any) for item in value]
-    if origin is tuple and isinstance(value, list):
-        return tuple(
-            _rehydrate(item, args[index] if index < len(args) else Any)
-            for index, item in enumerate(value)
-        )
-    if origin in (typing.Union, types.UnionType):
-        for candidate in args:
-            hydrated = _rehydrate(value, candidate)
-            if value_matches_type(hydrated, candidate):
-                return hydrated
-    return value

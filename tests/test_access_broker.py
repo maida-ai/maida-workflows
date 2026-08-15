@@ -71,7 +71,7 @@ class DenyCustomerPolicy:
 
     async def authorize(
         self,
-        capability: Capability[Any, Any],
+        capability: Capability[Any, Any] | EffectSpec[Any, Any],
         request: Any,
         *,
         grant: CapabilityGrant,

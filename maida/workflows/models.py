@@ -401,13 +401,101 @@ class TrajectoryRecord:
 
 @dataclass(frozen=True)
 class EffectRecord:
-    """Attempted or committed runtime-managed external effect."""
+    """Attempted or committed runtime-managed external effect.
+
+    ``effect_name`` and ``ordinal`` identify one logical operation within a
+    task independently of physical worker attempts. ``connector_version`` pins
+    the exact adapter contract and ``idempotency_key`` is the stable destination
+    key reused by safe retries. Legacy effectful modules may omit these
+    broker-managed identity fields.
+    """
 
     kind: EffectKind
     adapter: str
     operation: str
     request_digest: str
     result_digest: str | None = None
+    effect_name: str | None = None
+    ordinal: int | None = None
+    idempotency_key: str | None = None
+    connector_version: str | None = None
+
+    def __post_init__(self) -> None:
+        """Validate legacy or fully identified broker-managed evidence."""
+        for value in (self.adapter, self.operation, self.request_digest):
+            if not isinstance(value, str) or not value:
+                raise ValueError("effect adapter, operation, and request digest must be non-empty")
+        if self.connector_version is not None and (
+            not isinstance(self.connector_version, str) or not self.connector_version
+        ):
+            raise ValueError("effect connector version must be a non-empty string")
+
+        identity = (self.effect_name, self.ordinal, self.idempotency_key)
+        if any(value is not None for value in identity) and not all(
+            value is not None for value in identity
+        ):
+            raise ValueError("managed effect identity fields must be supplied together")
+        if not any(value is not None for value in identity) and self.connector_version is not None:
+            raise ValueError("legacy effect evidence cannot contain a connector version")
+        if self.effect_name is not None:
+            if not isinstance(self.effect_name, str) or not self.effect_name:
+                raise ValueError("managed effect name must be a non-empty string")
+            if type(self.ordinal) is not int or self.ordinal < 0:
+                raise ValueError("managed effect ordinal must be a non-negative integer")
+            if not isinstance(self.idempotency_key, str) or not self.idempotency_key:
+                raise ValueError("managed effect idempotency key must be a non-empty string")
+
+        if self.kind is EffectKind.ATTEMPTED:
+            if self.result_digest is not None:
+                raise ValueError("attempted effect evidence cannot contain a result digest")
+        elif self.kind is EffectKind.COMMITTED and (
+            not isinstance(self.result_digest, str) or not self.result_digest
+        ):
+            raise ValueError("committed effect evidence requires a result digest")
+
+    def to_data(self) -> dict[str, Any]:
+        """Return canonical effect evidence without absent legacy fields."""
+        data: dict[str, Any] = {
+            "kind": self.kind.value,
+            "adapter": self.adapter,
+            "operation": self.operation,
+            "request_digest": self.request_digest,
+            "result_digest": self.result_digest,
+        }
+        if self.effect_name is not None:
+            data["effect_name"] = self.effect_name
+        if self.ordinal is not None:
+            data["ordinal"] = self.ordinal
+        if self.idempotency_key is not None:
+            data["idempotency_key"] = self.idempotency_key
+        if self.connector_version is not None:
+            data["connector_version"] = self.connector_version
+        return data
+
+
+class _EffectOperationStatus(StrEnum):
+    RESERVED = "RESERVED"
+    ATTEMPTED = "ATTEMPTED"
+    COMMITTED = "COMMITTED"
+
+
+class _EffectOperationConflict(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class _EffectOperation:
+    task_id: str
+    effect_name: str
+    ordinal: int
+    reservation_order: int
+    request_digest: str
+    result_schema_digest: str
+    idempotency_key: str
+    status: _EffectOperationStatus
+    adapter_idempotent: bool
+    attempt_count: int
+    result_value: StoredValue | None = None
 
 
 @dataclass(frozen=True)
@@ -464,6 +552,42 @@ class BoundaryRecord:
     map_decisions: tuple[dict[str, Any], ...] = ()
     effects: tuple[EffectRecord, ...] = ()
 
+    def __post_init__(self) -> None:
+        """Validate ordered, unique broker-managed effect evidence pairs."""
+        managed = tuple(effect.effect_name is not None for effect in self.effects)
+        if not any(managed):
+            return
+        if not all(managed):
+            raise ValueError("a boundary cannot mix legacy and managed effect evidence")
+        if len(self.effects) % 2:
+            raise ValueError("managed effect evidence requires attempted and committed pairs")
+
+        seen: set[tuple[str, int]] = set()
+        for offset in range(0, len(self.effects), 2):
+            attempted, committed = self.effects[offset : offset + 2]
+            if (
+                attempted.kind is not EffectKind.ATTEMPTED
+                or committed.kind is not EffectKind.COMMITTED
+            ):
+                raise ValueError("managed effect evidence must be ordered attempted then committed")
+            if attempted.effect_name is None or attempted.ordinal is None:
+                raise ValueError("managed effect evidence is missing its logical identity")
+            identity = (attempted.effect_name, attempted.ordinal)
+            if identity in seen:
+                raise ValueError("managed effect evidence contains a duplicate logical identity")
+            seen.add(identity)
+            comparable = (
+                "adapter",
+                "operation",
+                "request_digest",
+                "effect_name",
+                "ordinal",
+                "idempotency_key",
+                "connector_version",
+            )
+            if any(getattr(attempted, field) != getattr(committed, field) for field in comparable):
+                raise ValueError("managed attempted and committed effect evidence does not match")
+
     @property
     def instance_key(self) -> str:
         """Return the canonical address of this concrete boundary instance."""
@@ -471,7 +595,9 @@ class BoundaryRecord:
 
     def to_data(self) -> dict[str, Any]:
         """Return a canonical JSON-compatible boundary representation."""
-        return cast(dict[str, Any], canonical_data(asdict(self)))
+        data = asdict(self)
+        data["effects"] = [effect.to_data() for effect in self.effects]
+        return cast(dict[str, Any], canonical_data(data))
 
     @classmethod
     def from_data(cls, data: dict[str, Any]) -> Self:

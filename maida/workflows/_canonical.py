@@ -169,3 +169,38 @@ def value_matches_type(value: Any, annotation: Any) -> bool:
         return isinstance(value, annotation)
     except TypeError:
         return True
+
+
+def _rehydrate_value(value: Any, annotation: Any) -> Any:
+    if dataclasses.is_dataclass(annotation) and isinstance(value, dict):
+        hints = typing.get_type_hints(annotation)
+        data_class = cast(typing.Callable[..., Any], annotation)
+        return data_class(
+            **{
+                field.name: _rehydrate_value(value[field.name], hints.get(field.name, Any))
+                for field in dataclasses.fields(annotation)
+                if field.name in value
+            }
+        )
+    origin = typing.get_origin(annotation)
+    args = typing.get_args(annotation)
+    if origin is list and isinstance(value, list):
+        return [_rehydrate_value(item, args[0] if args else Any) for item in value]
+    if origin is tuple and isinstance(value, list):
+        return tuple(
+            _rehydrate_value(item, args[index] if index < len(args) else Any)
+            for index, item in enumerate(value)
+        )
+    if origin in (dict, Mapping) and isinstance(value, dict):
+        key_type = args[0] if args else Any
+        value_type = args[1] if len(args) > 1 else Any
+        return {
+            _rehydrate_value(key, key_type): _rehydrate_value(item, value_type)
+            for key, item in value.items()
+        }
+    if origin in (typing.Union, types.UnionType):
+        for candidate in args:
+            hydrated = _rehydrate_value(value, candidate)
+            if value_matches_type(hydrated, candidate):
+                return hydrated
+    return value

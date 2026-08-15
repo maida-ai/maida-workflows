@@ -293,7 +293,14 @@ class ReplayBroker:
         self.replay_safe_live_reads = dict(replay_safe_live_reads or {})
         self.effect_attempts = 0
 
-    async def effect(self, adapter: str, operation: str, request: Any) -> Any:
+    async def effect(
+        self,
+        adapter: str,
+        operation: str,
+        request: Any,
+        *,
+        connector_version: str | None = None,
+    ) -> Any:
         """Record an effect attempt and fail replay without calling an adapter."""
         self.effect_attempts += 1
         raise ReplayEffectViolation(
@@ -339,6 +346,9 @@ class ReplayEffectAdapter:
         request: Any,
         recorded: EffectRecord,
         recorded_result: Any = None,
+        connector_version: str | None = None,
+        effect_name: str | None = None,
+        ordinal: int | None = None,
     ) -> Any:
         """Compare a proposed effect with history and return a safe response.
 
@@ -348,7 +358,9 @@ class ReplayEffectAdapter:
         Raises
         ------
         ReplayContractError
-            If adapter, operation, or request content differs from history.
+            If adapter, operation, request content, or any recorded logical
+            effect identity differs from history. Legacy records without the
+            newer identity fields retain their narrower comparison behavior.
         """
         proposed_digest = digest_data(request)
         if (
@@ -356,6 +368,12 @@ class ReplayEffectAdapter:
             or recorded.adapter != adapter
             or recorded.operation != operation
             or recorded.request_digest != proposed_digest
+            or (
+                recorded.connector_version is not None
+                and recorded.connector_version != connector_version
+            )
+            or (recorded.effect_name is not None and recorded.effect_name != effect_name)
+            or (recorded.ordinal is not None and recorded.ordinal != ordinal)
         ):
             raise ReplayContractError("proposed effect does not match the recorded effect boundary")
         return recorded_result if recorded_result is not None else {"replay_ack": True}
