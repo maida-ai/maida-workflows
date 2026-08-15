@@ -12,16 +12,19 @@ from __future__ import annotations
 import re
 from collections import Counter
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import timedelta
+from decimal import Decimal
 from types import MappingProxyType
 from typing import Any, Self, cast
 
 from ._canonical import canonical_data, canonical_json, digest_data
+from .budget import Budget
 from .ir import PlanIR, ReplayKey, _validated_access_declarations
-from .models import ExecutionSpec
+from .models import CapabilityGrant, ExecutionSpec
 
 PLAN_FRAGMENT_VERSION = "0.1.0"
-PLAN_SIGNATURE_VERSION = "0.1.0"
+PLAN_SIGNATURE_VERSION = "0.2.0"
 _REGION_INPUT = "$input"
 _STABLE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 _HEX_DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -356,7 +359,7 @@ class PlanFragmentIR:
 
 @dataclass(frozen=True)
 class PlanLimits:
-    """Hard structural limits applied to every generated fragment.
+    """Trusted structural and resource limits for a generated graph region.
 
     Parameters
     ----------
@@ -368,15 +371,20 @@ class PlanLimits:
         Maximum number of direct consumers of any node or region input.
     max_replans
         Maximum number of replans after the initial revision one.
+    budget
+        Maximum aggregate resource envelope for the generated region. Token,
+        tool, and cost limits are summed across node occurrences. Wall time is
+        measured along the DAG's longest dependency path.
     """
 
     max_nodes: int
     max_depth: int
     max_fanout: int
     max_replans: int
+    budget: Budget
 
     def __post_init__(self) -> None:
-        """Reject nonsensical or boolean structural limits."""
+        """Reject nonsensical structural limits or a missing budget."""
         for label, value in (
             ("max_nodes", self.max_nodes),
             ("max_depth", self.max_depth),
@@ -388,9 +396,12 @@ class PlanLimits:
             raise ValueError("max_nodes must be positive")
         if self.max_depth == 0:
             raise ValueError("max_depth must be positive")
+        if not isinstance(self.budget, Budget):
+            raise TypeError("budget must be a Budget")
 
 
 _CATALOG_FIELDS = {
+    "budget",
     "capabilities",
     "effects",
     "execution",
@@ -399,7 +410,6 @@ _CATALOG_FIELDS = {
     "module_id",
     "output_schema_digest",
 }
-_RESOLVED_NODE_FIELDS = _CATALOG_FIELDS | {"dependencies", "key", "module_alias"}
 
 
 @dataclass(frozen=True)
@@ -411,6 +421,7 @@ class _CatalogEntry:
     execution: Mapping[str, Any]
     capabilities: tuple[Mapping[str, Any], ...]
     effects: tuple[Mapping[str, Any], ...]
+    budget: Budget
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "execution", cast(Mapping[str, Any], _freeze_json(self.execution)))
@@ -431,6 +442,7 @@ class _CatalogEntry:
             canonical_data(
                 {
                     "capabilities": self.capabilities,
+                    "budget": self.budget.to_data(),
                     "effects": self.effects,
                     "execution": self.execution,
                     "input_schema_digests": self.input_schema_digests,
@@ -451,6 +463,8 @@ def _catalog_entry(
     execution: Any,
     capabilities: Any,
     effects: Any,
+    budget: Any,
+    require_canonical: bool = False,
 ) -> _CatalogEntry:
     if not isinstance(module_id, str) or not module_id.strip():
         raise ValueError("module_id must be a non-empty stable identity")
@@ -475,16 +489,26 @@ def _catalog_entry(
         capabilities,
         expected_kind="capability",
         location="catalog capabilities",
-        require_canonical=False,
+        require_canonical=require_canonical,
         error_type=ValueError,
     )
     encoded_effects = _validated_access_declarations(
         effects,
         expected_kind="effect",
         location="catalog effects",
-        require_canonical=False,
+        require_canonical=require_canonical,
         error_type=ValueError,
     )
+    if not isinstance(budget, Budget):
+        if not isinstance(budget, Mapping):
+            raise ValueError("budget must be a Budget or canonical budget mapping")
+        try:
+            restored_budget = Budget.from_data(budget)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"budget is invalid: {exc}") from exc
+        if canonical_json(restored_budget.to_data()) != canonical_json(budget):
+            raise ValueError("budget fields do not match the canonical budget contract")
+        budget = restored_budget
     return _CatalogEntry(
         module_id=module_id,
         module_digest=module_digest,
@@ -493,6 +517,7 @@ def _catalog_entry(
         execution=encoded_execution,
         capabilities=encoded_capabilities,
         effects=encoded_effects,
+        budget=budget,
     )
 
 
@@ -502,8 +527,8 @@ class ModuleCatalog:
     A catalog is constructed by trusted application or deployment code, never
     from generated plan content. Each alias resolves to immutable module and
     schema digests plus credential-free execution, capability, and effect
-    declarations. Runtime grants and adapter credentials are intentionally not
-    representable.
+    declarations and an immutable per-occurrence resource envelope. Runtime
+    credentials are intentionally not representable.
 
     Notes
     -----
@@ -534,6 +559,7 @@ class ModuleCatalog:
         input_schema_digests: tuple[str, ...],
         output_schema_digest: str,
         execution: Mapping[str, Any],
+        budget: Budget,
         capabilities: tuple[Mapping[str, Any], ...] = (),
         effects: tuple[Mapping[str, Any], ...] = (),
     ) -> ModuleCatalog:
@@ -551,6 +577,8 @@ class ModuleCatalog:
             Typed output contract exposed to downstream generated nodes.
         execution
             Canonical credential-free execution requirements.
+        budget
+            Trusted resource envelope for each occurrence of this alias.
         capabilities, effects
             Canonical external-access declarations inherited from the trusted
             module definition. They cannot be altered by generated plans.
@@ -562,9 +590,13 @@ class ModuleCatalog:
 
         Raises
         ------
+        TypeError
+            If ``budget`` is not a :class:`Budget` declaration.
         ValueError
             If an identity or descriptor is invalid or the alias already exists.
         """
+        if not isinstance(budget, Budget):
+            raise TypeError("budget must be a Budget")
         try:
             _require_stable_name(alias, label="module alias")
             entry = _catalog_entry(
@@ -573,6 +605,7 @@ class ModuleCatalog:
                 input_schema_digests=input_schema_digests,
                 output_schema_digest=output_schema_digest,
                 execution=execution,
+                budget=budget,
                 capabilities=capabilities,
                 effects=effects,
             )
@@ -628,6 +661,7 @@ class ModuleCatalog:
                 input_schema_digests=(step.input_binding.schema_digest,),
                 output_schema_digest=step.output_schema_digest,
                 execution=step.execution or ExecutionSpec().to_data(),
+                budget=Budget.from_data(step.budget) if step.budget is not None else Budget(),
                 capabilities=step.capabilities,
                 effects=step.effects,
             )
@@ -644,7 +678,7 @@ class ModuleCatalog:
         Returns
         -------
         dict
-            Canonical credential-free module descriptor.
+            Canonical credential-free module descriptor including its budget.
 
         Raises
         ------
@@ -676,69 +710,166 @@ class ModuleCatalog:
 
 
 _SIGNATURE_FIELDS = {
+    "aggregate_budget",
+    "alias_provenance",
+    "approval_requirements",
+    "catalog_digest",
     "max_depth",
     "max_fanout",
     "module_composition",
     "node_count",
     "output_schema_digests",
     "outputs",
+    "region_grant",
+    "region_id",
     "region_input_schema_digest",
+    "required_grant",
     "resolved_nodes",
     "revision",
+    "source_fragment_digest",
     "supersedes",
     "topology_digest",
     "version",
 }
+_RESOLVED_NODE_FIELDS = _CATALOG_FIELDS | {
+    "capability_grant",
+    "dependencies",
+    "key",
+}
+
+
+def _canonical_grant(data: Any, *, label: str) -> CapabilityGrant:
+    if not isinstance(data, Mapping):
+        raise _error("PLAN_SIGNATURE_INVALID", f"{label} must be an object")
+    try:
+        grant = CapabilityGrant.from_data(data)
+    except (TypeError, ValueError) as exc:
+        raise _error("PLAN_SIGNATURE_INVALID", f"{label} is invalid: {exc}") from exc
+    if canonical_json(grant.to_data()) != canonical_json(data):
+        raise _error("PLAN_SIGNATURE_INVALID", f"{label} is not canonical")
+    return grant
+
+
+def _entry_grant(entry: _CatalogEntry) -> CapabilityGrant:
+    return CapabilityGrant(
+        capabilities=tuple(cast(str, item["name"]) for item in entry.capabilities),
+        effects=tuple(cast(str, item["name"]) for item in entry.effects),
+    )
+
+
+def _topological_depths(
+    dependencies_by_key: Mapping[str, tuple[str, ...]],
+    *,
+    error_code: str,
+    cycle_message: str,
+) -> tuple[dict[str, int], tuple[str, ...]]:
+    """Return iterative DAG depths and order without recursion limits."""
+    indegrees: dict[str, int] = {}
+    consumers: dict[str, list[str]] = {key: [] for key in dependencies_by_key}
+    for key, dependencies in dependencies_by_key.items():
+        graph_dependencies = tuple(
+            dependency for dependency in dependencies if dependency != _REGION_INPUT
+        )
+        indegrees[key] = len(graph_dependencies)
+        for dependency in graph_dependencies:
+            consumers[dependency].append(key)
+    ready = sorted((key for key, count in indegrees.items() if count == 0), reverse=True)
+    depths: dict[str, int] = {}
+    order: list[str] = []
+    while ready:
+        key = ready.pop()
+        order.append(key)
+        dependencies = tuple(
+            dependency for dependency in dependencies_by_key[key] if dependency != _REGION_INPUT
+        )
+        depths[key] = 1 + max((depths[dependency] for dependency in dependencies), default=0)
+        for consumer in sorted(consumers[key], reverse=True):
+            indegrees[consumer] -= 1
+            if indegrees[consumer] == 0:
+                ready.append(consumer)
+    if len(order) != len(dependencies_by_key):
+        raise _error(error_code, cycle_message)
+    return depths, tuple(order)
 
 
 @dataclass(frozen=True)
 class PlanSignature:
-    """Trusted behavioral signature of a validated generated fragment.
+    """Resolved behavior and provenance for one validated generated DAG.
 
-    The signature resolves every generated alias through the immutable catalog
-    and therefore contains the module pins, typed ports, execution requirements,
-    and external-access declarations that the generated fragment itself cannot
-    provide. It is suitable for structural comparison and later materialization;
-    it is not an authorization grant.
+    A signature contains only behavior selected from a trusted
+    :class:`ModuleCatalog`: immutable module pins, typed ports, execution
+    requirements, exact child grants, resource envelopes, and approval-policy
+    requirements. Parsing a signature checks its shape and internal
+    consistency but does **not** authorize execution. Before any future
+    materializer uses an imported signature, call
+    :meth:`PlanValidator.revalidate` with the source fragment and current
+    trusted context.
+
+    Planner aliases are retained in :attr:`alias_provenance` for diagnostics,
+    but are excluded from equality and :attr:`digest`. Renaming an alias that
+    resolves to the same module pin therefore does not look like behavior
+    drift.
 
     Parameters
     ----------
     revision, supersedes
-        Validated lineage copied from the generated fragment.
+        Validated one-based revision and preceding fragment digest. They are
+        lineage provenance excluded from behavioral equality and digest.
+    region_id
+        Stable identity of the trusted dynamic region.
+    region_grant, required_grant
+        Region-wide maximum grant and the exact union required by resolved
+        nodes. Every node also stores its own least-privilege grant.
+    aggregate_budget
+        Mechanically derived occurrence budget. Count and cost dimensions are
+        sums; wall time is the longest DAG dependency path.
     node_count, max_depth, max_fanout
-        Structural measurements checked against :class:`PlanLimits`.
+        Structural measurements recomputed from :attr:`resolved_nodes`.
     module_composition
-        Canonically ordered ``(alias, count)`` pairs.
+        Canonical ``(module_id, module_digest, occurrence_count)`` tuples.
+        Aliases are deliberately absent.
     topology_digest
-        Digest of resolved nodes and ordered output keys, excluding the
-        diagnostic fragment label.
+        Digest of alias-free resolved nodes and ordered output keys.
     resolved_nodes
-        Canonical trusted module descriptors joined to generated topology.
+        Canonical behavior-bearing node descriptors. Each descriptor includes
+        the trusted module pin, schemas, execution environment, external-access
+        declarations, budget, dependencies, and exact child grant.
     region_input_schema_digest
-        Trusted schema supplied to ``$input`` dependency ports.
-    outputs
-        Ordered resolved node keys returned by the generated region.
-    output_schema_digests
-        Validated ordered schemas returned by the dynamic region.
+        Trusted schema supplied to every ``$input`` dependency.
+    outputs, output_schema_digests
+        Ordered output node keys and their verified surrounding-region schemas.
+    approval_requirements
+        Canonical ``(node_key, effect_name)`` policy-eligibility checks. These
+        are not runtime effect approvals.
+    source_fragment_digest, catalog_digest, alias_provenance
+        Diagnostic provenance excluded from behavioral equality and digest.
     version
-        Signature schema version.
+        Resolved signature wire-contract version.
     """
 
-    revision: int
-    supersedes: str | None
+    revision: int = field(compare=False)
+    supersedes: str | None = field(compare=False)
+    region_id: str
+    region_grant: CapabilityGrant
+    required_grant: CapabilityGrant
+    aggregate_budget: Budget
     node_count: int
     max_depth: int
     max_fanout: int
-    module_composition: tuple[tuple[str, int], ...]
+    module_composition: tuple[tuple[str, str, int], ...]
     topology_digest: str
     resolved_nodes: tuple[Mapping[str, Any], ...]
     region_input_schema_digest: str
     outputs: tuple[str, ...]
     output_schema_digests: tuple[str, ...]
+    approval_requirements: tuple[tuple[str, str], ...]
+    source_fragment_digest: str = field(compare=False)
+    catalog_digest: str = field(compare=False)
+    alias_provenance: tuple[tuple[str, str], ...] = field(compare=False)
     version: str = PLAN_SIGNATURE_VERSION
 
     def __post_init__(self) -> None:
-        """Canonicalize trusted records and validate signature primitives."""
+        """Canonicalize records and verify every internally derived field."""
         if self.version != PLAN_SIGNATURE_VERSION:
             raise _error(
                 "PLAN_SIGNATURE_VERSION_UNSUPPORTED",
@@ -753,34 +884,59 @@ class PlanSignature:
             raise _error("PLAN_SIGNATURE_INVALID", "revision must be at least one")
         if self.supersedes is not None:
             _require_digest(
-                self.supersedes,
-                label="supersedes",
-                error_code="PLAN_SIGNATURE_INVALID",
+                self.supersedes, label="supersedes", error_code="PLAN_SIGNATURE_INVALID"
             )
         if self.revision == 1 and self.supersedes is not None:
             raise _error("PLAN_SIGNATURE_INVALID", "initial signature supersedes must be null")
         if self.revision > 1 and self.supersedes is None:
             raise _error("PLAN_SIGNATURE_INVALID", "revised signature requires supersedes")
+        region_id = _require_stable_name(
+            self.region_id, label="region_id", error_code="PLAN_SIGNATURE_INVALID"
+        )
+        if not isinstance(self.region_grant, CapabilityGrant):
+            raise _error("PLAN_SIGNATURE_INVALID", "region_grant must be CapabilityGrant")
+        if not isinstance(self.required_grant, CapabilityGrant):
+            raise _error("PLAN_SIGNATURE_INVALID", "required_grant must be CapabilityGrant")
+        if not isinstance(self.aggregate_budget, Budget):
+            raise _error("PLAN_SIGNATURE_INVALID", "aggregate_budget must be Budget")
         for label, value in (
             ("node_count", self.node_count),
             ("max_depth", self.max_depth),
             ("max_fanout", self.max_fanout),
         ):
-            _require_nonnegative_integer(
-                value,
-                label=label,
-                error_code="PLAN_SIGNATURE_INVALID",
-            )
-        _require_digest(
+            _require_nonnegative_integer(value, label=label, error_code="PLAN_SIGNATURE_INVALID")
+        topology_digest = _require_digest(
             self.topology_digest,
             label="topology_digest",
             error_code="PLAN_SIGNATURE_INVALID",
         )
-        composition = tuple(sorted(tuple(self.module_composition)))
-        for alias, count in composition:
-            _require_stable_name(
-                alias,
-                label="module composition alias",
+        source_digest = _require_digest(
+            self.source_fragment_digest,
+            label="source_fragment_digest",
+            error_code="PLAN_SIGNATURE_INVALID",
+        )
+        catalog_digest = _require_digest(
+            self.catalog_digest,
+            label="catalog_digest",
+            error_code="PLAN_SIGNATURE_INVALID",
+        )
+        if not isinstance(self.module_composition, (list, tuple)) or any(
+            not isinstance(item, (list, tuple)) or len(item) != 3
+            for item in self.module_composition
+        ):
+            raise _error(
+                "PLAN_SIGNATURE_INVALID",
+                "module composition must contain three-field tuples",
+            )
+        composition = tuple(
+            cast(tuple[str, str, int], tuple(item)) for item in self.module_composition
+        )
+        for module_id, module_digest, count in composition:
+            if not isinstance(module_id, str) or not module_id.strip():
+                raise _error("PLAN_SIGNATURE_INVALID", "composition module_id must be non-empty")
+            _require_digest(
+                module_digest,
+                label="composition module_digest",
                 error_code="PLAN_SIGNATURE_INVALID",
             )
             if type(count) is not int or count < 1:
@@ -788,8 +944,13 @@ class PlanSignature:
                     "PLAN_SIGNATURE_INVALID",
                     "module composition counts must be positive integers",
                 )
-        if len(composition) != len({alias for alias, _count in composition}):
-            raise _error("PLAN_SIGNATURE_INVALID", "module composition contains duplicate aliases")
+        composition = tuple(sorted(composition))
+        if len(composition) != len({item[:2] for item in composition}):
+            raise _error("PLAN_SIGNATURE_INVALID", "module composition contains duplicate pins")
+        if not isinstance(self.resolved_nodes, (list, tuple)) or any(
+            not isinstance(node, Mapping) for node in self.resolved_nodes
+        ):
+            raise _error("PLAN_SIGNATURE_INVALID", "resolved_nodes must contain objects")
         mutable_resolved = tuple(
             sorted(
                 (cast(dict[str, Any], canonical_data(dict(node))) for node in self.resolved_nodes),
@@ -807,13 +968,15 @@ class PlanSignature:
             raise _error("PLAN_SIGNATURE_INVALID", "outputs must be an ordered sequence")
         output_keys = tuple(
             _require_stable_name(
-                value,
-                label="signature output",
-                error_code="PLAN_SIGNATURE_INVALID",
+                value, label="signature output", error_code="PLAN_SIGNATURE_INVALID"
             )
             for value in self.outputs
         )
-        resolved = tuple(cast(Mapping[str, Any], _freeze_json(node)) for node in mutable_resolved)
+        if not isinstance(self.output_schema_digests, (list, tuple)):
+            raise _error(
+                "PLAN_SIGNATURE_INVALID",
+                "output_schema_digests must be an ordered sequence",
+            )
         output_schemas = tuple(
             _require_digest(
                 value,
@@ -822,6 +985,41 @@ class PlanSignature:
             )
             for value in self.output_schema_digests
         )
+        if not isinstance(self.approval_requirements, (list, tuple)) or any(
+            not isinstance(item, (list, tuple)) or len(item) != 2
+            for item in self.approval_requirements
+        ):
+            raise _error(
+                "PLAN_SIGNATURE_INVALID",
+                "approval requirements must contain two-field tuples",
+            )
+        approvals = tuple(cast(tuple[str, str], tuple(item)) for item in self.approval_requirements)
+        for node_key, effect_name in approvals:
+            _require_stable_name(
+                node_key, label="approval node key", error_code="PLAN_SIGNATURE_INVALID"
+            )
+            _require_stable_name(
+                effect_name, label="approval effect name", error_code="PLAN_SIGNATURE_INVALID"
+            )
+        approvals = tuple(sorted(approvals))
+        if len(approvals) != len(set(approvals)):
+            raise _error("PLAN_SIGNATURE_INVALID", "approval requirements contain duplicates")
+        if not isinstance(self.alias_provenance, (list, tuple)) or any(
+            not isinstance(item, (list, tuple)) or len(item) != 2 for item in self.alias_provenance
+        ):
+            raise _error(
+                "PLAN_SIGNATURE_INVALID",
+                "alias provenance must contain two-field tuples",
+            )
+        provenance = tuple(cast(tuple[str, str], tuple(item)) for item in self.alias_provenance)
+        for node_key, alias in provenance:
+            _require_stable_name(
+                node_key, label="alias node key", error_code="PLAN_SIGNATURE_INVALID"
+            )
+            _require_stable_name(alias, label="module alias", error_code="PLAN_SIGNATURE_INVALID")
+        provenance = tuple(sorted(provenance))
+        if len(provenance) != len({key for key, _alias in provenance}):
+            raise _error("PLAN_SIGNATURE_INVALID", "alias provenance contains duplicate node keys")
         metrics = _resolved_metrics(mutable_resolved, region_input, output_keys)
         if self.node_count != len(mutable_resolved):
             raise _error("PLAN_SIGNATURE_INVALID", "signature node count is inconsistent")
@@ -833,56 +1031,115 @@ class PlanSignature:
             raise _error("PLAN_SIGNATURE_INVALID", "signature module composition is inconsistent")
         if output_schemas != metrics.output_schema_digests:
             raise _error("PLAN_SIGNATURE_INVALID", "signature output schemas are inconsistent")
-        if self.topology_digest != metrics.topology_digest:
+        if topology_digest != metrics.topology_digest:
             raise _error("PLAN_SIGNATURE_INVALID", "signature topology digest is inconsistent")
+        if self.aggregate_budget != metrics.aggregate_budget:
+            raise _error("PLAN_SIGNATURE_INVALID", "signature aggregate budget is inconsistent")
+        if self.required_grant != metrics.required_grant:
+            raise _error("PLAN_SIGNATURE_INVALID", "signature required grant is inconsistent")
+        if approvals != metrics.approval_requirements:
+            raise _error(
+                "PLAN_SIGNATURE_INVALID", "signature approval requirements are inconsistent"
+            )
+        if {key for key, _alias in provenance} != {node["key"] for node in mutable_resolved}:
+            raise _error("PLAN_SIGNATURE_INVALID", "alias provenance does not cover resolved nodes")
+        try:
+            self.region_grant.narrow(
+                capabilities=self.required_grant.capabilities,
+                effects=self.required_grant.effects,
+            )
+        except ValueError as exc:
+            raise _error("PLAN_SIGNATURE_INVALID", "required grant exceeds region grant") from exc
+        resolved = tuple(cast(Mapping[str, Any], _freeze_json(node)) for node in mutable_resolved)
+        object.__setattr__(self, "region_id", region_id)
         object.__setattr__(self, "module_composition", composition)
         object.__setattr__(self, "resolved_nodes", resolved)
         object.__setattr__(self, "region_input_schema_digest", region_input)
         object.__setattr__(self, "outputs", output_keys)
         object.__setattr__(self, "output_schema_digests", output_schemas)
+        object.__setattr__(self, "approval_requirements", approvals)
+        object.__setattr__(self, "source_fragment_digest", source_digest)
+        object.__setattr__(self, "catalog_digest", catalog_digest)
+        object.__setattr__(self, "alias_provenance", provenance)
+
+    def _behavior_data(self) -> dict[str, Any]:
+        return {
+            "aggregate_budget": self.aggregate_budget.to_data(),
+            "approval_requirements": [
+                {"effect_name": effect_name, "node_key": node_key}
+                for node_key, effect_name in self.approval_requirements
+            ],
+            "max_depth": self.max_depth,
+            "max_fanout": self.max_fanout,
+            "module_composition": [
+                {"count": count, "module_digest": digest, "module_id": module_id}
+                for module_id, digest, count in self.module_composition
+            ],
+            "node_count": self.node_count,
+            "output_schema_digests": self.output_schema_digests,
+            "outputs": self.outputs,
+            "region_grant": self.region_grant.to_data(),
+            "region_id": self.region_id,
+            "region_input_schema_digest": self.region_input_schema_digest,
+            "required_grant": self.required_grant.to_data(),
+            "resolved_nodes": self.resolved_nodes,
+            "topology_digest": self.topology_digest,
+            "version": self.version,
+        }
 
     def to_dict(self) -> dict[str, Any]:
-        """Return the canonical JSON-compatible resolved signature."""
+        """Return canonical behavior plus diagnostic source provenance.
+
+        Returns
+        -------
+        dict
+            JSON-compatible signature data. This serialized form remains
+            untrusted after transport; parse it with :meth:`from_dict` and
+            authenticate it with :meth:`PlanValidator.revalidate`.
+        """
         return cast(
             dict[str, Any],
             canonical_data(
                 {
-                    "max_depth": self.max_depth,
-                    "max_fanout": self.max_fanout,
-                    "module_composition": [
-                        {"alias": alias, "count": count} for alias, count in self.module_composition
+                    **self._behavior_data(),
+                    "alias_provenance": [
+                        {"alias": alias, "node_key": node_key}
+                        for node_key, alias in self.alias_provenance
                     ],
-                    "node_count": self.node_count,
-                    "output_schema_digests": self.output_schema_digests,
-                    "outputs": self.outputs,
-                    "region_input_schema_digest": self.region_input_schema_digest,
-                    "resolved_nodes": self.resolved_nodes,
+                    "catalog_digest": self.catalog_digest,
                     "revision": self.revision,
+                    "source_fragment_digest": self.source_fragment_digest,
                     "supersedes": self.supersedes,
-                    "topology_digest": self.topology_digest,
-                    "version": self.version,
                 }
             ),
         )
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Self:
-        """Strictly import a previously resolved signature.
+        """Parse a signature without treating imported pins as trusted.
+
+        This method strictly checks canonical encoding and internal graph
+        consistency. It cannot prove that module pins, grants, or budgets still
+        match the current trusted catalog. Call :meth:`PlanValidator.revalidate`
+        before using an imported value for any execution decision.
 
         Parameters
         ----------
         data
-            Mapping with exactly the supported signature fields.
+            Mapping containing exactly the supported signature fields and
+            canonical nested declarations.
 
         Returns
         -------
         PlanSignature
-            Canonically validated trusted signature.
+            Deeply immutable, internally consistent parsed signature. The
+            return value is not authorization to execute.
 
         Raises
         ------
         PlanValidationError
-            If fields, ordering, descriptors, or digests are invalid.
+            If the version, fields, canonical ordering, graph, schemas, grants,
+            budgets, or internally derived digests are invalid.
         """
         if not isinstance(data, Mapping):
             raise _error("PLAN_SIGNATURE_INVALID", "PlanSignature must be an object")
@@ -897,50 +1154,93 @@ class PlanSignature:
                 "PLAN_SIGNATURE_VERSION_UNSUPPORTED",
                 f"unsupported PlanSignature version {data['version']!r}",
             )
-        raw_composition = data["module_composition"]
-        raw_nodes = data["resolved_nodes"]
-        raw_output_keys = data["outputs"]
-        raw_outputs = data["output_schema_digests"]
-        if not isinstance(raw_composition, list):
-            raise _error("PLAN_SIGNATURE_INVALID", "module_composition must be an array")
-        if not isinstance(raw_nodes, list):
-            raise _error("PLAN_SIGNATURE_INVALID", "resolved_nodes must be an array")
-        if not isinstance(raw_output_keys, list):
-            raise _error("PLAN_SIGNATURE_INVALID", "outputs must be an array")
-        if not isinstance(raw_outputs, list):
-            raise _error("PLAN_SIGNATURE_INVALID", "output schemas must be an array")
-        composition: list[tuple[str, int]] = []
-        for item in raw_composition:
-            if not isinstance(item, Mapping) or set(item) != {"alias", "count"}:
+        arrays = {
+            "alias_provenance": data["alias_provenance"],
+            "approval_requirements": data["approval_requirements"],
+            "module_composition": data["module_composition"],
+            "output_schema_digests": data["output_schema_digests"],
+            "outputs": data["outputs"],
+            "resolved_nodes": data["resolved_nodes"],
+        }
+        for label, value in arrays.items():
+            if not isinstance(value, list):
+                raise _error("PLAN_SIGNATURE_INVALID", f"{label} must be an array")
+        composition: list[tuple[str, str, int]] = []
+        for item in cast(list[Any], arrays["module_composition"]):
+            if not isinstance(item, Mapping) or set(item) != {
+                "count",
+                "module_digest",
+                "module_id",
+            }:
                 raise _error(
                     "PLAN_SIGNATURE_INVALID",
                     "module composition fields do not match the contract",
                 )
-            composition.append((item["alias"], item["count"]))
-        if composition != sorted(composition):
-            raise _error(
-                "PLAN_SIGNATURE_INVALID",
-                "module composition must be in canonical alias order",
-            )
+            if (
+                not isinstance(item["module_id"], str)
+                or not isinstance(item["module_digest"], str)
+                or type(item["count"]) is not int
+            ):
+                raise _error(
+                    "PLAN_SIGNATURE_INVALID",
+                    "module composition values have invalid types",
+                )
+            composition.append((item["module_id"], item["module_digest"], item["count"]))
+        approvals: list[tuple[str, str]] = []
+        for item in cast(list[Any], arrays["approval_requirements"]):
+            if not isinstance(item, Mapping) or set(item) != {"effect_name", "node_key"}:
+                raise _error(
+                    "PLAN_SIGNATURE_INVALID",
+                    "approval requirement fields do not match the contract",
+                )
+            if not isinstance(item["node_key"], str) or not isinstance(item["effect_name"], str):
+                raise _error(
+                    "PLAN_SIGNATURE_INVALID",
+                    "approval requirement values must be strings",
+                )
+            approvals.append((item["node_key"], item["effect_name"]))
+        provenance: list[tuple[str, str]] = []
+        for item in cast(list[Any], arrays["alias_provenance"]):
+            if not isinstance(item, Mapping) or set(item) != {"alias", "node_key"}:
+                raise _error(
+                    "PLAN_SIGNATURE_INVALID",
+                    "alias provenance fields do not match the contract",
+                )
+            if not isinstance(item["node_key"], str) or not isinstance(item["alias"], str):
+                raise _error(
+                    "PLAN_SIGNATURE_INVALID",
+                    "alias provenance values must be strings",
+                )
+            provenance.append((item["node_key"], item["alias"]))
+        raw_nodes = cast(list[Any], arrays["resolved_nodes"])
         node_keys: list[str] = []
         for node in raw_nodes:
             if not isinstance(node, Mapping) or not isinstance(node.get("key"), str):
-                raise _error(
-                    "PLAN_SIGNATURE_INVALID",
-                    "resolved nodes must contain string keys",
-                )
+                raise _error("PLAN_SIGNATURE_INVALID", "resolved nodes must contain string keys")
             node_keys.append(node["key"])
-        if node_keys != sorted(node_keys):
-            raise _error(
-                "PLAN_SIGNATURE_INVALID",
-                "resolved nodes must be in canonical key order",
-            )
-        if len(node_keys) != len(set(node_keys)):
-            raise _error("PLAN_SIGNATURE_INVALID", "resolved nodes contain duplicate keys")
+        for label, value in (
+            ("module composition", composition),
+            ("approval requirements", approvals),
+            ("alias provenance", provenance),
+            ("resolved nodes", node_keys),
+        ):
+            if value != sorted(value):
+                raise _error("PLAN_SIGNATURE_INVALID", f"{label} must be in canonical order")
         try:
+            region_grant = _canonical_grant(data["region_grant"], label="region_grant")
+            required_grant = _canonical_grant(data["required_grant"], label="required_grant")
+            aggregate_budget = Budget.from_data(data["aggregate_budget"])
+            if canonical_json(aggregate_budget.to_data()) != canonical_json(
+                data["aggregate_budget"]
+            ):
+                raise ValueError("aggregate_budget is not canonical")
             return cls(
                 revision=data["revision"],
                 supersedes=data["supersedes"],
+                region_id=data["region_id"],
+                region_grant=region_grant,
+                required_grant=required_grant,
+                aggregate_budget=aggregate_budget,
                 node_count=data["node_count"],
                 max_depth=data["max_depth"],
                 max_fanout=data["max_fanout"],
@@ -948,8 +1248,12 @@ class PlanSignature:
                 topology_digest=data["topology_digest"],
                 resolved_nodes=tuple(cast(Mapping[str, Any], node) for node in raw_nodes),
                 region_input_schema_digest=data["region_input_schema_digest"],
-                outputs=tuple(raw_output_keys),
-                output_schema_digests=tuple(raw_outputs),
+                outputs=tuple(cast(list[Any], arrays["outputs"])),
+                output_schema_digests=tuple(cast(list[Any], arrays["output_schema_digests"])),
+                approval_requirements=tuple(approvals),
+                source_fragment_digest=data["source_fragment_digest"],
+                catalog_digest=data["catalog_digest"],
+                alias_provenance=tuple(provenance),
                 version=data["version"],
             )
         except (TypeError, ValueError) as exc:
@@ -958,13 +1262,24 @@ class PlanSignature:
             raise _error("PLAN_SIGNATURE_INVALID", str(exc)) from exc
 
     def canonical_json(self) -> str:
-        """Serialize the resolved signature as deterministic canonical JSON."""
+        """Serialize behavior and diagnostic provenance as canonical JSON.
+
+        Returns
+        -------
+        str
+            Deterministic JSON suitable for persistence and byte comparison.
+        """
         return canonical_json(self.to_dict())
 
     @property
     def digest(self) -> str:
-        """Return the SHA-256 digest of the complete resolved signature."""
-        return digest_data(self.to_dict())
+        """Return an alias-invariant digest of resolved graph behavior.
+
+        Diagnostic fragment labels, catalog aliases, and their provenance are
+        excluded. Module identities, content digests, topology, schemas,
+        execution requirements, grants, budgets, and region identity remain.
+        """
+        return digest_data(self._behavior_data())
 
 
 def _validate_resolved_node(node: Mapping[str, Any]) -> None:
@@ -975,14 +1290,7 @@ def _validate_resolved_node(node: Mapping[str, Any]) -> None:
         error_code="PLAN_SIGNATURE_INVALID",
     )
     _require_stable_name(
-        node["key"],
-        label="resolved node key",
-        error_code="PLAN_SIGNATURE_INVALID",
-    )
-    _require_stable_name(
-        node["module_alias"],
-        label="resolved module alias",
-        error_code="PLAN_SIGNATURE_INVALID",
+        node["key"], label="resolved node key", error_code="PLAN_SIGNATURE_INVALID"
     )
     dependencies = node["dependencies"]
     if not isinstance(dependencies, list):
@@ -995,7 +1303,7 @@ def _validate_resolved_node(node: Mapping[str, Any]) -> None:
                 error_code="PLAN_SIGNATURE_INVALID",
             )
     try:
-        _catalog_entry(
+        entry = _catalog_entry(
             module_id=node["module_id"],
             module_digest=node["module_digest"],
             input_schema_digests=node["input_schema_digests"],
@@ -1003,18 +1311,75 @@ def _validate_resolved_node(node: Mapping[str, Any]) -> None:
             execution=node["execution"],
             capabilities=node["capabilities"],
             effects=node["effects"],
+            budget=node["budget"],
+            require_canonical=True,
         )
+        grant = _canonical_grant(node["capability_grant"], label="node capability_grant")
     except ValueError as exc:
+        if isinstance(exc, PlanValidationError):
+            raise
         raise _error("PLAN_SIGNATURE_INVALID", str(exc)) from exc
+    if grant != _entry_grant(entry):
+        raise _error("PLAN_SIGNATURE_INVALID", "node capability grant is inconsistent")
 
 
 @dataclass(frozen=True)
 class _ResolvedMetrics:
     max_depth: int
     max_fanout: int
-    module_composition: tuple[tuple[str, int], ...]
+    module_composition: tuple[tuple[str, str, int], ...]
     topology_digest: str
     output_schema_digests: tuple[str, ...]
+    aggregate_budget: Budget
+    required_grant: CapabilityGrant
+    approval_requirements: tuple[tuple[str, str], ...]
+
+
+def _aggregate_budget(
+    nodes: tuple[dict[str, Any], ...],
+    by_key: Mapping[str, dict[str, Any]],
+    outputs: tuple[str, ...],
+    topological_order: tuple[str, ...],
+) -> Budget:
+    budgets = [Budget.from_data(cast(Mapping[str, Any], node["budget"])) for node in nodes]
+
+    def count_sum(attribute: str) -> int | None:
+        values = [cast(int | None, getattr(budget, attribute)) for budget in budgets]
+        return None if any(value is None for value in values) else sum(cast(list[int], values))
+
+    costs = [budget.cost_usd for budget in budgets]
+    cost = (
+        None
+        if any(value is None for value in costs)
+        else float(sum((Decimal(str(value)) for value in costs), start=Decimal(0)))
+    )
+    path_ms: dict[str, int | None] = {}
+    for key in topological_order:
+        budget_data = cast(Mapping[str, Any], by_key[key]["budget"])
+        own = cast(int | None, budget_data["wall_time_ms"])
+        dependencies = [
+            dependency
+            for dependency in cast(list[str], by_key[key]["dependencies"])
+            if dependency != _REGION_INPUT
+        ]
+        dependency_paths = [path_ms[dependency] for dependency in dependencies]
+        if own is None or any(value is None for value in dependency_paths):
+            path_ms[key] = None
+        else:
+            path_ms[key] = own + max(cast(list[int], dependency_paths), default=0)
+
+    output_paths = [path_ms[output] for output in outputs]
+    wall_time_ms = (
+        None
+        if any(value is None for value in output_paths)
+        else max(cast(list[int], output_paths), default=0)
+    )
+    return Budget(
+        wall_time=timedelta(milliseconds=wall_time_ms) if wall_time_ms is not None else None,
+        model_tokens=count_sum("model_tokens"),
+        tool_calls=count_sum("tool_calls"),
+        cost_usd=cost,
+    )
 
 
 def _resolved_metrics(
@@ -1034,11 +1399,27 @@ def _resolved_metrics(
         raise _error("PLAN_SIGNATURE_INVALID", "signature outputs contain duplicate keys")
     for output in outputs:
         if output not in by_key:
-            raise _error(
-                "PLAN_SIGNATURE_INVALID",
-                f"signature output {output!r} does not exist",
-            )
-
+            raise _error("PLAN_SIGNATURE_INVALID", f"signature output {output!r} does not exist")
+    reachable: set[str] = set()
+    pending = list(outputs)
+    while pending:
+        key = pending.pop()
+        if key in reachable:
+            continue
+        reachable.add(key)
+        for dependency in cast(list[str], by_key[key]["dependencies"]):
+            if dependency == _REGION_INPUT:
+                continue
+            if dependency not in by_key:
+                raise _error(
+                    "PLAN_SIGNATURE_INVALID",
+                    f"resolved dependency {dependency!r} does not exist",
+                )
+            pending.append(dependency)
+    if reachable != set(keys):
+        raise _error(
+            "PLAN_SIGNATURE_INVALID", "resolved graph contains a node unreachable from outputs"
+        )
     for node in nodes:
         node_key = cast(str, node["key"])
         dependencies = cast(list[str], node["dependencies"])
@@ -1050,82 +1431,105 @@ def _resolved_metrics(
             )
         if len(dependencies) != len(input_schemas):
             raise _error(
-                "PLAN_SIGNATURE_INVALID",
-                f"resolved node {node_key!r} input count is inconsistent",
+                "PLAN_SIGNATURE_INVALID", f"resolved node {node_key!r} input count is inconsistent"
             )
         for index, (dependency, expected_schema) in enumerate(
             zip(dependencies, input_schemas, strict=True)
         ):
-            if dependency == _REGION_INPUT:
-                actual_schema = region_input_schema_digest
-            else:
-                if dependency not in by_key:
-                    raise _error(
-                        "PLAN_SIGNATURE_INVALID",
-                        f"resolved dependency {dependency!r} does not exist",
-                    )
-                actual_schema = cast(str, by_key[dependency]["output_schema_digest"])
+            actual_schema = (
+                region_input_schema_digest
+                if dependency == _REGION_INPUT
+                else cast(str, by_key[dependency]["output_schema_digest"])
+            )
             if actual_schema != expected_schema:
                 raise _error(
                     "PLAN_SIGNATURE_INVALID",
                     f"resolved edge schema at {node_key!r} input {index} is inconsistent",
                 )
-
-    visiting: set[str] = set()
-    depths: dict[str, int] = {}
-
-    def visit(key: str) -> int:
-        if key in depths:
-            return depths[key]
-        if key in visiting:
-            raise _error("PLAN_SIGNATURE_INVALID", "resolved topology must be acyclic")
-        visiting.add(key)
-        dependencies = [
-            dependency
-            for dependency in cast(list[str], by_key[key]["dependencies"])
-            if dependency != _REGION_INPUT
-        ]
-        depth = 1 + max((visit(dependency) for dependency in dependencies), default=0)
-        visiting.remove(key)
-        depths[key] = depth
-        return depth
-
-    for key in keys:
-        visit(key)
+    dependencies_by_key = {key: tuple(cast(list[str], by_key[key]["dependencies"])) for key in keys}
+    depths, topological_order = _topological_depths(
+        dependencies_by_key,
+        error_code="PLAN_SIGNATURE_INVALID",
+        cycle_message="resolved topology must be acyclic",
+    )
     fanouts = Counter(
         dependency for node in nodes for dependency in cast(list[str], node["dependencies"])
     )
-    composition = tuple(sorted(Counter(cast(str, node["module_alias"]) for node in nodes).items()))
+    pin_counts = Counter(
+        (cast(str, node["module_id"]), cast(str, node["module_digest"])) for node in nodes
+    )
+    composition = tuple(
+        (module_id, module_digest, count)
+        for (module_id, module_digest), count in sorted(pin_counts.items())
+    )
+    capability_names = {
+        cast(str, item["name"])
+        for node in nodes
+        for item in cast(list[dict[str, Any]], node["capabilities"])
+    }
+    effect_names = {
+        cast(str, item["name"])
+        for node in nodes
+        for item in cast(list[dict[str, Any]], node["effects"])
+    }
+    approvals = tuple(
+        sorted(
+            (cast(str, node["key"]), cast(str, effect["name"]))
+            for node in nodes
+            for effect in cast(list[dict[str, Any]], node["effects"])
+            if effect["approval_required"] is True
+        )
+    )
     output_schemas = tuple(cast(str, by_key[output]["output_schema_digest"]) for output in outputs)
+    try:
+        aggregate_budget = _aggregate_budget(nodes, by_key, outputs, topological_order)
+    except (OverflowError, ValueError):
+        raise _error(
+            "PLAN_BUDGET_INVALID",
+            "aggregate budget exceeds the supported numeric range",
+        ) from None
     return _ResolvedMetrics(
         max_depth=max(depths.values()),
         max_fanout=max(fanouts.values(), default=0),
         module_composition=composition,
         topology_digest=digest_data({"nodes": nodes, "outputs": outputs}),
         output_schema_digests=output_schemas,
+        aggregate_budget=aggregate_budget,
+        required_grant=CapabilityGrant(
+            capabilities=tuple(capability_names), effects=tuple(effect_names)
+        ),
+        approval_requirements=approvals,
     )
 
 
 class PlanValidator:
-    """Resolve and validate generated fragments inside a trusted policy boundary.
+    """Bind generated fragments to a trusted region policy boundary.
 
     Parameters
     ----------
     catalog
         Immutable allowlist that supplies all module pins and behavior metadata.
     limits
-        Hard structural and revision limits.
-    budget_check
-        Required deployment-owned callback receiving the fully resolved
-        :class:`PlanSignature`. It must return ``None`` or raise
-        :class:`PlanValidationError` to reject the plan.
+        Hard structural, revision, and aggregate resource limits.
+    region_id
+        Stable identity of the surrounding dynamic region. It becomes part of
+        the behavioral signature and prevents reuse in another region.
+    region_grant
+        Exact maximum external-access grant available to child nodes. The
+        validator derives least-privilege child grants and rejects widening.
+    approval_check
+        Optional trusted policy callback invoked as
+        ``approval_check(region_id, node_key, effect_name)`` for every
+        approval-required effect declaration. It must return ``None``. This is
+        policy eligibility only; runtime effect requests still need durable,
+        request-scoped approval evidence.
 
     Notes
     -----
-    The package currently has no shared live-execution ``Budget`` contract.
-    Consequently this validator does not invent a cost estimator or budget
-    schema. Deployments must provide the explicit ``budget_check`` seam, which
-    can consult their authoritative module budget registry using resolved pins.
+    ``validate`` is the only operation that creates a signature from generated
+    graph choices. Imported signatures remain untrusted until
+    :meth:`revalidate` rebuilds them from the source fragment, current catalog,
+    region policy, schemas, limits, and lineage.
     """
 
     def __init__(
@@ -1133,17 +1537,27 @@ class PlanValidator:
         catalog: ModuleCatalog,
         limits: PlanLimits,
         *,
-        budget_check: Callable[[PlanSignature], None],
+        region_id: str,
+        region_grant: CapabilityGrant,
+        approval_check: Callable[[str, str, str], None] | None = None,
     ) -> None:
         if not isinstance(catalog, ModuleCatalog):
             raise TypeError("catalog must be a ModuleCatalog")
         if not isinstance(limits, PlanLimits):
             raise TypeError("limits must be PlanLimits")
-        if not callable(budget_check):
-            raise TypeError("budget_check must be a callable trusted policy seam")
+        try:
+            trusted_region_id = _require_stable_name(region_id, label="region_id")
+        except PlanValidationError as exc:
+            raise ValueError(str(exc)) from exc
+        if not isinstance(region_grant, CapabilityGrant):
+            raise TypeError("region_grant must be a CapabilityGrant")
+        if approval_check is not None and not callable(approval_check):
+            raise TypeError("approval_check must be callable or None")
         self.catalog = catalog
         self.limits = limits
-        self.budget_check = budget_check
+        self.region_id = trusted_region_id
+        self.region_grant = region_grant
+        self.approval_check = approval_check
 
     def validate(
         self,
@@ -1177,7 +1591,8 @@ class PlanValidator:
         Raises
         ------
         PlanValidationError
-            If aliases, topology, schemas, lineage, limits, or budget policy fail.
+            If aliases, topology, schemas, lineage, limits, grants, budgets, or
+            approval policy fail.
         """
         if not isinstance(fragment, PlanFragmentIR):
             raise _error("PLAN_FRAGMENT_INVALID", "fragment must be PlanFragmentIR")
@@ -1195,21 +1610,121 @@ class PlanValidator:
             _require_digest(expected_supersedes, label="expected supersedes")
         self._validate_lineage(fragment, expected_revision, expected_supersedes)
         signature = self._resolve_graph(fragment, region_input, expected_outputs)
-        try:
-            result = self.budget_check(signature)
-        except PlanValidationError:
-            raise
-        except Exception as exc:
-            raise _error(
-                "PLAN_BUDGET_VALIDATION_FAILED",
-                f"budget validation failed: {exc}",
-            ) from exc
-        if result is not None:
-            raise _error(
-                "PLAN_BUDGET_VALIDATION_FAILED",
-                "budget validation failed: budget_check must return None",
-            )
+        self._validate_budget(signature.aggregate_budget)
+        self._validate_approvals(signature.approval_requirements)
         return signature
+
+    def revalidate(
+        self,
+        signature: PlanSignature,
+        fragment: PlanFragmentIR,
+        *,
+        region_input_schema_digest: str,
+        expected_output_schema_digests: tuple[str, ...],
+        expected_revision: int,
+        expected_supersedes: str | None,
+    ) -> PlanSignature:
+        """Rebuild and authenticate an imported signature against trusted state.
+
+        The method never trusts imported resolved nodes. It resolves the source
+        fragment again through this validator's current catalog, grant, limits,
+        schemas, lineage, and approval policy, then requires an exact canonical
+        match.
+
+        Parameters
+        ----------
+        signature
+            Parsed signature to authenticate. A mapping must first be decoded
+            with :meth:`PlanSignature.from_dict`.
+        fragment
+            Original generated graph choices referenced by the signature.
+        region_input_schema_digest
+            Current trusted schema supplied to ``$input`` dependency ports.
+        expected_output_schema_digests
+            Current ordered output contracts of the surrounding region.
+        expected_revision, expected_supersedes
+            Current trusted lineage state.
+
+        Returns
+        -------
+        PlanSignature
+            Newly rebuilt trusted signature. Future materializers must use this
+            returned value and its exact per-node grants, not the imported
+            object's descriptors.
+
+        Raises
+        ------
+        PlanValidationError
+            If the value is malformed or any trusted fact has changed or was
+            forged.
+        """
+        if not isinstance(signature, PlanSignature):
+            raise _error("PLAN_SIGNATURE_INVALID", "signature must be PlanSignature")
+        rebuilt = self.validate(
+            fragment,
+            region_input_schema_digest=region_input_schema_digest,
+            expected_output_schema_digests=expected_output_schema_digests,
+            expected_revision=expected_revision,
+            expected_supersedes=expected_supersedes,
+        )
+        if signature.canonical_json() != rebuilt.canonical_json():
+            raise _error(
+                "PLAN_SIGNATURE_UNTRUSTED",
+                "signature does not match the current trusted validation context",
+            )
+        return rebuilt
+
+    def _validate_budget(self, aggregate: Budget) -> None:
+        limit = self.limits.budget
+        dimensions: tuple[tuple[str, int | float | None, int | float | None], ...] = (
+            ("model_tokens", aggregate.model_tokens, limit.model_tokens),
+            ("tool_calls", aggregate.tool_calls, limit.tool_calls),
+            ("cost_usd", aggregate.cost_usd, limit.cost_usd),
+            (
+                "wall_time",
+                cast(int | None, aggregate.to_data()["wall_time_ms"]),
+                cast(int | None, limit.to_data()["wall_time_ms"]),
+            ),
+        )
+        for name, actual, maximum in dimensions:
+            if maximum is None:
+                continue
+            if actual is None:
+                raise _error(
+                    "PLAN_BUDGET_EXCEEDED",
+                    f"unbounded child {name} exceeds the finite region budget",
+                )
+            if name == "cost_usd":
+                exceeded = Decimal(str(actual)) > Decimal(str(maximum))
+            else:
+                exceeded = actual > maximum
+            if exceeded:
+                raise _error(
+                    "PLAN_BUDGET_EXCEEDED",
+                    f"aggregate {name} exceeds the region budget",
+                )
+
+    def _validate_approvals(self, requirements: tuple[tuple[str, str], ...]) -> None:
+        if requirements and self.approval_check is None:
+            raise _error(
+                "PLAN_APPROVAL_REQUIRED",
+                "approval-required effects need a trusted approval policy check",
+            )
+        for node_key, effect_name in requirements:
+            try:
+                result = cast(Callable[[str, str, str], None], self.approval_check)(
+                    self.region_id, node_key, effect_name
+                )
+            except Exception:
+                raise _error(
+                    "PLAN_APPROVAL_VALIDATION_FAILED",
+                    "trusted approval policy validation failed",
+                ) from None
+            if result is not None:
+                raise _error(
+                    "PLAN_APPROVAL_VALIDATION_FAILED",
+                    "trusted approval policy must return None",
+                )
 
     def _validate_lineage(
         self,
@@ -1262,6 +1777,27 @@ class PlanValidator:
                     "PLAN_TOPOLOGY_INVALID",
                     f"fragment output {output!r} does not exist",
                 )
+        reachable: set[str] = set()
+        pending = list(fragment.outputs)
+        while pending:
+            key = pending.pop()
+            if key in reachable:
+                continue
+            reachable.add(key)
+            for dependency in by_key[key].dependencies:
+                if dependency == _REGION_INPUT:
+                    continue
+                if dependency not in by_key:
+                    raise _error(
+                        "PLAN_TOPOLOGY_INVALID",
+                        f"node {key!r} dependency {dependency!r} does not exist",
+                    )
+                pending.append(dependency)
+        if reachable != set(keys):
+            raise _error(
+                "PLAN_TOPOLOGY_INVALID",
+                "plan contains a node unreachable from outputs",
+            )
 
         entries: dict[str, _CatalogEntry] = {}
         for node in fragment.nodes:
@@ -1322,9 +1858,9 @@ class PlanValidator:
             resolved.append(
                 {
                     **entry.to_dict(),
+                    "capability_grant": _entry_grant(entry).to_data(),
                     "dependencies": list(node.dependencies),
                     "key": node.key,
-                    "module_alias": node.module_alias,
                 }
             )
 
@@ -1343,46 +1879,45 @@ class PlanValidator:
                     f"fragment output schema at index {index} is incompatible",
                 )
 
-        composition = tuple(sorted(Counter(node.module_alias for node in fragment.nodes).items()))
-        topology_digest = digest_data(
-            {
-                "nodes": resolved,
-                "outputs": fragment.outputs,
-            }
-        )
+        resolved_tuple = tuple(resolved)
+        metrics = _resolved_metrics(resolved_tuple, region_input_schema_digest, fragment.outputs)
+        try:
+            self.region_grant.narrow(
+                capabilities=metrics.required_grant.capabilities,
+                effects=metrics.required_grant.effects,
+            )
+        except ValueError as exc:
+            raise _error(
+                "PLAN_CAPABILITY_ESCALATION",
+                "generated plan requires access outside the trusted region grant",
+            ) from exc
         return PlanSignature(
             revision=fragment.revision,
             supersedes=fragment.supersedes,
+            region_id=self.region_id,
+            region_grant=self.region_grant,
+            required_grant=metrics.required_grant,
+            aggregate_budget=metrics.aggregate_budget,
             node_count=len(fragment.nodes),
             max_depth=max_depth,
             max_fanout=max_fanout,
-            module_composition=composition,
-            topology_digest=topology_digest,
-            resolved_nodes=tuple(resolved),
+            module_composition=metrics.module_composition,
+            topology_digest=metrics.topology_digest,
+            resolved_nodes=resolved_tuple,
             region_input_schema_digest=region_input_schema_digest,
             outputs=fragment.outputs,
             output_schema_digests=actual_outputs,
+            approval_requirements=metrics.approval_requirements,
+            source_fragment_digest=fragment.digest,
+            catalog_digest=self.catalog.digest,
+            alias_provenance=tuple((node.key, node.module_alias) for node in fragment.nodes),
         )
 
     @staticmethod
     def _depths(by_key: Mapping[str, PlanNode]) -> dict[str, int]:
-        visiting: set[str] = set()
-        memo: dict[str, int] = {}
-
-        def visit(key: str) -> int:
-            if key in memo:
-                return memo[key]
-            if key in visiting:
-                raise _error("PLAN_TOPOLOGY_INVALID", "plan topology must be acyclic")
-            visiting.add(key)
-            dependencies = [
-                dependency for dependency in by_key[key].dependencies if dependency != _REGION_INPUT
-            ]
-            depth = 1 + max((visit(dependency) for dependency in dependencies), default=0)
-            visiting.remove(key)
-            memo[key] = depth
-            return depth
-
-        for node_key in by_key:
-            visit(node_key)
-        return memo
+        depths, _order = _topological_depths(
+            {key: node.dependencies for key, node in by_key.items()},
+            error_code="PLAN_TOPOLOGY_INVALID",
+            cycle_message="plan topology must be acyclic",
+        )
+        return depths
