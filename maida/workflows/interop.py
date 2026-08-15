@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, cast
 
+from ._canonical import canonical_data
 from .access import Capability, EffectSpec, Idempotency
 from .authoring import ExecutionContext, Module
 from .fixture import ReplayFixture
@@ -117,6 +118,43 @@ class VerificationSurface:
             "The external flow is opaque; Maida verifies its typed boundary and "
             "declared access, not its internal graph or behavior.",
         )
+
+
+@dataclass(frozen=True)
+class WorkflowStartRequest:
+    """Transport-neutral idempotent request to start a registered workflow.
+
+    Parameters
+    ----------
+    workflow_id
+        Application address resolved by a deployment-pinned workflow catalog.
+    input
+        Canonical trigger-derived root input.
+    idempotency_key
+        Stable external event identity scoped by tenant at persistence time.
+
+    Notes
+    -----
+    The request carries no provider credentials or session state. HTTP, queue,
+    and in-process adapters may all translate it to
+    :meth:`~maida.workflows.userplane.WorkflowClient.start` with the same
+    idempotency key.
+    """
+
+    workflow_id: str
+    input: Any
+    idempotency_key: str
+
+    def __post_init__(self) -> None:
+        """Validate stable workflow and retry identities."""
+        _stable("workflow_id", self.workflow_id)
+        if not isinstance(self.idempotency_key, str) or not self.idempotency_key.strip():
+            raise ValueError("idempotency_key must be non-empty")
+        object.__setattr__(self, "input", canonical_data(self.input))
+
+    def to_data(self) -> dict[str, Any]:
+        """Return the userplane start body without provider-specific metadata."""
+        return {"input": self.input, "idempotency_key": self.idempotency_key}
 
 
 class ExternalWorkflowProvider(Protocol):

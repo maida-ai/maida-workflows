@@ -80,6 +80,7 @@ from .interop import (
     InteropUnsupportedError,
     VerificationSurface,
     WorkflowInterop,
+    WorkflowStartRequest,
 )
 from .ir import (
     BindingIR,
@@ -287,6 +288,7 @@ __all__ = [
     "WorkflowScheduler",
     "WorkflowSpec",
     "WorkflowSpecError",
+    "WorkflowStartRequest",
     "bind_workflow",
     "compile_workflow",
     "compile_workflow_spec",
