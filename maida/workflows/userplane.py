@@ -34,6 +34,62 @@ class CommandType(StrEnum):
     RETRY = "retry"
 
 
+class InteractionKind(StrEnum):
+    """Durable reasons that a task may relinquish compute and await a command."""
+
+    INPUT = "input"
+    APPROVAL = "approval"
+    SIGNAL = "signal"
+
+
+@dataclass(frozen=True, kw_only=True)
+class InteractionRequest:
+    """Transport-neutral request that parks a running task.
+
+    This object is runtime infrastructure rather than a workflow-authoring
+    primitive. A future ``Approval`` or ``Input`` module can emit the same
+    contract without changing persistence or frontend integrations.
+
+    Parameters
+    ----------
+    request_id
+        Stable identity used by input, approval, or signal commands.
+    kind
+        Interaction category and resulting durable task state.
+    prompt
+        Human-readable application prompt.
+    schema_digest
+        Optional declared input schema digest.
+    signal_name
+        Optional named signal required by a signal wait.
+    metadata
+        Canonical non-sensitive presentation metadata.
+    """
+
+    request_id: str
+    kind: InteractionKind
+    prompt: str
+    schema_digest: str | None = None
+    signal_name: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Validate stable request addressing and signal requirements."""
+        if not self.request_id.strip():
+            raise ValueError("request_id must be non-empty")
+        if not self.prompt.strip():
+            raise ValueError("interaction prompt must be non-empty")
+        if self.kind is InteractionKind.SIGNAL and not (self.signal_name or "").strip():
+            raise ValueError("signal_name is required for a signal interaction")
+
+    def to_data(self) -> dict[str, Any]:
+        """Return a canonical request event payload."""
+        payload = canonical_data(asdict(self))
+        if not isinstance(payload, dict):  # pragma: no cover - dataclasses encode as objects
+            raise TypeError("interaction request must encode as an object")
+        return {key: value for key, value in payload.items() if value is not None}
+
+
 @dataclass(frozen=True, kw_only=True)
 class RunCommand:
     """Base value for an idempotent command addressed to a durable run.
@@ -64,7 +120,10 @@ class RunCommand:
         payload = canonical_data(asdict(self))
         if not isinstance(payload, dict):  # pragma: no cover - dataclasses encode as objects
             raise TypeError("command payload must encode as an object")
-        return {"type": self.command_type.value, **payload}
+        return {
+            "type": self.command_type.value,
+            **{key: value for key, value in payload.items() if value is not None},
+        }
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -84,6 +143,7 @@ class SignalCommand(RunCommand):
     command_type: ClassVar[CommandType] = CommandType.SIGNAL
     name: str
     value: Any
+    request_id: str | None = None
 
     def __post_init__(self) -> None:
         """Validate command and signal identities."""
@@ -189,6 +249,7 @@ _EVENT_NAMES = {
     "TASK_READY": "task.ready",
     "ATTEMPT_STARTED": "task.started",
     "TASK_SUCCEEDED": "task.completed",
+    "TASK_COMPLETED": "task.completed",
     "TASK_FAILED": "task.failed",
     "INPUT_REQUIRED": "input.required",
     "APPROVAL_REQUIRED": "approval.required",
@@ -278,6 +339,22 @@ class RunSnapshot:
     output: Any = None
 
 
+@dataclass(frozen=True)
+class CommandReceipt:
+    """Acknowledgement for an accepted or idempotently repeated command."""
+
+    command_id: str
+    sequence: int
+    run_status: RunStatus
+    task_id: str | None = None
+    duplicate: bool = False
+
+    @property
+    def accepted(self) -> bool:
+        """Return ``True`` because a receipt exists only for accepted commands."""
+        return True
+
+
 class _UserplaneStore(DurableRuntimeStore, Protocol):
     def list_events(
         self,
@@ -287,6 +364,14 @@ class _UserplaneStore(DurableRuntimeStore, Protocol):
         after: int,
         limit: int,
     ) -> tuple[Event, ...]: ...
+
+    def submit_command(
+        self,
+        run_id: str,
+        *,
+        tenant_id: str,
+        command: dict[str, Any],
+    ) -> tuple[Event, bool, RunStatus]: ...
 
 
 @dataclass(frozen=True)
@@ -346,6 +431,26 @@ class WorkflowRun:
         projected = tuple(RunEvent.from_runtime(event) for event in loaded[:limit])
         cursor = projected[-1].sequence if projected else after
         return EventPage(projected, cursor, has_more)
+
+    def send(self, command: RunCommand) -> CommandReceipt:
+        """Validate and durably apply one idempotent typed command.
+
+        Repeating the same ``command_id`` and content returns a duplicate
+        receipt without applying the transition twice. Reusing an ID with
+        different content fails explicitly.
+        """
+        event, duplicate, status = self._store.submit_command(
+            self.run_id,
+            tenant_id=self.tenant_id,
+            command=command.to_data(),
+        )
+        return CommandReceipt(
+            command_id=command.command_id,
+            sequence=event.event_id,
+            run_status=status,
+            task_id=event.task_id,
+            duplicate=duplicate,
+        )
 
 
 class WorkflowClient:

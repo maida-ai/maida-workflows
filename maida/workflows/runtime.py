@@ -132,6 +132,10 @@ class DurableRuntimeStore(Protocol):
         """Record a failed attempt and optionally make its task retryable."""
         ...
 
+    def park_task(self, claim: ClaimedTask, request: dict[str, Any]) -> None:
+        """Relinquish a running attempt while awaiting a durable command."""
+        ...
+
     def complete_run(self, run_id: str, root_output: StoredValue) -> None:
         """Mark a run successful with its immutable root output."""
         ...
@@ -394,6 +398,22 @@ class TaskWorker:
     ) -> None:
         """Fail an attempt and optionally return its logical task to ready."""
         self.store.fail_task(envelope._claim(), diagnostic, retry=retry)
+
+    def park(self, envelope: TaskEnvelope, request: Any) -> None:
+        """Park a running task for input, approval, or a named signal.
+
+        The worker relinquishes its lease and completes the physical attempt;
+        a later accepted command returns the logical task to ``READY`` for a
+        fresh worker attempt. ``request`` must expose ``to_data()`` returning a
+        canonical interaction payload.
+        """
+        to_data = getattr(request, "to_data", None)
+        if not callable(to_data):
+            raise TypeError("interaction request must provide to_data()")
+        request_data = to_data()
+        if not isinstance(request_data, dict):
+            raise TypeError("interaction request payload must be a mapping")
+        self.store.park_task(envelope._claim(), request_data)
 
     async def run_once(self, *, task_id: str | None = None) -> BoundaryRecord | None:
         """Claim and execute at most one durable task.

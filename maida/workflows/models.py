@@ -43,8 +43,12 @@ class TaskStatus(StrEnum):
     READY = "READY"
     LEASED = "LEASED"
     RUNNING = "RUNNING"
+    NEEDS_INPUT = "NEEDS_INPUT"
+    NEEDS_APPROVAL = "NEEDS_APPROVAL"
+    WAITING_SIGNAL = "WAITING_SIGNAL"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 class AttemptStatus(StrEnum):
@@ -55,6 +59,8 @@ class AttemptStatus(StrEnum):
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     ABANDONED = "ABANDONED"
+    PARKED = "PARKED"
+    CANCELLED = "CANCELLED"
 
 
 class EffectKind(StrEnum):

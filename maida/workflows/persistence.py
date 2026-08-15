@@ -277,6 +277,15 @@ class PostgresStore:
         initial_status = TaskStatus.READY if input_value is not None else TaskStatus.BLOCKED
         dependencies = dependency_node_ids if dependency_node_ids is not None else step.dependencies
         with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT status FROM workflow_runs WHERE run_id = %s FOR SHARE",
+                (run_id,),
+            )
+            run_row = cursor.fetchone()
+            if run_row is None:
+                raise PersistenceError(f"run {run_id} was not found")
+            if run_row["status"] != RunStatus.RUNNING.value:
+                raise InvalidRunStateError(f"run {run_id} is not running")
             if input_value is not None:
                 self._register_value_artifact(cursor, input_value)
             cursor.execute(
@@ -379,7 +388,11 @@ class PostgresStore:
                 SET task_input = %s, dependency_instance_keys = %s,
                     branch_decisions = %s, map_decisions = %s,
                     status = 'READY', ready_at = now()
-                WHERE task_id = %s AND status = 'BLOCKED'
+                FROM workflow_runs
+                WHERE workflow_tasks.task_id = %s
+                  AND workflow_tasks.status = 'BLOCKED'
+                  AND workflow_runs.run_id = workflow_tasks.run_id
+                  AND workflow_runs.status = 'RUNNING'
                 RETURNING *
                 """,
                 (
@@ -449,6 +462,7 @@ class PostgresStore:
                 JOIN workflow_runs r ON r.run_id = t.run_id
                 WHERE (%s::uuid IS NULL OR t.task_id = %s::uuid)
                   AND (%s::text IS NULL OR r.definition_digest = %s::text)
+                  AND r.status = 'RUNNING'
                   AND (
                     t.status = 'READY'
                     OR (t.status IN ('LEASED', 'RUNNING') AND t.lease_expires_at < now())
@@ -545,6 +559,11 @@ class PostgresStore:
                 """
                 UPDATE workflow_tasks SET status = 'RUNNING'
                 WHERE task_id = %s AND status = 'LEASED' AND lease_token = %s
+                  AND EXISTS (
+                      SELECT 1 FROM workflow_runs
+                      WHERE workflow_runs.run_id = workflow_tasks.run_id
+                        AND workflow_runs.status = 'RUNNING'
+                  )
                 RETURNING *
                 """,
                 (claim.task.task_id, claim.attempt.lease_token),
@@ -747,6 +766,309 @@ class PostgresStore:
                 task_id=claim.task.task_id,
                 attempt_id=claim.attempt.attempt_id,
             )
+
+    def park_task(self, claim: ClaimedTask, request: dict[str, Any]) -> None:
+        """Relinquish a running attempt while awaiting a durable command.
+
+        The request becomes an append-only event and the logical task enters a
+        non-claimable state. No worker or Python stack remains allocated. A
+        matching accepted userplane command later returns the task to
+        ``READY`` for a new physical attempt.
+
+        Raises
+        ------
+        ValueError
+            If the interaction kind or required request identity is invalid.
+        StaleLeaseError
+            If the attempt no longer owns the running task.
+        """
+        kind = request.get("kind")
+        transitions = {
+            "input": (TaskStatus.NEEDS_INPUT, "INPUT_REQUIRED"),
+            "approval": (TaskStatus.NEEDS_APPROVAL, "APPROVAL_REQUIRED"),
+            "signal": (TaskStatus.WAITING_SIGNAL, "SIGNAL_REQUIRED"),
+        }
+        if kind not in transitions:
+            raise ValueError("interaction kind must be input, approval, or signal")
+        if not str(request.get("request_id", "")).strip():
+            raise ValueError("interaction request_id must be non-empty")
+        next_status, event_type = transitions[str(kind)]
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE workflow_tasks
+                SET status = %s, lease_owner = NULL, lease_token = NULL,
+                    lease_expires_at = NULL
+                WHERE task_id = %s AND status = 'RUNNING' AND lease_token = %s
+                """,
+                (next_status.value, claim.task.task_id, claim.attempt.lease_token),
+            )
+            if cursor.rowcount != 1:
+                raise StaleLeaseError(f"lease for task {claim.task.task_id} is stale")
+            cursor.execute(
+                """
+                UPDATE workflow_attempts SET status = 'PARKED', completed_at = now()
+                WHERE attempt_id = %s AND status = 'RUNNING' AND lease_token = %s
+                """,
+                (claim.attempt.attempt_id, claim.attempt.lease_token),
+            )
+            if cursor.rowcount != 1:  # pragma: no cover - task CAS protects the paired attempt
+                raise StaleLeaseError(f"attempt {claim.attempt.attempt_id} cannot park")
+            self._append_event(
+                cursor,
+                claim.task.run_id,
+                event_type,
+                request,
+                task_id=claim.task.task_id,
+                attempt_id=claim.attempt.attempt_id,
+            )
+
+    def submit_command(
+        self,
+        run_id: str,
+        *,
+        tenant_id: str,
+        command: dict[str, Any],
+    ) -> tuple[Event, bool, RunStatus]:
+        """Apply one tenant-scoped command and transition in a transaction.
+
+        Identical reuse of ``command_id`` returns the original command event.
+        Reuse with different content fails closed. The command event and any
+        resulting run/task transition are committed atomically.
+
+        Returns
+        -------
+        tuple
+            ``(command_event, duplicate, resulting_run_status)``.
+
+        Raises
+        ------
+        InvalidRunStateError
+            If the command identity conflicts, its target is unavailable, or
+            the requested transition is invalid.
+        TenantAccessError
+            If the run belongs to a different tenant.
+        """
+        command_id = str(command.get("command_id", ""))
+        command_type = str(command.get("type", ""))
+        known = {"signal", "approve", "reject", "input", "pause", "resume", "cancel", "retry"}
+        if not command_id.strip():
+            raise ValueError("command_id must be non-empty")
+        if command_type not in known:
+            raise ValueError(f"unsupported command type {command_type!r}")
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT * FROM workflow_runs WHERE run_id = %s FOR UPDATE",
+                (run_id,),
+            )
+            run_row = cursor.fetchone()
+            if run_row is None:
+                raise PersistenceError(f"run {run_id} was not found")
+            if run_row["tenant_id"] != tenant_id:
+                raise TenantAccessError("run is not accessible to this tenant")
+            cursor.execute(
+                """
+                SELECT * FROM workflow_events
+                WHERE run_id = %s AND event_type = 'COMMAND_RECEIVED'
+                  AND payload->>'command_id' = %s
+                """,
+                (run_id, command_id),
+            )
+            existing = cursor.fetchone()
+            if existing is not None:
+                if existing["payload"].get("command") != command:
+                    raise InvalidRunStateError(
+                        f"command_id {command_id!r} was reused with different content"
+                    )
+                return self._event_from_row(existing), True, RunStatus(run_row["status"])
+
+            run_status = RunStatus(run_row["status"])
+            target_task_id: str | None = None
+            if command_type in {"approve", "reject", "input"}:
+                request_id = str(command.get("request_id", ""))
+                event_type = "INPUT_REQUIRED" if command_type == "input" else "APPROVAL_REQUIRED"
+                required_status = (
+                    TaskStatus.NEEDS_INPUT if command_type == "input" else TaskStatus.NEEDS_APPROVAL
+                )
+                cursor.execute(
+                    """
+                    SELECT e.task_id FROM workflow_events e
+                    JOIN workflow_tasks t ON t.task_id = e.task_id
+                    WHERE e.run_id = %s AND e.event_type = %s
+                      AND e.payload->>'request_id' = %s AND t.status = %s
+                    ORDER BY e.event_id DESC LIMIT 1
+                    """,
+                    (run_id, event_type, request_id, required_status.value),
+                )
+                target = cursor.fetchone()
+                if target is None:
+                    raise InvalidRunStateError(
+                        f"interaction request {request_id!r} is not awaiting {command_type}"
+                    )
+                target_task_id = str(target["task_id"])
+            elif command_type == "retry":
+                target_task_id = str(command.get("task_id", ""))
+                cursor.execute(
+                    """
+                    SELECT task_id FROM workflow_tasks
+                    WHERE run_id = %s AND task_id = %s AND status = 'FAILED'
+                    FOR UPDATE
+                    """,
+                    (run_id, target_task_id),
+                )
+                if cursor.fetchone() is None:
+                    raise InvalidRunStateError(
+                        f"task {target_task_id!r} is not a failed task in this run"
+                    )
+            elif command_type == "signal":
+                signal_request_id = command.get("request_id")
+                if signal_request_id:
+                    cursor.execute(
+                        """
+                        SELECT e.task_id FROM workflow_events e
+                        JOIN workflow_tasks t ON t.task_id = e.task_id
+                        WHERE e.run_id = %s AND e.event_type = 'SIGNAL_REQUIRED'
+                          AND e.payload->>'request_id' = %s AND t.status = 'WAITING_SIGNAL'
+                        ORDER BY e.event_id DESC LIMIT 1
+                        """,
+                        (run_id, signal_request_id),
+                    )
+                    target = cursor.fetchone()
+                    if target is None:
+                        raise InvalidRunStateError(
+                            f"signal request {signal_request_id!r} is not awaiting a signal"
+                        )
+                    target_task_id = str(target["task_id"])
+
+            cursor.execute(
+                """
+                INSERT INTO workflow_events (
+                    run_id, task_id, event_type, payload
+                ) VALUES (%s, %s, 'COMMAND_RECEIVED', %s)
+                RETURNING *
+                """,
+                (run_id, target_task_id, Jsonb({"command_id": command_id, "command": command})),
+            )
+            command_row = cursor.fetchone()
+            if command_row is None:  # pragma: no cover - INSERT RETURNING contract
+                raise PersistenceError("accepted command event was not returned")
+
+            resulting_status = run_status
+            if command_type == "pause":
+                if run_status is not RunStatus.RUNNING:
+                    raise InvalidRunStateError("only a running run can be paused")
+                cursor.execute(
+                    "UPDATE workflow_runs SET status = 'PAUSED' WHERE run_id = %s",
+                    (run_id,),
+                )
+                resulting_status = RunStatus.PAUSED
+                self._append_event(cursor, run_id, "RUN_PAUSED", {"reason": command.get("reason")})
+            elif command_type == "resume":
+                if run_status is not RunStatus.PAUSED:
+                    raise InvalidRunStateError("only a paused run can be resumed")
+                cursor.execute(
+                    "UPDATE workflow_runs SET status = 'RUNNING' WHERE run_id = %s",
+                    (run_id,),
+                )
+                resulting_status = RunStatus.RUNNING
+                self._append_event(cursor, run_id, "RUN_RESUMED", {})
+            elif command_type == "cancel":
+                if run_status not in {RunStatus.RUNNING, RunStatus.PAUSED}:
+                    raise InvalidRunStateError("only a running or paused run can be cancelled")
+                cursor.execute(
+                    """
+                    UPDATE workflow_tasks
+                    SET status = 'CANCELLED', lease_owner = NULL, lease_token = NULL,
+                        lease_expires_at = NULL, completed_at = now()
+                    WHERE run_id = %s AND status IN (
+                        'BLOCKED', 'READY', 'LEASED', 'RUNNING',
+                        'NEEDS_INPUT', 'NEEDS_APPROVAL', 'WAITING_SIGNAL'
+                    )
+                    RETURNING task_id
+                    """,
+                    (run_id,),
+                )
+                cancelled_tasks = [str(row["task_id"]) for row in cursor.fetchall()]
+                cursor.execute(
+                    """
+                    UPDATE workflow_attempts SET status = 'CANCELLED', completed_at = now(),
+                        diagnostic = %s
+                    WHERE task_id = ANY(%s::uuid[]) AND status IN ('CLAIMED', 'RUNNING')
+                    """,
+                    (Jsonb({"reason": command.get("reason")}), cancelled_tasks),
+                )
+                cursor.execute(
+                    """
+                    UPDATE workflow_runs SET status = 'CANCELLED', completed_at = now(),
+                        replayable_reason = 'cancelled run'
+                    WHERE run_id = %s
+                    """,
+                    (run_id,),
+                )
+                for cancelled_task_id in cancelled_tasks:
+                    self._append_event(
+                        cursor,
+                        run_id,
+                        "TASK_CANCELLED",
+                        {"reason": command.get("reason")},
+                        task_id=cancelled_task_id,
+                    )
+                resulting_status = RunStatus.CANCELLED
+                self._append_event(
+                    cursor, run_id, "RUN_CANCELLED", {"reason": command.get("reason")}
+                )
+            elif command_type in {"approve", "reject", "input"}:
+                if run_status not in {RunStatus.RUNNING, RunStatus.PAUSED}:
+                    raise InvalidRunStateError("terminal runs cannot accept interaction commands")
+                cursor.execute(
+                    """
+                    UPDATE workflow_tasks SET status = 'READY', ready_at = now()
+                    WHERE task_id = %s AND status IN ('NEEDS_INPUT', 'NEEDS_APPROVAL')
+                    """,
+                    (target_task_id,),
+                )
+                domain_type = "INPUT_RECEIVED" if command_type == "input" else "APPROVAL_RESOLVED"
+                payload = {key: value for key, value in command.items() if key != "type"}
+                if command_type in {"approve", "reject"}:
+                    payload["decision"] = command_type
+                self._append_event(cursor, run_id, domain_type, payload, task_id=target_task_id)
+                self._append_event(cursor, run_id, "TASK_READY", {}, task_id=target_task_id)
+            elif command_type == "retry":
+                if run_status not in {RunStatus.RUNNING, RunStatus.PAUSED}:
+                    raise InvalidRunStateError("terminal runs cannot retry tasks")
+                cursor.execute(
+                    """
+                    UPDATE workflow_tasks SET status = 'READY', ready_at = now(),
+                        completed_at = NULL
+                    WHERE task_id = %s AND status = 'FAILED'
+                    """,
+                    (target_task_id,),
+                )
+                self._append_event(
+                    cursor,
+                    run_id,
+                    "TASK_RETRY_REQUESTED",
+                    {"command_id": command_id},
+                    task_id=target_task_id,
+                )
+            elif command_type == "signal":
+                if run_status not in {RunStatus.RUNNING, RunStatus.PAUSED}:
+                    raise InvalidRunStateError("terminal runs cannot accept signals")
+                if target_task_id is not None:
+                    cursor.execute(
+                        """
+                        UPDATE workflow_tasks SET status = 'READY', ready_at = now()
+                        WHERE task_id = %s AND status = 'WAITING_SIGNAL'
+                        """,
+                        (target_task_id,),
+                    )
+                payload = {key: value for key, value in command.items() if key != "type"}
+                self._append_event(
+                    cursor, run_id, "SIGNAL_RECEIVED", payload, task_id=target_task_id
+                )
+                if target_task_id is not None:
+                    self._append_event(cursor, run_id, "TASK_READY", {}, task_id=target_task_id)
+            return self._event_from_row(command_row), False, resulting_status
 
     def complete_run(self, run_id: str, root_output: StoredValue) -> None:
         """Mark a running workflow successful after every task is accepted.
