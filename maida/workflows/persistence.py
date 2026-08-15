@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.resources
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -81,6 +81,15 @@ class TenantAccessError(PersistenceError):
 
 class InvalidRunStateError(PersistenceError):
     """Raised when a run transition is invalid for its current state."""
+
+
+def _decode_budget_declaration(data: Any) -> Budget:
+    if not isinstance(data, Mapping):
+        raise PersistenceError("persisted task budget declaration is not an object")
+    try:
+        return Budget.from_data(data)
+    except (TypeError, ValueError) as exc:
+        raise PersistenceError(f"persisted task budget declaration is invalid: {exc}") from exc
 
 
 @dataclass(frozen=True)
@@ -373,7 +382,7 @@ class PostgresStore:
                 recorded_input = (
                     StoredValue.from_data(row["task_input"]) if row["task_input"] else None
                 )
-                recorded_budget = Budget.from_data(dict(row["budget_declaration"]))
+                recorded_budget = _decode_budget_declaration(row["budget_declaration"])
                 if (
                     input_value is not None
                     and recorded_input is not None
@@ -1920,7 +1929,7 @@ class PostgresStore:
             dependency_node_ids=tuple(row.get("dependency_node_ids", ())),
             input_value=StoredValue.from_data(row["task_input"]) if row["task_input"] else None,
             execution=ExecutionSpec.from_data(dict(row.get("execution_requirements") or {})),
-            budget=Budget.from_data(dict(row.get("budget_declaration") or Budget().to_data())),
+            budget=_decode_budget_declaration(row.get("budget_declaration")),
             capability_grant=CapabilityGrant.from_data(row.get("capability_grant")),
             branch_decisions=tuple(row.get("branch_decisions", ())),
             map_decisions=tuple(row.get("map_decisions", ())),

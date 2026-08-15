@@ -10,15 +10,21 @@ from maida.workflows import (
     Budget,
     ExecutionContext,
     Module,
+    RunStatus,
     RuntimeValue,
     TaskEnvelope,
+    TaskWorker,
     Workflow,
+    WorkflowCatalog,
+    WorkflowCoordinator,
+    WorkflowScheduler,
     compile_workflow,
 )
 from maida.workflows._canonical import digest_data, schema_digest
 from maida.workflows.alignment import DiffKind, GraphAligner
 from maida.workflows.ir import PlanIR
-from maida.workflows.persistence import InvalidRunStateError, PostgresStore
+from maida.workflows.persistence import InvalidRunStateError, PersistenceError, PostgresStore
+from maida.workflows.replay import build_module_registry
 
 
 class BudgetedIdentity(Module[int, int]):
@@ -39,6 +45,24 @@ class BudgetedWorkflow(Workflow[int, int]):
 
     def __init__(self, budget: Budget) -> None:
         self.identity = BudgetedIdentity(budget)
+
+    def build(self, value: RuntimeValue[int]) -> RuntimeValue[int]:
+        return self.identity(value)
+
+
+class UnbudgetedIdentity(Module[int, int]):
+    input_type = int
+    output_type = int
+
+    async def execute(self, value: int, ctx: ExecutionContext) -> int:
+        return value
+
+
+class UnbudgetedWorkflow(Workflow[int, int]):
+    workflow_id = "unbudgeted-workflow"
+    input_type = int
+    output_type = int
+    identity = UnbudgetedIdentity()
 
     def build(self, value: RuntimeValue[int]) -> RuntimeValue[int]:
         return self.identity(value)
@@ -115,12 +139,45 @@ def test_budget_is_immutable_and_round_trips_through_canonical_wire_data() -> No
         Budget.from_data({**Budget().to_data(), "wall_time_ms": 10**30})
 
 
+def test_cost_budget_rejects_lossy_or_overflowing_integer_normalization() -> None:
+    assert Budget(cost_usd=1).cost_usd == 1.0
+    with pytest.raises(ValueError, match="exactly representable"):
+        Budget(cost_usd=2**53 + 1)
+    with pytest.raises(ValueError, match="finite"):
+        Budget(cost_usd=10**400)
+
+
 def test_compiler_rejects_a_non_budget_module_declaration() -> None:
     workflow = BudgetedWorkflow(Budget())
     workflow.identity.budget = {"model_tokens": 10}  # type: ignore[assignment]
 
     with pytest.raises(ValueError, match="module budget must be a Budget"):
         compile_workflow(workflow)
+
+
+def test_unbounded_workflow_keeps_the_exact_access_ir_definition_contract() -> None:
+    plan = compile_workflow(UnbudgetedWorkflow())
+    step = plan.executable_steps[0]
+    assert step.input_binding is not None
+    expected_definition_digest = digest_data(
+        {
+            "module_id": step.module_id,
+            "logical_step": step.logical_step,
+            "module_digest": step.module_digest,
+            "input_schema_digest": step.input_binding.schema_digest,
+            "output_schema_digest": step.output_schema_digest,
+            "execution": step.execution,
+            "capabilities": step.capabilities,
+            "effects": step.effects,
+            "control": step.control,
+        }
+    )
+
+    assert plan.version == "0.2.0"
+    assert step.budget is None
+    assert step.definition_digest == expected_definition_digest
+    assert "budget" not in plan.to_dict()["steps"][0]
+    assert PlanIR.from_dict(plan.to_dict()).digest == plan.digest
 
 
 def test_budget_changes_content_identity_and_has_a_specific_structural_diff() -> None:
@@ -159,12 +216,9 @@ def test_current_budget_ir_round_trips_and_rejects_missing_or_extra_usage_fields
 
 def test_legacy_missing_budget_aligns_with_the_current_unbounded_default() -> None:
     current = compile_workflow(BudgetedWorkflow(Budget()))
-    legacy = replace(
-        current,
-        version="0.2.0",
-        steps=tuple(replace(step, budget=None) for step in current.steps),
-    )
+    legacy = PlanIR.from_dict(current.to_dict())
 
+    assert current.version == "0.2.0"
     assert GraphAligner().align(legacy, current).diff.changes == ()
 
 
@@ -295,6 +349,63 @@ def test_task_and_worker_envelope_preserve_the_budget_declaration(
     assert TaskEnvelope.from_claim(claim).to_data()["budget"] == budget.to_data()
     history = postgres_store.load_run_history(run.run_id, tenant_id="tenant-a")
     assert history.tasks[0].budget == budget
+
+    with postgres_store.connect() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE workflow_tasks SET budget_declaration = '{}'::jsonb WHERE task_id = %s",
+            (task.task_id,),
+        )
+    with pytest.raises(PersistenceError, match="budget declaration"):
+        postgres_store.load_run_history(run.run_id, tenant_id="tenant-a")
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_populated_access_ir_run_resumes_after_budget_schema_upgrade(
+    postgres_store: PostgresStore,
+) -> None:
+    workflow = UnbudgetedWorkflow()
+    scheduler = WorkflowScheduler.submit(
+        postgres_store,
+        workflow,
+        1,
+        tenant_id="tenant-a",
+    )
+    assert scheduler.plan.version == "0.2.0"
+
+    with postgres_store.connect() as connection, connection.cursor() as cursor:
+        cursor.execute("ALTER TABLE workflow_tasks DROP COLUMN budget_declaration")
+        cursor.execute(
+            "DELETE FROM workflow_schema_migrations WHERE version = %s",
+            ("0005_workflow_budgets",),
+        )
+    postgres_store.upgrade()
+
+    history = postgres_store.load_run_history(scheduler.run_id, tenant_id="tenant-a")
+    assert history.tasks[0].budget == Budget()
+    coordinator = WorkflowCoordinator(
+        postgres_store,
+        WorkflowCatalog([UnbudgetedWorkflow]),
+    )
+    assert coordinator.run_once().ready_tasks == 1
+    worker_workflow = UnbudgetedWorkflow()
+    worker = TaskWorker(
+        postgres_store,
+        workflow_id=scheduler.plan.workflow_id,
+        definition_digest=scheduler.plan.digest,
+        modules=build_module_registry(worker_workflow),
+        worker_id="upgrade-worker",
+    )
+    assert await worker.run_once() is not None
+
+    assert coordinator.run_once().completed_runs == 1
+    assert (
+        postgres_store.load_run_history(
+            scheduler.run_id,
+            tenant_id="tenant-a",
+        ).run.status
+        is RunStatus.SUCCEEDED
+    )
 
 
 def test_replacing_a_step_budget_does_not_misclassify_usage_as_a_declaration() -> None:

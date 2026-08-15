@@ -57,10 +57,14 @@ def test_default_identity_and_canonical_ir_are_stable() -> None:
     first = compile_workflow(Simple())
     second = compile_workflow(Simple())
 
-    assert first.version == "0.3.0"
+    assert first.version == "0.2.0"
     assert first.canonical_json() == second.canonical_json()
     assert first.digest == second.digest
+    assert first.digest == "8783a3d322b3edd68ee32edbcb527c8ef1a42a1b0d3084395a6742671f0c3995"
     step = first.executable_steps[0]
+    assert (
+        step.definition_digest == "15894aeadf64d4ab56280ffdab3b3a658de429c63e0d2a9ef408ea2abb6741da"
+    )
     assert step.module_id == "simple.add"
     assert step.logical_step == "root"
     assert step.replay_key is not None

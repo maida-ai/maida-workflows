@@ -46,7 +46,8 @@ class Budget:
         Maximum number of runtime-metered tool calls.
     cost_usd
         Maximum runtime-metered cost in US dollars. The value must be finite
-        and nonnegative.
+        and nonnegative. Integer inputs must be exactly representable by the
+        canonical floating-point wire value; lossy conversion is rejected.
 
     Notes
     -----
@@ -88,9 +89,14 @@ class Budget:
         if self.cost_usd is not None:
             if isinstance(self.cost_usd, bool) or not isinstance(self.cost_usd, (int, float)):
                 raise TypeError("cost_usd must be a number or None")
-            normalized = float(self.cost_usd)
+            try:
+                normalized = float(self.cost_usd)
+            except OverflowError:
+                raise ValueError("cost_usd must be finite") from None
             if not math.isfinite(normalized):
                 raise ValueError("cost_usd must be finite")
+            if isinstance(self.cost_usd, int) and normalized != self.cost_usd:
+                raise ValueError("integer cost_usd must be exactly representable as a float")
             if normalized < 0:
                 raise ValueError("cost_usd must be nonnegative")
             object.__setattr__(self, "cost_usd", 0.0 if normalized == 0 else normalized)

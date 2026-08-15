@@ -13,7 +13,7 @@ import marshal
 import re
 from collections import Counter
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, cast
 
 from ._canonical import (
@@ -579,13 +579,21 @@ class _Compiler:
             workflow=self.root_workflow,
             external_input="input",
         )
+        version = IR_VERSION
+        steps = tuple(self.steps)
+        if all(step.budget == Budget().to_data() for step in steps if step.replay_key is not None):
+            version = "0.2.0"
+            steps = tuple(
+                replace(step, budget=None) if step.replay_key is not None else step
+                for step in steps
+            )
         return _CompiledWorkflowGraph(
             PlanIR(
-                version=IR_VERSION,
+                version=version,
                 workflow_id=self.root_workflow.workflow_id,
                 input_schema=type_schema(self.root_workflow.input_type),
                 output_schema=type_schema(self.root_workflow.output_type),
-                steps=tuple(self.steps),
+                steps=steps,
                 output_node=output_node,
             ),
             output,
@@ -728,20 +736,20 @@ class _Compiler:
         budget = _budget_contract(module)
         input_digest = schema_digest(module.input_type)
         output_digest = schema_digest(module.output_type)
-        definition_digest = digest_data(
-            {
-                "module_id": module_id,
-                "logical_step": logical_step,
-                "module_digest": behavior_digest,
-                "input_schema_digest": input_digest,
-                "output_schema_digest": output_digest,
-                "execution": module.execution.to_data(),
-                "capabilities": access["capabilities"],
-                "effects": access["effects"],
-                "budget": budget,
-                "control": control,
-            }
-        )
+        definition_contract = {
+            "module_id": module_id,
+            "logical_step": logical_step,
+            "module_digest": behavior_digest,
+            "input_schema_digest": input_digest,
+            "output_schema_digest": output_digest,
+            "execution": module.execution.to_data(),
+            "capabilities": access["capabilities"],
+            "effects": access["effects"],
+            "control": control,
+        }
+        if budget != Budget().to_data():
+            definition_contract["budget"] = budget
+        definition_digest = digest_data(definition_contract)
         return StepIR(
             node_id=path,
             kind="map_module" if control and control.get("region") == "map" else "module",
@@ -779,6 +787,13 @@ def compile_workflow(workflow: Workflow[Any, Any]) -> PlanIR:
         If module identities, topology, or the root output contract are invalid.
     TypeError
         If a symbolic handoff violates a declared type contract.
+
+    Notes
+    -----
+    Workflows whose modules all use the unbounded default resource envelope
+    retain the exact ``0.2.0`` representation and digest. Declaring any finite
+    :class:`~maida.workflows.Budget` selects the budget-capable ``0.3.0``
+    representation.
 
     Examples
     --------
