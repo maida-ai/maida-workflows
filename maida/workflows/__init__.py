@@ -50,6 +50,7 @@ from .authoring import (
     parallel,
     when,
 )
+from .budget import Budget
 from .coordination import CoordinatorProgress, WorkflowCatalog, WorkflowCoordinator
 from .fixture import ReplayFixture, ReplayFixtureError, ReplayFixtureImporter
 from .ir import CompileError, PlanIR, ReplayKey, StepIR, compile_workflow
@@ -110,6 +111,7 @@ __all__ = [
     "ApproveCommand",
     "BoundModuleCall",
     "BoundaryRecord",
+    "Budget",
     "CancelCommand",
     "Capability",
     "CapabilityGrant",

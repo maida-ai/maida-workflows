@@ -88,6 +88,36 @@ adds a deterministic `step_instance_id`; mapped values therefore require a
 stable field or callback key. Reusing a module without `.at("stable-step")`, or
 creating a duplicate replay key, is a compile error.
 
+## Resource envelopes
+
+Modules can declare immutable resource limits that travel with every durable
+task and participate in structural comparison:
+
+```python
+from datetime import timedelta
+
+from maida.workflows import Budget, ExecutionContext, Module
+
+
+class Research(Module[str, str]):
+    input_type = str
+    output_type = str
+    budget = Budget(
+        wall_time=timedelta(minutes=2),
+        model_tokens=20_000,
+        tool_calls=10,
+        cost_usd=0.50,
+    )
+
+    async def execute(self, value: str, ctx: ExecutionContext) -> str:
+        return value
+```
+
+`Budget` is a behavior-bearing declaration, not a usage counter. Runtime and
+provider integrations must meter actual consumption and enforce the envelope;
+measured usage remains separate from the compiled definition and task
+declaration.
+
 The `ReplayFixture 0.1.0` format is a projection of a successful native run: a
 canonical manifest plus SHA-256-addressed blobs. Failed, cancelled, paused,
 incomplete, redacted, truncated, missing, or corrupt histories fail closed.

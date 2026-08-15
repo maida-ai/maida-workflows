@@ -11,6 +11,7 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
 
+from .budget import Budget
 from .ir import PlanIR, ReplayKey, StepIR
 
 
@@ -18,6 +19,7 @@ class DiffKind(StrEnum):
     """Classification of a structural or behavior-bearing graph change."""
 
     MODULE_DIGEST_CHANGED = "MODULE_DIGEST_CHANGED"
+    BUDGET_CHANGED = "BUDGET_CHANGED"
     CAPABILITY_CHANGED = "CAPABILITY_CHANGED"
     EFFECT_CHANGED = "EFFECT_CHANGED"
     CONNECTOR_CHANGED = "CONNECTOR_CHANGED"
@@ -200,6 +202,17 @@ class GraphAligner:
                         True,
                     )
                 )
+            if _budget_signature(old) != _budget_signature(new):
+                changes.append(
+                    GraphChange(
+                        DiffKind.BUDGET_CHANGED,
+                        f"steps[{index}].budget",
+                        key,
+                        _budget_signature(old),
+                        _budget_signature(new),
+                        True,
+                    )
+                )
             if old.capabilities != new.capabilities:
                 changes.append(
                     GraphChange(
@@ -363,6 +376,11 @@ def _connector_signature(step: StepIR) -> tuple[tuple[Any, ...], ...]:
         )
         for declaration in (*step.capabilities, *step.effects)
     )
+
+
+def _budget_signature(step: StepIR) -> dict[str, int | float | None]:
+    """Normalize legacy missing declarations to the unbounded budget."""
+    return dict(step.budget) if step.budget is not None else Budget().to_data()
 
 
 def _policy_signature(step: StepIR) -> tuple[tuple[Any, ...], ...]:

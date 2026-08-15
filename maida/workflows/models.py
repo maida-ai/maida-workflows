@@ -15,6 +15,7 @@ from enum import StrEnum
 from typing import Any, Self, cast
 
 from ._canonical import canonical_data
+from .budget import Budget
 
 
 class ExecutionMode(StrEnum):
@@ -660,7 +661,29 @@ class Run:
 
 @dataclass(frozen=True)
 class Task:
-    """Durable logical module task pinned to a module definition digest."""
+    """Durable logical module task pinned to one immutable definition.
+
+    The task carries its declared :attr:`budget` independently from accepted
+    or failed-attempt usage. Moving a task between workers therefore preserves
+    the same resource envelope without treating observed consumption as part
+    of the declaration.
+
+    Attributes
+    ----------
+    task_id, run_id
+        Durable logical task and owning run identities.
+    module_id, logical_step, step_instance_id, module_digest
+        Replay alignment, execution-instance, and behavior identities.
+    input_value
+        Typed immutable input reference, or ``None`` while dependencies block.
+    execution
+        Immutable executor-placement requirements.
+    budget
+        Immutable declared resource limits. Runtime meters record and enforce
+        actual usage separately.
+    status
+        Current durable task lifecycle state.
+    """
 
     task_id: str
     run_id: str
@@ -673,6 +696,7 @@ class Task:
     dependency_node_ids: tuple[str, ...]
     input_value: StoredValue | None
     execution: ExecutionSpec
+    budget: Budget
     capability_grant: CapabilityGrant
     branch_decisions: tuple[dict[str, Any], ...]
     map_decisions: tuple[dict[str, Any], ...]

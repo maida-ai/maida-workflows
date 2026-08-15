@@ -276,7 +276,9 @@ class TaskEnvelope:
 
     Payload bytes stay inline only when the configured value codec chose that
     representation; large values remain content-addressed references. The
-    envelope contains no workflow object, Python call stack, or VM placement.
+    envelope preserves immutable execution and budget declarations while
+    containing no workflow object, Python call stack, usage counter, or VM
+    placement.
     """
 
     task: Task
@@ -318,7 +320,11 @@ class TaskEnvelope:
         return self.task.input_value
 
     def to_data(self) -> dict[str, Any]:
-        """Return the transport mapping used by remote worker adapters."""
+        """Return remote-worker transport data with the declared budget.
+
+        The returned ``budget`` is the immutable module declaration. Attempt
+        usage is recorded separately and is never folded into this envelope.
+        """
         return {
             "task_id": self.task.task_id,
             "run_id": self.task.run_id,
@@ -328,6 +334,7 @@ class TaskEnvelope:
             "module_digest": self.task.module_digest,
             "input_ref": self.input_ref.to_data(),
             "execution_requirements": self.task.execution.to_data(),
+            "budget": self.task.budget.to_data(),
             "capability_grant": self.task.capability_grant.to_data(),
             "attempt_id": self.attempt_id,
             "attempt_number": self.attempt.attempt_number,

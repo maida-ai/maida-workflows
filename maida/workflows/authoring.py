@@ -17,6 +17,7 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Any, cast
 
 from ._canonical import schema_digest
+from .budget import Budget
 from .models import ExecutionSpec
 
 
@@ -138,6 +139,10 @@ class Module[InputT, OutputT](ABC):
     execution
         Immutable environment requirements used to match durable tasks to
         capable executors.
+    budget
+        Immutable resource-limit declaration included in the module content
+        identity and durable task envelope. Runtime integrations meter and
+        enforce consumption separately.
     capabilities, effects
         Typed external access declarations compiled into the module boundary.
         Explicit :class:`~maida.workflows.Connector` and
@@ -149,6 +154,7 @@ class Module[InputT, OutputT](ABC):
     output_type: type[OutputT]
     effectful: bool = False
     execution: ExecutionSpec = ExecutionSpec()
+    budget: Budget = Budget()
     capabilities: tuple[Any, ...] = ()
     effects: tuple[Any, ...] = ()
 

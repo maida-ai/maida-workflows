@@ -24,6 +24,7 @@ from psycopg.types.json import Jsonb
 
 from ._canonical import digest_data
 from .artifacts import ValueCodec
+from .budget import Budget
 from .ir import PlanIR, StepIR
 from .models import (
     AcceptedAttemptProvenance,
@@ -290,6 +291,7 @@ class PostgresStore:
             raise ValueError("only executable module steps can be enqueued")
         identifier = task_id or str(uuid4())
         execution = ExecutionSpec.from_data(dict(step.execution or {}))
+        budget = Budget.from_data(step.budget) if step.budget is not None else Budget()
         compiled_grant = CapabilityGrant(
             capabilities=tuple(str(item["name"]) for item in step.capabilities),
             effects=tuple(str(item["name"]) for item in step.effects),
@@ -321,9 +323,10 @@ class PostgresStore:
                     dependency_node_ids, task_input, execution_requirements,
                     execution_isolation, execution_image, execution_cpu,
                     execution_memory_bytes, required_executor_capabilities,
-                    capability_grant, branch_decisions, map_decisions, status, ready_at
+                    capability_grant, budget_declaration, branch_decisions,
+                    map_decisions, status, ready_at
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                          %s, %s, %s, %s, %s, %s, %s,
+                          %s, %s, %s, %s, %s, %s, %s, %s,
                           CASE WHEN %s = 'READY' THEN now() ELSE NULL END)
                 ON CONFLICT (run_id, module_id, logical_step, step_instance_id)
                 DO NOTHING
@@ -347,6 +350,7 @@ class PostgresStore:
                     execution.memory_bytes,
                     Jsonb(list(execution.capabilities)),
                     Jsonb(grant.to_data()),
+                    Jsonb(budget.to_data()),
                     Jsonb(list(branch_decisions)),
                     Jsonb(list(map_decisions)),
                     initial_status.value,
@@ -369,12 +373,17 @@ class PostgresStore:
                 recorded_input = (
                     StoredValue.from_data(row["task_input"]) if row["task_input"] else None
                 )
+                recorded_budget = Budget.from_data(dict(row["budget_declaration"]))
                 if (
                     input_value is not None
                     and recorded_input is not None
                     and input_value.digest != recorded_input.digest
                 ):
                     raise InvalidRunStateError("task identity was reused with a different input")
+                if recorded_budget != budget:
+                    raise InvalidRunStateError(
+                        "task identity was reused with a different budget declaration"
+                    )
             else:
                 self._append_event(
                     cursor,
@@ -1911,6 +1920,7 @@ class PostgresStore:
             dependency_node_ids=tuple(row.get("dependency_node_ids", ())),
             input_value=StoredValue.from_data(row["task_input"]) if row["task_input"] else None,
             execution=ExecutionSpec.from_data(dict(row.get("execution_requirements") or {})),
+            budget=Budget.from_data(dict(row.get("budget_declaration") or Budget().to_data())),
             capability_grant=CapabilityGrant.from_data(row.get("capability_grant")),
             branch_decisions=tuple(row.get("branch_decisions", ())),
             map_decisions=tuple(row.get("map_decisions", ())),

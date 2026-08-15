@@ -137,7 +137,7 @@ def test_compiled_ir_exposes_access_contracts_and_loads_legacy_ir() -> None:
     plan = compile_workflow(SupportWorkflow())
     customer, send = plan.executable_steps
 
-    assert plan.version == "0.2.0"
+    assert plan.version == "0.3.0"
     assert customer.capabilities == (GET_CUSTOMER.to_data(),)
     assert customer.effects == ()
     assert send.capabilities == ()
@@ -149,6 +149,7 @@ def test_compiled_ir_exposes_access_contracts_and_loads_legacy_ir() -> None:
     for step in legacy["steps"]:
         step.pop("capabilities", None)
         step.pop("effects", None)
+        step.pop("budget", None)
     loaded = PlanIR.from_dict(legacy)
     assert loaded.version == "0.1.0"
     assert all(step.capabilities == () and step.effects == () for step in loaded.steps)

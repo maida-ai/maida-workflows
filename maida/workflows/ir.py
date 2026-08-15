@@ -33,9 +33,11 @@ from .authoring import (
     _ModuleBinding,
     _WorkflowBinding,
 )
+from .budget import Budget
 
-IR_VERSION = "0.2.0"
-SUPPORTED_IR_VERSIONS = frozenset({"0.1.0", IR_VERSION})
+IR_VERSION = "0.3.0"
+SUPPORTED_IR_VERSIONS = frozenset({"0.1.0", "0.2.0", IR_VERSION})
+_ACCESS_IR_VERSIONS = frozenset({"0.2.0", IR_VERSION})
 
 
 class CompileError(ValueError):
@@ -104,6 +106,9 @@ class StepIR:
         Immutable executor requirements for executable nodes.
     capabilities, effects
         Canonical external read and write declarations.
+    budget
+        Canonical resource-limit declaration for executable nodes. Measured
+        usage is deliberately not part of Workflow IR.
     control
         Canonical control-region metadata when applicable.
     """
@@ -120,6 +125,7 @@ class StepIR:
     execution: Mapping[str, Any] | None = None
     capabilities: tuple[Mapping[str, Any], ...] = ()
     effects: tuple[Mapping[str, Any], ...] = ()
+    budget: Mapping[str, int | float | None] | None = None
     control: Mapping[str, Any] | None = None
 
     @property
@@ -162,6 +168,9 @@ class PlanIR:
     def to_dict(self) -> dict[str, Any]:
         """Return a deterministic JSON-compatible representation of the plan."""
         encoded = cast(dict[str, Any], canonical_data(asdict(self)))
+        if self.version in {"0.1.0", "0.2.0"}:
+            for step in encoded["steps"]:
+                step.pop("budget", None)
         if self.version == "0.1.0":
             for step in encoded["steps"]:
                 step.pop("capabilities", None)
@@ -188,22 +197,52 @@ class PlanIR:
             If the version, replay identities, topology, or output node is
             invalid.
         """
-        if data.get("version") not in SUPPORTED_IR_VERSIONS:
+        version = data.get("version")
+        if version not in SUPPORTED_IR_VERSIONS:
             raise ValueError(
                 f"unsupported Workflow IR version {data.get('version')!r}; "
                 f"expected one of {sorted(SUPPORTED_IR_VERSIONS)}"
             )
-        if data.get("version") == "0.1.0" and any(
+        if version == "0.1.0" and any(
             "capabilities" in step or "effects" in step for step in data["steps"]
         ):
             raise ValueError("Workflow IR 0.1.0 does not define external access fields")
+        if version in {"0.1.0", "0.2.0"} and any("budget" in step for step in data["steps"]):
+            raise ValueError(f"Workflow IR {version} does not define budget fields")
         steps = []
         for raw in data["steps"]:
             binding = raw.get("input_binding")
-            if data.get("version") == IR_VERSION and (
+            if version in _ACCESS_IR_VERSIONS and (
                 "capabilities" not in raw or "effects" not in raw
             ):
-                raise ValueError("Workflow IR 0.2.0 steps require external access fields")
+                raise ValueError(f"Workflow IR {version} steps require external access fields")
+            if version == IR_VERSION and "budget" not in raw:
+                raise ValueError(f"Workflow IR {version} steps require a budget field")
+            budget: dict[str, int | float | None] | None = None
+            if version == IR_VERSION:
+                raw_budget = raw["budget"]
+                if raw.get("module_id") is None:
+                    if raw_budget is not None:
+                        raise ValueError(
+                            f"control Workflow IR node {raw.get('node_id')!r} "
+                            "cannot declare a budget"
+                        )
+                else:
+                    if not isinstance(raw_budget, Mapping):
+                        raise ValueError(
+                            f"Workflow IR node {raw.get('node_id')!r} budget must be an object"
+                        )
+                    try:
+                        restored_budget = Budget.from_data(raw_budget)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            f"Workflow IR node {raw.get('node_id')!r} budget is invalid: {exc}"
+                        ) from exc
+                    budget = restored_budget.to_data()
+                    if canonical_json(budget) != canonical_json(raw_budget):
+                        raise ValueError(
+                            f"Workflow IR node {raw.get('node_id')!r} budget is not canonical"
+                        )
             steps.append(
                 StepIR(
                     node_id=raw["node_id"],
@@ -220,16 +259,17 @@ class PlanIR:
                         raw.get("capabilities", ()),
                         expected_kind="capability",
                         location=f"Workflow IR node {raw.get('node_id')!r} capabilities",
-                        require_canonical=data.get("version") == IR_VERSION,
+                        require_canonical=version in _ACCESS_IR_VERSIONS,
                         error_type=ValueError,
                     ),
                     effects=_validated_access_declarations(
                         raw.get("effects", ()),
                         expected_kind="effect",
                         location=f"Workflow IR node {raw.get('node_id')!r} effects",
-                        require_canonical=data.get("version") == IR_VERSION,
+                        require_canonical=version in _ACCESS_IR_VERSIONS,
                         error_type=ValueError,
                     ),
+                    budget=budget,
                     control=raw.get("control"),
                 )
             )
@@ -287,6 +327,7 @@ def _behavior_bytes(module: Module[Any, Any]) -> bytes:
 
 
 _MODULE_CONTRACT_FIELDS = {
+    "budget",
     "capabilities",
     "effectful",
     "effects",
@@ -314,7 +355,15 @@ def _module_configuration(module: Module[Any, Any]) -> dict[str, Any]:
     configured = {
         name: value
         for name, value in sorted(vars(module).items())
-        if name not in {"capabilities", "effects", "input_type", "module_id", "output_type"}
+        if name
+        not in {
+            "budget",
+            "capabilities",
+            "effects",
+            "input_type",
+            "module_id",
+            "output_type",
+        }
         and not name.startswith("_")
     }
     return {"class": declared, "instance": configured}
@@ -431,12 +480,20 @@ def _access_contract(module: Module[Any, Any]) -> dict[str, tuple[dict[str, Any]
     return access
 
 
+def _budget_contract(module: Module[Any, Any]) -> dict[str, int | float | None]:
+    budget = getattr(module, "budget", None)
+    if not isinstance(budget, Budget):
+        raise CompileError("module budget must be a Budget declaration")
+    return budget.to_data()
+
+
 def module_digest(module: Module[Any, Any]) -> str:
     """Compute the behavior-bearing content digest for a module definition.
 
     The digest covers the module class artifact, public configuration, declared
-    input/output schemas, and effect classification. Stable component and step
-    identities are intentionally excluded.
+    input/output schemas, execution environment, external access, effect
+    classification, and resource budget. Stable component and step identities
+    are intentionally excluded.
 
     Parameters
     ----------
@@ -448,6 +505,7 @@ def module_digest(module: Module[Any, Any]) -> str:
     str
         Lowercase SHA-256 hexadecimal digest.
     """
+    budget = _budget_contract(module)
     parts = [
         qualified_name(module.__class__).encode(),
         _behavior_bytes(module),
@@ -460,6 +518,8 @@ def module_digest(module: Module[Any, Any]) -> str:
     access = _access_contract(module)
     if access["capabilities"] or access["effects"]:
         parts.append(canonical_json(access).encode())
+    if budget != Budget().to_data():
+        parts.append(canonical_json({"budget": budget}).encode())
     payload = b"\0".join(parts)
     return digest_bytes(payload)
 
@@ -665,6 +725,7 @@ class _Compiler:
         self.keys.add(key)
         behavior_digest = module_digest(module)
         access = _access_contract(module)
+        budget = _budget_contract(module)
         input_digest = schema_digest(module.input_type)
         output_digest = schema_digest(module.output_type)
         definition_digest = digest_data(
@@ -677,6 +738,7 @@ class _Compiler:
                 "execution": module.execution.to_data(),
                 "capabilities": access["capabilities"],
                 "effects": access["effects"],
+                "budget": budget,
                 "control": control,
             }
         )
@@ -693,6 +755,7 @@ class _Compiler:
             execution=module.execution.to_data(),
             capabilities=access["capabilities"],
             effects=access["effects"],
+            budget=budget,
             control=control,
         )
 
@@ -752,14 +815,15 @@ def _validate_imported_plan(plan: PlanIR) -> None:
                 step.module_digest is None
                 or step.definition_digest is None
                 or step.input_binding is None
+                or (plan.version == IR_VERSION and step.budget is None)
             ):
                 raise ValueError(
                     f"executable Workflow IR node {step.node_id!r} has an incomplete definition"
                 )
             replay_keys.add(step.replay_key)
-        elif step.capabilities or step.effects:
+        elif step.capabilities or step.effects or step.budget is not None:
             raise ValueError(
-                f"control Workflow IR node {step.node_id!r} cannot declare external access"
+                f"control Workflow IR node {step.node_id!r} cannot declare module contracts"
             )
         known_nodes.add(step.node_id)
     if plan.output_node not in known_nodes:
