@@ -4,7 +4,6 @@ import inspect
 import marshal
 from collections import Counter
 from collections.abc import Callable, Mapping
-from contextlib import suppress
 from dataclasses import asdict, dataclass
 from typing import Any, cast
 
@@ -23,6 +22,7 @@ from .authoring import (
     Workflow,
     _MapBinding,
     _ModuleBinding,
+    _WorkflowBinding,
 )
 
 IR_VERSION = "0.1.0"
@@ -81,6 +81,10 @@ class PlanIR:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> PlanIR:
+        if data.get("version") != IR_VERSION:
+            raise ValueError(
+                f"unsupported Workflow IR version {data.get('version')!r}; expected {IR_VERSION}"
+            )
         steps = []
         for raw in data["steps"]:
             binding = raw.get("input_binding")
@@ -98,7 +102,7 @@ class PlanIR:
                     control=raw.get("control"),
                 )
             )
-        return cls(
+        plan = cls(
             version=str(data["version"]),
             workflow_id=str(data["workflow_id"]),
             input_schema=cast(Mapping[str, Any], data["input_schema"]),
@@ -106,6 +110,8 @@ class PlanIR:
             steps=tuple(steps),
             output_node=str(data["output_node"]),
         )
+        _validate_imported_plan(plan)
+        return plan
 
     def canonical_json(self) -> str:
         return canonical_json(self.to_dict())
@@ -119,40 +125,75 @@ class PlanIR:
         return tuple(step for step in self.steps if step.replay_key is not None)
 
 
+@dataclass(frozen=True)
+class _CompiledWorkflowGraph:
+    plan: PlanIR
+    output: RuntimeValue[Any]
+
+
 def _behavior_bytes(module: Module[Any, Any]) -> bytes:
-    function = module.__class__.execute
-    try:
-        return inspect.getsource(function).encode()
-    except (OSError, TypeError):
-        code = getattr(function, "__code__", None)
-        if code is None:
-            return qualified_name(function).encode()
-        return marshal.dumps(code)
+    artifacts: list[bytes] = []
+    for module_class in reversed(module.__class__.mro()):
+        if module_class in {object, Module}:
+            continue
+        try:
+            artifacts.append(inspect.getsource(module_class).encode())
+            continue
+        except (OSError, TypeError):
+            pass
+        artifacts.append(qualified_name(module_class).encode())
+        for name, member in sorted(vars(module_class).items()):
+            function = (
+                member.__func__ if isinstance(member, (classmethod, staticmethod)) else member
+            )
+            code = getattr(function, "__code__", None)
+            if code is not None:
+                artifacts.extend((name.encode(), marshal.dumps(code)))
+    return b"\0".join(artifacts)
+
+
+_MODULE_CONTRACT_FIELDS = {
+    "effectful",
+    "input_type",
+    "module_id",
+    "output_type",
+}
+
+
+def _module_configuration(module: Module[Any, Any]) -> dict[str, Any]:
+    declared: dict[str, Any] = {}
+    for module_class in reversed(module.__class__.mro()):
+        if module_class in {object, Module}:
+            continue
+        for name, value in sorted(vars(module_class).items()):
+            if (
+                name.startswith("_")
+                or name in _MODULE_CONTRACT_FIELDS
+                or isinstance(value, (classmethod, property, staticmethod))
+                or callable(value)
+            ):
+                continue
+            declared[name] = value
+    configured = {
+        name: value
+        for name, value in sorted(vars(module).items())
+        if name != "module_id" and not name.startswith("_")
+    }
+    return {"class": declared, "instance": configured}
 
 
 def module_digest(module: Module[Any, Any]) -> str:
-    cached = getattr(module, "_maida_definition_digest", None)
-    if isinstance(cached, str):
-        return cached
-    config = {
-        key: value
-        for key, value in vars(module).items()
-        if key != "module_id" and not key.startswith("_")
-    }
     payload = b"\0".join(
         (
             qualified_name(module.__class__).encode(),
             _behavior_bytes(module),
-            canonical_json(config).encode(),
+            canonical_json(_module_configuration(module)).encode(),
             schema_digest(module.input_type).encode(),
             schema_digest(module.output_type).encode(),
             str(module.effectful).encode(),
         )
     )
-    digest = digest_bytes(payload)
-    with suppress(AttributeError, TypeError):
-        module._maida_definition_digest = digest
-    return digest
+    return digest_bytes(payload)
 
 
 def _callback_identity(callback: Callable[[Any], str]) -> str:
@@ -188,10 +229,14 @@ class _Compiler:
         self.steps: list[StepIR] = []
         self.node_ids: dict[int, str] = {}
         self.occurrences: Counter[int] = Counter()
+        self.implicit_occurrences: set[int] = set()
         self.keys: set[ReplayKey] = set()
         self.module_paths_by_workflow: dict[int, dict[int, str]] = {}
 
     def compile(self) -> PlanIR:
+        return self.compile_graph().plan
+
+    def compile_graph(self) -> _CompiledWorkflowGraph:
         self._validate_workflow(self.root_workflow)
         root_input = RuntimeValue.input(self.root_workflow.input_type)
         output = self.root_workflow.build(root_input)
@@ -206,13 +251,16 @@ class _Compiler:
             workflow=self.root_workflow,
             external_input="input",
         )
-        return PlanIR(
-            version=IR_VERSION,
-            workflow_id=self.root_workflow.workflow_id,
-            input_schema=type_schema(self.root_workflow.input_type),
-            output_schema=type_schema(self.root_workflow.output_type),
-            steps=tuple(self.steps),
-            output_node=output_node,
+        return _CompiledWorkflowGraph(
+            PlanIR(
+                version=IR_VERSION,
+                workflow_id=self.root_workflow.workflow_id,
+                input_schema=type_schema(self.root_workflow.input_type),
+                output_schema=type_schema(self.root_workflow.output_type),
+                steps=tuple(self.steps),
+                output_node=output_node,
+            ),
+            output,
         )
 
     def _validate_workflow(self, workflow: Workflow[Any, Any]) -> None:
@@ -235,9 +283,10 @@ class _Compiler:
         if existing is not None:
             return existing
         if expression.kind == "workflow":
-            nested = expression.payload
-            if not isinstance(nested, Workflow):
+            binding = expression.payload
+            if not isinstance(binding, _WorkflowBinding):
                 raise CompileError("invalid nested workflow expression")
+            nested = binding.workflow
             self._validate_workflow(nested)
             source = self._visit(
                 expression.dependencies[0],
@@ -245,10 +294,8 @@ class _Compiler:
                 workflow=workflow,
                 external_input=external_input,
             )
-            nested_input = RuntimeValue.input(nested.input_type)
-            nested_output = nested.build(nested_input)
             node_id = self._visit(
-                nested_output,
+                binding.output,
                 path=f"{path}.nested[{nested.workflow_id}]",
                 workflow=nested,
                 external_input=source,
@@ -324,7 +371,11 @@ class _Compiler:
         control: Mapping[str, Any] | None,
     ) -> StepIR:
         self.occurrences[id(module)] += 1
-        if self.occurrences[id(module)] > 1 and not explicit:
+        if not explicit:
+            self.implicit_occurrences.add(id(module))
+        if self.occurrences[id(module)] > 1 and (
+            not explicit or id(module) in self.implicit_occurrences
+        ):
             raise CompileError(
                 "a reused module requires an explicit .at(logical_step) identity "
                 "for every occurrence"
@@ -373,3 +424,39 @@ class _Compiler:
 
 def compile_workflow(workflow: Workflow[Any, Any]) -> PlanIR:
     return _Compiler(workflow).compile()
+
+
+def _compile_workflow_graph(workflow: Workflow[Any, Any]) -> _CompiledWorkflowGraph:
+    return _Compiler(workflow).compile_graph()
+
+
+def _validate_imported_plan(plan: PlanIR) -> None:
+    known_nodes = {"input"}
+    replay_keys: set[ReplayKey] = set()
+    for step in plan.steps:
+        if step.node_id in known_nodes:
+            raise ValueError(f"duplicate Workflow IR node {step.node_id!r}")
+        missing_dependencies = set(step.dependencies) - known_nodes
+        if missing_dependencies:
+            raise ValueError(
+                f"Workflow IR node {step.node_id!r} has unknown or forward dependencies: "
+                f"{sorted(missing_dependencies)}"
+            )
+        identity = (step.module_id, step.logical_step)
+        if (identity[0] is None) != (identity[1] is None):
+            raise ValueError(f"Workflow IR node {step.node_id!r} has a partial replay identity")
+        if step.replay_key is not None:
+            if step.replay_key in replay_keys:
+                raise ValueError(f"duplicate replay key {step.replay_key.as_string()}")
+            if (
+                step.module_digest is None
+                or step.definition_digest is None
+                or step.input_binding is None
+            ):
+                raise ValueError(
+                    f"executable Workflow IR node {step.node_id!r} has an incomplete definition"
+                )
+            replay_keys.add(step.replay_key)
+        known_nodes.add(step.node_id)
+    if plan.output_node not in known_nodes:
+        raise ValueError(f"Workflow IR output node {plan.output_node!r} does not exist")

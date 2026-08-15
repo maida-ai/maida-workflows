@@ -5,7 +5,7 @@ durable, replayable AI workflows. It compiles workflow definitions into a
 canonical replay-addressable IR, records accepted module-boundary history in
 PostgreSQL, and projects successful native runs into portable replay fixtures.
 
-The first implementation supports:
+The package supports:
 
 - typed modules, branches, stable-key maps, parallel joins, and nested workflows;
 - durable PostgreSQL runs, tasks, attempts, events, definitions, and leases;
@@ -13,9 +13,7 @@ The first implementation supports:
 - structural diff, zero-live-call full-stub replay, and isolated selective replay;
 - a canonical `maida_workflows` package and `maida.workflows` wheel shim.
 
-Python 3.12 and 3.13 are supported. The temporary `<3.14` cap follows the
-required `maida-ai` integration dependency and can be removed when that package
-widens its own compatibility range.
+Python 3.12 and 3.13 are supported.
 
 ## Quick start
 
@@ -44,6 +42,10 @@ class Greeting(Workflow[str, str]):
 plan = compile_workflow(Greeting())
 print(plan.canonical_json())
 ```
+
+For a PyTorch-style progression from one module through sequential, branching,
+parallel, keyed-map, nested, and expert replay-ready composition, see the
+[workflow creation examples](examples/workflow_creation/README.md).
 
 Use `maida-workflows --help` for compile, database, fixture, diff, replay, and
 verification commands. Fixture export is explicit and writes private local
@@ -80,10 +82,9 @@ export MAIDA_WORKFLOWS_DSN=postgresql://maida_workflows:local-only@127.0.0.1:554
 uv run maida-workflows db upgrade
 ```
 
-Runtime recovery uses persisted task input, leases, compare-and-swap completion,
-and accepted checkpoints only. Replay resolution is a separate module and is
-not imported by the recovery worker. Expired attempts remain diagnostic
-history; only one accepted logical boundary is eligible for fixture projection.
+Expired task attempts can be retried from persisted input. Attempt history is
+retained for diagnostics, while only the accepted logical result is eligible
+for fixture projection.
 
 Key commands are:
 
@@ -113,7 +114,7 @@ selective execution failures, budget failures, and effect violations block.
 Baselines contain fixture/population digests and provenance, never fixture
 payloads.
 
-## Deterministic Phase 2 exit demo
+## Native replay demo
 
 The offline demo captures a native run, exports it, changes one same-identity
 module, prints the structural/content diff, performs full-stub and selective
@@ -133,22 +134,14 @@ local Compose service, and show the final JSON. Expected evidence includes one
 `replay_effect_calls: 0`. The demo is deterministic and needs no cloud account,
 API key, or production credential.
 
-CI should order checks as: compile, structural diff, full-stub replay, selective
-replay of changed modules, representative live reruns, then the broader
-behavioral gate.
+## Safety and compatibility
 
-## Current boundaries
-
-Deferred work includes the HTTP/SSE userplane, durable approval commands,
-production capability/effect brokers and idempotency, OS-level syscall
-sandboxing, dynamic Plan IR execution/replay, hosted retention, generic-trace
-heuristics, and Path A instrumentation. Replay workers currently guarantee that
-runtime-managed effect paths cannot reach production adapters; arbitrary Python
-syscall isolation needs the future OS/container sandbox.
+Replay workers prevent runtime-managed effect paths from reaching registered
+production adapters. They do not sandbox arbitrary Python syscalls, so untrusted
+selective modules still require appropriate process or container isolation.
 
 `maida_workflows` is canonical. Built wheels also install `maida.workflows` as a
-compatibility shim. Editable overlay behavior remains experimental because the
-installed `maida` parent is a regular, non-cooperative namespace package.
+compatibility shim; editable installs should import the canonical package.
 
 ## Development
 
@@ -164,5 +157,4 @@ uv build
 PostgreSQL integration tests use `MAIDA_WORKFLOWS_TEST_DSN`. A local service is
 provided in `compose.yaml`.
 
-Python 3.12 and 3.13 are both test targets. Removing the temporary `<3.14` cap
-remains follow-up work after the required `maida-ai` dependency supports 3.14.
+Test and package metadata target Python 3.12 and 3.13.

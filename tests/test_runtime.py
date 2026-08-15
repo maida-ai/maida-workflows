@@ -299,6 +299,40 @@ async def test_worker_fails_closed_for_missing_modules_and_invalid_persisted_val
         await worker.run_once(task_id=invalid_task.task_id)
 
 
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_worker_rejects_code_that_does_not_match_the_pinned_module_digest(
+    postgres_store: PostgresStore,
+) -> None:
+    workflow = BranchWorkflow()
+    plan = compile_workflow(workflow)
+    step = next(
+        item for item in plan.executable_steps if item.module_id == "branch-runtime.positive"
+    )
+    value = postgres_store.values.encode(1, schema_digest=schema_digest(int))
+    run = postgres_store.create_run(plan, tenant_id="local", root_input=value)
+    task = postgres_store.enqueue_task(
+        run.run_id,
+        step,
+        step_instance_id="pinned-definition",
+        input_value=value,
+    )
+
+    replacement = CountingBranch(999)
+    assert step.replay_key is not None
+    worker = TaskWorker(
+        postgres_store,
+        workflow_id=plan.workflow_id,
+        definition_digest=plan.digest,
+        modules={step.replay_key: replacement},
+        worker_id="wrong-definition",
+    )
+
+    with pytest.raises(RuntimeContractError, match="digest mismatch"):
+        await worker.run_once(task_id=task.task_id)
+    assert replacement.calls == 0
+
+
 def test_worker_configuration_requires_positive_attempt_budget(
     postgres_store: PostgresStore,
 ) -> None:

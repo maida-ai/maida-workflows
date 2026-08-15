@@ -8,7 +8,7 @@ import typing
 from collections.abc import Mapping, Sequence
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 
 class CanonicalValueError(TypeError):
@@ -137,6 +137,14 @@ def value_matches_type(value: Any, annotation: Any) -> bool:
     args = typing.get_args(annotation)
     if origin in (typing.Union, types.UnionType):
         return any(value_matches_type(value, item) for item in args)
+    if dataclasses.is_dataclass(annotation):
+        if not isinstance(value, cast(type[Any], annotation)):
+            return False
+        hints = typing.get_type_hints(annotation)
+        return all(
+            value_matches_type(getattr(value, field.name), hints.get(field.name, Any))
+            for field in dataclasses.fields(annotation)
+        )
     if origin in (list, Sequence):
         return isinstance(value, list) and all(
             value_matches_type(item, args[0] if args else Any) for item in value
@@ -151,7 +159,12 @@ def value_matches_type(value: Any, annotation: Any) -> bool:
             )
         )
     if origin in (dict, Mapping):
-        return isinstance(value, dict) and all(isinstance(key, str) for key in value)
+        key_type = args[0] if args else Any
+        value_type = args[1] if len(args) > 1 else Any
+        return isinstance(value, dict) and all(
+            value_matches_type(key, key_type) and value_matches_type(item, value_type)
+            for key, item in value.items()
+        )
     try:
         return isinstance(value, annotation)
     except TypeError:

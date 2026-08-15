@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from maida_workflows import (
     RuntimeValue,
     Workflow,
     compile_workflow,
+    when,
 )
 from maida_workflows.alignment import DiffKind, GraphAligner
 from maida_workflows.baseline import create_baseline
@@ -31,6 +33,7 @@ from maida_workflows.replay import (
     ReplayBudget,
     ReplayCase,
     ReplayContractError,
+    ReplayEffectViolation,
     ReplayEngine,
     ReplayMode,
     ReplaySelectorError,
@@ -245,6 +248,11 @@ async def test_failed_incomplete_and_generic_traces_are_rejected(
         ReplayFixtureExporter(postgres_store.values).project(incomplete)
     assert captured.value.code is FixtureErrorCode.RUN_NOT_TERMINAL
 
+    missing_boundary = replace(history, tasks=history.tasks[:1])
+    with pytest.raises(ReplayFixtureError) as captured:
+        ReplayFixtureExporter(postgres_store.values).project(missing_boundary)
+    assert captured.value.code is FixtureErrorCode.HISTORY_INCOMPLETE
+
     generic = tmp_path / "ordinary-maida-trace"
     generic.mkdir()
     (generic / "meta.json").write_text("{}")
@@ -270,6 +278,56 @@ class InsertedChain(ChangedChain):
         return self.second.at("second")(self.added(self.first.at("first")(value)))
 
 
+class IsPositive(Module[int, bool]):
+    input_type = int
+    output_type = bool
+
+    async def execute(self, value: int, ctx: ExecutionContext) -> bool:
+        return value > 0
+
+
+class Offset(Module[int, int]):
+    input_type = int
+    output_type = int
+
+    def __init__(self, amount: int) -> None:
+        self.amount = amount
+
+    async def execute(self, value: int, ctx: ExecutionContext) -> int:
+        return value + self.amount
+
+
+class HistoricalBranch(Workflow[int, int]):
+    workflow_id = "historical-path"
+    input_type = int
+    output_type = int
+
+    def __init__(self) -> None:
+        self.check = IsPositive()
+        self.positive = Offset(10)
+        self.negative = Offset(-10)
+
+    def build(self, value: RuntimeValue[int]) -> RuntimeValue[int]:
+        return when(
+            self.check.at("check")(value),
+            then=self.positive.at("positive")(value),
+            otherwise=self.negative.at("negative")(value),
+        )
+
+
+class BranchWithInsertedNegativeStep(HistoricalBranch):
+    def __init__(self) -> None:
+        super().__init__()
+        self.extra = Offset(-1)
+
+    def build(self, value: RuntimeValue[int]) -> RuntimeValue[int]:
+        return when(
+            self.check.at("check")(value),
+            then=self.positive.at("positive")(value),
+            otherwise=self.negative.at("negative")(self.extra.at("negative-extra")(value)),
+        )
+
+
 @pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_divergence_uses_structured_diff_and_policy_controls_blocking(
@@ -289,6 +347,34 @@ async def test_divergence_uses_structured_diff_and_policy_controls_blocking(
     )
     assert diagnostic.verdict is VerificationVerdict.PASS
     assert blocking.verdict is VerificationVerdict.FAIL
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_replay_alignment_projects_only_the_historical_executed_branch(
+    postgres_store: PostgresStore,
+) -> None:
+    positive_fixture = await capture_fixture(postgres_store, HistoricalBranch(), 2)
+    current = BranchWithInsertedNegativeStep()
+    static = GraphAligner().align(positive_fixture.workflow_ir, compile_workflow(current)).diff
+    assert static.first_divergence is not None
+    assert static.first_divergence.kind is DiffKind.INSERTION
+
+    historical_path = await ReplayEngine(trace_bridge=FakeTraceBridge()).replay(
+        current,
+        ReplayCase(positive_fixture, ReplayMode.FULL_STUB),
+    )
+    assert historical_path.status is ReplayStatus.PASS
+    assert historical_path.output == 12
+
+    negative_fixture = await capture_fixture(postgres_store, HistoricalBranch(), -2)
+    changed_path = await ReplayEngine(trace_bridge=FakeTraceBridge()).replay(
+        current,
+        ReplayCase(negative_fixture, ReplayMode.FULL_STUB),
+    )
+    assert changed_path.status is ReplayStatus.REPLAY_DIVERGENCE
+    assert changed_path.divergence is not None
+    assert changed_path.divergence.change.kind is DiffKind.INSERTION
 
 
 class StringSecond(Module[int, str]):
@@ -386,6 +472,13 @@ class Violating(Safe):
         return value
 
 
+class SuppressesViolation(Safe):
+    async def execute(self, value: int, ctx: ExecutionContext) -> int:
+        with suppress(ReplayEffectViolation):
+            await ctx.broker.effect("production", "send", {"value": value})
+        return value
+
+
 class BrokerWorkflow(Workflow[int, int]):
     workflow_id = "broker"
     input_type = int
@@ -414,6 +507,17 @@ async def test_any_broker_effect_attempt_is_a_hard_violation(
     )
     assert result.status is ReplayStatus.REPLAY_EFFECT_VIOLATION
     assert result.blocking
+
+    suppressed = await ReplayEngine(trace_bridge=FakeTraceBridge()).replay(
+        BrokerWorkflow(SuppressesViolation()),
+        ReplayCase(
+            fixture,
+            ReplayMode.SELECTIVE,
+            (ReplayKey("broker.boundary", "root"),),
+        ),
+    )
+    assert suppressed.status is ReplayStatus.REPLAY_EFFECT_VIOLATION
+    assert suppressed.blocking
 
 
 class ReusedWorkflow(Workflow[int, int]):
@@ -464,7 +568,7 @@ def test_replay_worker_policy_scrubs_credentials_and_rejects_effect_adapters() -
 
 @pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_phase_two_exit_demo_proves_native_replay_and_effect_safety(
+async def test_native_replay_demo_proves_selective_execution_and_effect_safety(
     postgres_store: PostgresStore, tmp_path: Path
 ) -> None:
     from examples.native_replay_demo import run_demo

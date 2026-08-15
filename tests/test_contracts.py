@@ -75,6 +75,9 @@ def test_type_schemas_and_runtime_type_checks_cover_boundary_shapes() -> None:
     assert not value_matches_type((1,), tuple[int, str])
     assert value_matches_type({"key": 1}, dict[str, int])
     assert not value_matches_type({1: "bad"}, dict[str, int])
+    assert not value_matches_type({"key": "bad"}, dict[str, int])
+    assert value_matches_type(Contract(1), Contract)
+    assert not value_matches_type(Contract("bad"), Contract)  # type: ignore[arg-type]
 
 
 class Identity(Module[int, int]):
@@ -161,3 +164,28 @@ def test_graph_diff_reports_resolvable_schema_and_digest_changes() -> None:
         DiffKind.MODULE_DIGEST_CHANGED,
         DiffKind.SCHEMA_CHANGED,
     ]
+
+
+def test_imported_plan_rejects_unknown_versions_duplicate_keys_and_broken_topology() -> None:
+    source = compile_workflow(PairWorkflow())
+    data = source.to_dict()
+
+    unsupported = {**data, "version": "9.9.9"}
+    with pytest.raises(ValueError, match="unsupported Workflow IR"):
+        type(source).from_dict(unsupported)
+
+    steps = list(data["steps"])
+    executable = [step for step in steps if step["module_id"] is not None]
+    duplicate = {**executable[1], "module_id": executable[0]["module_id"]}
+    duplicate["logical_step"] = executable[0]["logical_step"]
+    duplicate_data = {
+        **data,
+        "steps": [*steps, {**duplicate, "node_id": "duplicate"}],
+        "output_node": "duplicate",
+    }
+    with pytest.raises(ValueError, match="duplicate replay key"):
+        type(source).from_dict(duplicate_data)
+
+    broken = {**data, "steps": [{**steps[0], "dependencies": ["missing"]}, *steps[1:]]}
+    with pytest.raises(ValueError, match="unknown or forward dependencies"):
+        type(source).from_dict(broken)

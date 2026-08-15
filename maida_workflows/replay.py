@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from collections import Counter
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -10,8 +11,8 @@ from enum import StrEnum
 from functools import partial
 from typing import Any, Protocol, cast
 
-from ._canonical import digest_data, schema_digest, value_matches_type
-from .alignment import GraphAligner, GraphChange, GraphDiff
+from ._canonical import canonical_json, digest_data, schema_digest, value_matches_type
+from .alignment import GraphAligner, GraphChange, GraphDiff, project_execution_path
 from .authoring import (
     ExecutionContext,
     Module,
@@ -19,11 +20,12 @@ from .authoring import (
     Workflow,
     _MapBinding,
     _ModuleBinding,
+    _WorkflowBinding,
 )
 from .fixture import ReplayFixture, _validate_loaded_integrity
-from .ir import PlanIR, ReplayKey, compile_workflow
+from .ir import PlanIR, ReplayKey, _compile_workflow_graph
 from .models import EffectKind, EffectRecord, Usage
-from .runtime import _coerce_trajectory, _rehydrate
+from .runtime import _coerce_trajectory, _rehydrate, _stable_instance_id
 
 
 class ReplayMode(StrEnum):
@@ -217,8 +219,14 @@ class ReplayEngine:
         case: ReplayCase,
     ) -> ReplayResult:
         _validate_loaded_integrity(case.fixture)
-        current = compile_workflow(workflow)
-        alignment = self.aligner.align(case.fixture.workflow_ir, current)
+        compiled = _compile_workflow_graph(workflow)
+        current = compiled.plan
+        historical_path = project_execution_path(
+            case.fixture.workflow_ir,
+            case.fixture.control_decisions,
+        )
+        current_path = project_execution_path(current, case.fixture.control_decisions)
+        alignment = self.aligner.align(historical_path, current_path)
         if alignment.diff.first_divergence is not None:
             change = alignment.diff.first_divergence
             return ReplayResult(
@@ -229,22 +237,28 @@ class ReplayEngine:
                 message=f"graph correspondence stopped at {change.location}",
             )
         self._validate_contracts(workflow, current, case.fixture)
+        historical_output = await _StubGraphExecutor(current, case.fixture).execute(
+            workflow,
+            compiled.output,
+        )
         if case.mode is ReplayMode.FULL_STUB:
             if case.live_steps:
                 raise ReplaySelectorError("full-stub replay does not accept live step selectors")
-            output = _rehydrate(
-                case.fixture.values.decode(case.fixture.root_output),
-                workflow.output_type,
-            )
             return ReplayResult(
                 status=ReplayStatus.PASS,
                 mode=case.mode,
-                output=output,
+                output=historical_output,
                 message="all accepted outputs injected; zero live boundaries executed",
             )
         if not case.live_steps:
             raise ReplaySelectorError("selective replay requires at least one exact live step")
-        return await self._selective(workflow, current, case)
+        return await self._selective(
+            workflow,
+            current,
+            case,
+            historical_output,
+            compiled.output,
+        )
 
     def _validate_contracts(
         self,
@@ -268,7 +282,11 @@ class ReplayEngine:
         seen_instances: set[str] = set()
         for boundary in fixture.boundaries:
             key = ReplayKey(boundary.module_id, boundary.logical_step)
-            step = current_by_key[key]
+            step = current_by_key.get(key)
+            if step is None:
+                raise ReplayContractError(
+                    f"recorded boundary {boundary.instance_key} has no current replay key"
+                )
             input_schema = step.input_binding.schema_digest if step.input_binding else None
             if (
                 boundary.input_schema_digest != input_schema
@@ -293,6 +311,8 @@ class ReplayEngine:
         workflow: Workflow[Any, Any],
         current: PlanIR,
         case: ReplayCase,
+        historical_output: Any,
+        built_output: RuntimeValue[Any],
     ) -> ReplayResult:
         selected = set(case.live_steps)
         available = {
@@ -302,7 +322,17 @@ class ReplayEngine:
         if unknown:
             labels = ", ".join(sorted(key.as_string() for key in unknown))
             raise ReplaySelectorError(f"unknown replay selector(s): {labels}")
-        modules = build_module_registry(workflow, current)
+        executed = {
+            ReplayKey(boundary.module_id, boundary.logical_step)
+            for boundary in case.fixture.boundaries
+        }
+        unavailable = selected - executed
+        if unavailable:
+            labels = ", ".join(sorted(key.as_string() for key in unavailable))
+            raise ReplaySelectorError(
+                f"selected step(s) have no recorded execution in this fixture: {labels}"
+            )
+        modules = build_module_registry(workflow, current, output=built_output)
         comparisons: list[StepComparison] = []
         traces: list[str] = []
         usage = Usage()
@@ -367,12 +397,28 @@ class ReplayEngine:
                     message=str(exc),
                 )
             except Exception as exc:
+                if broker.effect_attempts:
+                    return ReplayResult(
+                        status=ReplayStatus.REPLAY_EFFECT_VIOLATION,
+                        mode=case.mode,
+                        comparisons=tuple(comparisons),
+                        blocking=True,
+                        message="a supported effect path was attempted during replay",
+                    )
                 return ReplayResult(
                     status=ReplayStatus.REPLAY_LIVE_FAILURE,
                     mode=case.mode,
                     comparisons=tuple(comparisons),
                     blocking=True,
                     message=f"{type(exc).__qualname__}: {exc}",
+                )
+            if broker.effect_attempts:
+                return ReplayResult(
+                    status=ReplayStatus.REPLAY_EFFECT_VIOLATION,
+                    mode=case.mode,
+                    comparisons=tuple(comparisons),
+                    blocking=True,
+                    message="a supported effect path was attempted during replay",
                 )
             elapsed_ms = (time.perf_counter() - started) * 1000
             if not value_matches_type(output, module.output_type):
@@ -408,15 +454,11 @@ class ReplayEngine:
                 traces.append(trace_id)
             usage = _add_usage(usage, current_usage)
         budget_message = _budget_violation(case.budget, usage, comparisons)
-        output = _rehydrate(
-            case.fixture.values.decode(case.fixture.root_output),
-            workflow.output_type,
-        )
         if budget_message:
             return ReplayResult(
                 ReplayStatus.REPLAY_BUDGET_EXCEEDED,
                 case.mode,
-                output,
+                historical_output,
                 tuple(comparisons),
                 trace_ids=tuple(traces),
                 live_usage=usage,
@@ -426,7 +468,7 @@ class ReplayEngine:
         return ReplayResult(
             ReplayStatus.CHANGED if changed else ReplayStatus.PASS,
             case.mode,
-            output,
+            historical_output,
             tuple(comparisons),
             trace_ids=tuple(traces),
             live_usage=usage,
@@ -435,10 +477,274 @@ class ReplayEngine:
         )
 
 
+@dataclass(frozen=True)
+class _StubEvaluation:
+    value: Any
+    dependency_instance_keys: tuple[str, ...] = ()
+
+
+class _StubGraphExecutor:
+    """Interpret current graph structure while injecting every historical boundary."""
+
+    def __init__(self, plan: PlanIR, fixture: ReplayFixture) -> None:
+        self.plan = plan
+        self.fixture = fixture
+        self.steps = {step.node_id: step for step in plan.steps}
+        self.boundaries = {
+            (
+                ReplayKey(boundary.module_id, boundary.logical_step),
+                boundary.step_instance_id,
+            ): boundary
+            for boundary in fixture.boundaries
+        }
+        self.used_boundaries: set[str] = set()
+        self.cache: dict[int, _StubEvaluation] = {}
+        self.control_decisions: list[dict[str, Any]] = []
+
+    async def execute(
+        self,
+        workflow: Workflow[Any, Any],
+        output: RuntimeValue[Any],
+    ) -> Any:
+        root_input = _rehydrate(
+            self.fixture.values.decode(self.fixture.root_input),
+            workflow.input_type,
+        )
+        if not value_matches_type(root_input, workflow.input_type):
+            raise ReplayContractError("recorded root input violates its current contract")
+        result = await self._visit(
+            output,
+            path="root",
+            workflow=workflow,
+            external=_StubEvaluation(root_input),
+            scope=(),
+        )
+        recorded_output = _rehydrate(
+            self.fixture.values.decode(self.fixture.root_output),
+            workflow.output_type,
+        )
+        if not value_matches_type(recorded_output, workflow.output_type):
+            raise ReplayContractError("recorded root output violates its current contract")
+        if digest_data(result.value) != self.fixture.root_output.digest:
+            raise ReplayContractError(
+                "injected graph result does not match the recorded root output"
+            )
+        expected_boundaries = {boundary.instance_key for boundary in self.fixture.boundaries}
+        missing = expected_boundaries - self.used_boundaries
+        if missing:
+            raise ReplayContractError(
+                "fixture contains boundary records outside the reconstructed path: "
+                f"{sorted(missing)}"
+            )
+        if Counter(map(canonical_json, self.control_decisions)) != Counter(
+            map(canonical_json, self.fixture.control_decisions)
+        ):
+            raise ReplayContractError(
+                "recorded control decisions do not match the reconstructed execution path"
+            )
+        return recorded_output
+
+    async def _visit(
+        self,
+        value: RuntimeValue[Any],
+        *,
+        path: str,
+        workflow: Workflow[Any, Any],
+        external: _StubEvaluation,
+        scope: tuple[str, ...],
+    ) -> _StubEvaluation:
+        expression = value._expression
+        if expression.kind == "input":
+            return external
+        cached = self.cache.get(id(value))
+        if cached is not None:
+            return cached
+        if expression.kind == "workflow":
+            source = await self._visit(
+                expression.dependencies[0],
+                path=f"{path}.input",
+                workflow=workflow,
+                external=external,
+                scope=scope,
+            )
+            binding = cast(_WorkflowBinding, expression.payload)
+            nested = binding.workflow
+            result = await self._visit(
+                binding.output,
+                path=f"{path}.nested[{nested.workflow_id}]",
+                workflow=nested,
+                external=source,
+                scope=(*scope, f"workflow:{nested.workflow_id}"),
+            )
+        elif expression.kind == "module":
+            source = await self._visit(
+                expression.dependencies[0],
+                path=f"{path}.dep0",
+                workflow=workflow,
+                external=external,
+                scope=scope,
+            )
+            module_binding = cast(_ModuleBinding, expression.payload)
+            result = self._inject(path, module_binding.module, source, scope)
+        elif expression.kind == "when":
+            condition = await self._visit(
+                expression.dependencies[0],
+                path=f"{path}.dep0",
+                workflow=workflow,
+                external=external,
+                scope=scope,
+            )
+            if not isinstance(condition.value, bool):
+                raise ReplayContractError("recorded when condition is not a boolean")
+            branch_index = 1 if condition.value else 2
+            decision = {
+                "event_type": "BRANCH_DECISION",
+                "payload": {
+                    "control_node": path,
+                    "selected": "true" if branch_index == 1 else "false",
+                },
+            }
+            self.control_decisions.append(decision)
+            branch = await self._visit(
+                expression.dependencies[branch_index],
+                path=f"{path}.dep{branch_index}",
+                workflow=workflow,
+                external=external,
+                scope=(*scope, f"branch:{branch_index}"),
+            )
+            result = _StubEvaluation(
+                branch.value,
+                _unique((*condition.dependency_instance_keys, *branch.dependency_instance_keys)),
+            )
+        elif expression.kind == "parallel":
+            branches = [
+                await self._visit(
+                    dependency,
+                    path=f"{path}.dep{index}",
+                    workflow=workflow,
+                    external=external,
+                    scope=(*scope, f"parallel:{index}"),
+                )
+                for index, dependency in enumerate(expression.dependencies)
+            ]
+            result = _StubEvaluation(
+                tuple(branch.value for branch in branches),
+                _unique(
+                    tuple(
+                        instance
+                        for branch in branches
+                        for instance in branch.dependency_instance_keys
+                    )
+                ),
+            )
+        elif expression.kind == "map":
+            source = await self._visit(
+                expression.dependencies[0],
+                path=f"{path}.dep0",
+                workflow=workflow,
+                external=external,
+                scope=scope,
+            )
+            if not isinstance(source.value, (list, tuple)):
+                raise ReplayContractError("recorded map_over input is not a sequence")
+            map_binding = cast(_MapBinding, expression.payload)
+            keyed = [(self._item_key(item, map_binding.item_key), item) for item in source.value]
+            keys = [item_key for item_key, _ in keyed]
+            if len(keys) != len(set(keys)):
+                raise ReplayContractError("recorded map_over item keys are not unique")
+            self.control_decisions.append(
+                {
+                    "event_type": "MAP_DECISION",
+                    "payload": {"control_node": path, "item_keys": keys},
+                }
+            )
+            mapped: list[Any] = []
+            boundaries: list[str] = []
+            for item_key, item in keyed:
+                item_result = self._inject(
+                    path,
+                    map_binding.module,
+                    _StubEvaluation(item, source.dependency_instance_keys),
+                    (*scope, f"item:{item_key}"),
+                )
+                mapped.append(item_result.value)
+                boundaries.extend(item_result.dependency_instance_keys)
+            result = _StubEvaluation(mapped, tuple(boundaries))
+        else:  # pragma: no cover - compilation rejects unsupported expressions
+            raise ReplayContractError(f"unsupported replay expression {expression.kind!r}")
+        self.cache[id(value)] = result
+        return result
+
+    def _inject(
+        self,
+        path: str,
+        module: Module[Any, Any],
+        source: _StubEvaluation,
+        scope: tuple[str, ...],
+    ) -> _StubEvaluation:
+        step = self.steps[path]
+        key = step.replay_key
+        if key is None:
+            raise ReplayContractError(f"executable path {path} has no replay key")
+        step_instance_id = _stable_instance_id(step, scope)
+        boundary = self.boundaries.get((key, step_instance_id))
+        if boundary is None:
+            raise ReplayContractError(
+                f"required replay boundary {key.as_string()}#{step_instance_id} is missing"
+            )
+        if boundary.instance_key in self.used_boundaries:
+            raise ReplayContractError(f"replay boundary {boundary.instance_key} was injected twice")
+        if boundary.input_value.digest != digest_data(source.value):
+            raise ReplayContractError(
+                f"recorded input for boundary {boundary.instance_key} does not match its handoff"
+            )
+        if boundary.dependency_instance_keys != source.dependency_instance_keys:
+            raise ReplayContractError(
+                f"recorded dependencies for boundary {boundary.instance_key} do not match topology"
+            )
+        recorded_input = _rehydrate(
+            self.fixture.values.decode(boundary.input_value),
+            module.input_type,
+        )
+        if not value_matches_type(recorded_input, module.input_type):
+            raise ReplayContractError(f"recorded input violates {key.as_string()} contract")
+        recorded_output = _rehydrate(
+            self.fixture.values.decode(boundary.output_value),
+            module.output_type,
+        )
+        if not value_matches_type(recorded_output, module.output_type):
+            raise ReplayContractError(f"recorded output violates {key.as_string()} contract")
+        self.used_boundaries.add(boundary.instance_key)
+        return _StubEvaluation(recorded_output, (boundary.instance_key,))
+
+    @staticmethod
+    def _item_key(item: Any, key: str | Callable[[Any], str]) -> str:
+        if isinstance(key, str):
+            raw = item.get(key) if isinstance(item, Mapping) else getattr(item, key, None)
+        else:
+            raw = key(item)
+        if raw is None or not str(raw):
+            raise ReplayContractError("map_over produced an empty item key during replay")
+        return str(raw)
+
+
+def _unique(values: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(values))
+
+
 def build_module_registry(
-    workflow: Workflow[Any, Any], plan: PlanIR | None = None
+    workflow: Workflow[Any, Any],
+    plan: PlanIR | None = None,
+    *,
+    output: RuntimeValue[Any] | None = None,
 ) -> dict[ReplayKey, Module[Any, Any]]:
-    compiled = plan or compile_workflow(workflow)
+    if plan is None or output is None:
+        compiled_graph = _compile_workflow_graph(workflow)
+        compiled = compiled_graph.plan
+        built_output = compiled_graph.output
+    else:
+        compiled = plan
+        built_output = output
     steps = {step.node_id: step for step in compiled.executable_steps}
     found: dict[ReplayKey, Module[Any, Any]] = {}
     seen: set[tuple[int, str]] = set()
@@ -453,9 +759,9 @@ def build_module_registry(
             return
         if expression.kind == "workflow":
             visit(expression.dependencies[0], f"{path}.input", owner)
-            nested = cast(Workflow[Any, Any], expression.payload)
-            nested_output = nested.build(RuntimeValue.input(nested.input_type))
-            visit(nested_output, f"{path}.nested[{nested.workflow_id}]", nested)
+            binding = cast(_WorkflowBinding, expression.payload)
+            nested = binding.workflow
+            visit(binding.output, f"{path}.nested[{nested.workflow_id}]", nested)
             return
         for index, dependency in enumerate(expression.dependencies):
             visit(dependency, f"{path}.dep{index}", owner)
@@ -470,7 +776,7 @@ def build_module_registry(
             if key is not None:
                 found[key] = map_binding.module
 
-    visit(workflow.build(RuntimeValue.input(workflow.input_type)), "root", workflow)
+    visit(built_output, "root", workflow)
     return found
 
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
 
@@ -123,6 +123,20 @@ class GraphAligner:
         for index, key in enumerate(old_keys):
             old = old_by_key[key]
             new = new_by_key[key]
+            old_control = (old.kind, old.control)
+            new_control = (new.kind, new.control)
+            if old_control != new_control:
+                changes.append(
+                    GraphChange(
+                        DiffKind.CONTROL_FLOW_CHANGED,
+                        f"steps[{index}].control",
+                        key,
+                        old_control,
+                        new_control,
+                        False,
+                    )
+                )
+                return GraphAlignment(tuple(pairs), GraphDiff(tuple(changes)))
             old_topology = _dependency_keys(historical, old)
             new_topology = _dependency_keys(current, new)
             if old_topology != new_topology:
@@ -169,6 +183,54 @@ class GraphAligner:
                 )
             pairs.append(AlignmentPair(key, old, new))
         return GraphAlignment(tuple(pairs), GraphDiff(tuple(changes)))
+
+
+def project_execution_path(
+    plan: PlanIR,
+    control_decisions: tuple[dict[str, Any], ...],
+) -> PlanIR:
+    """Project static IR onto one recorded branch path without guessing correspondence."""
+
+    decisions = {
+        str(decision.get("payload", {}).get("control_node")): str(
+            decision.get("payload", {}).get("selected")
+        )
+        for decision in control_decisions
+        if decision.get("event_type") == "BRANCH_DECISION"
+    }
+    by_node = {step.node_id: step for step in plan.steps}
+    included: dict[str, StepIR] = {}
+
+    def visit(node_id: str) -> None:
+        if node_id == "input" or node_id in included:
+            return
+        step = by_node[node_id]
+        if step.kind != "when":
+            for dependency in step.dependencies:
+                visit(dependency)
+            included[node_id] = step
+            return
+        selected = decisions.get(node_id)
+        branch_index = {"true": 1, "false": 2}.get(selected) if selected is not None else None
+        if branch_index is None:
+            for dependency in step.dependencies:
+                visit(dependency)
+            included[node_id] = replace(
+                step,
+                control={**(step.control or {}), "recorded_decision": "missing"},
+            )
+            return
+        selected_dependencies = (step.dependencies[0], step.dependencies[branch_index])
+        for dependency in selected_dependencies:
+            visit(dependency)
+        included[node_id] = replace(
+            step,
+            dependencies=selected_dependencies,
+            control={**(step.control or {}), "recorded_decision": selected},
+        )
+
+    visit(plan.output_node)
+    return replace(plan, steps=tuple(step for step in plan.steps if step.node_id in included))
 
 
 def _control_signature(plan: PlanIR) -> tuple[tuple[Any, ...], ...]:

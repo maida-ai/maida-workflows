@@ -18,8 +18,9 @@ from .authoring import (
     Workflow,
     _MapBinding,
     _ModuleBinding,
+    _WorkflowBinding,
 )
-from .ir import PlanIR, ReplayKey, StepIR, compile_workflow
+from .ir import PlanIR, ReplayKey, StepIR, _compile_workflow_graph, module_digest
 from .models import (
     AcceptedAttemptProvenance,
     BoundaryRecord,
@@ -158,6 +159,7 @@ class TaskWorker:
         self.workflow_id = workflow_id
         self.definition_digest = definition_digest
         self.modules = modules
+        self.module_digests = {key: module_digest(module) for key, module in modules.items()}
         self.worker_id = worker_id
         self.max_attempts = max_attempts
 
@@ -188,6 +190,14 @@ class TaskWorker:
         map_decisions: tuple[dict[str, Any], ...] = (),
         broker: Any = None,
     ) -> BoundaryRecord:
+        key = key_for(claim)
+        if self.module_digests.get(key) != claim.task.module_digest:
+            self.store.fail_task(
+                claim,
+                {"reason": f"module digest mismatch for pinned task {key.as_string()}"},
+                retry=False,
+            )
+            raise RuntimeContractError(f"module digest mismatch for pinned task {key.as_string()}")
         if not value_matches_type(input_data, module.input_type):
             diagnostic = {"reason": "persisted task input violates the module input contract"}
             self.store.fail_task(claim, diagnostic, retry=False)
@@ -302,7 +312,8 @@ class WorkflowRunner:
     ) -> RunResult:
         if not value_matches_type(value, workflow.input_type):
             raise RuntimeContractError("root input violates the workflow input contract")
-        plan = compile_workflow(workflow)
+        compiled = _compile_workflow_graph(workflow)
+        plan = compiled.plan
         root_input = self.store.values.encode(
             value, schema_digest=schema_digest(workflow.input_type)
         )
@@ -312,7 +323,6 @@ class WorkflowRunner:
             root_input=root_input,
             execution_mode=execution_mode,
         )
-        built = workflow.build(RuntimeValue.input(workflow.input_type))
         evaluator = _WorkflowEvaluator(
             self.store,
             plan,
@@ -323,7 +333,7 @@ class WorkflowRunner:
             self.broker,
         )
         try:
-            result = await evaluator.evaluate(built, value)
+            result = await evaluator.evaluate(compiled.output, value)
             root_output = self.store.values.encode(
                 result.value,
                 schema_digest=schema_digest(workflow.output_type),
@@ -416,10 +426,10 @@ class _WorkflowEvaluator:
                 external=external,
                 scope=scope,
             )
-            nested = cast(Workflow[Any, Any], expression.payload)
-            nested_output = nested.build(RuntimeValue.input(nested.input_type))
+            binding = cast(_WorkflowBinding, expression.payload)
+            nested = binding.workflow
             result = await self._visit(
-                nested_output,
+                binding.output,
                 path=f"{path}.nested[{nested.workflow_id}]",
                 workflow=nested,
                 external=source,
@@ -535,7 +545,12 @@ class _WorkflowEvaluator:
                 )
                 mapped.append(item_result.value)
                 boundaries.extend(item_result.dependency_instance_keys)
-            result = _Evaluation(mapped, tuple(boundaries))
+            result = _Evaluation(
+                mapped,
+                tuple(boundaries),
+                source.branch_decisions,
+                (*source.map_decisions, map_decision),
+            )
         else:  # pragma: no cover - the compiler rejects this first
             raise RuntimeContractError(f"unsupported runtime expression {expression.kind!r}")
         return result

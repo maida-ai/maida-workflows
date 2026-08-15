@@ -22,7 +22,7 @@ from .fixture import (
     ReplayFixtureError,
     ReplayFixtureExporter,
 )
-from .ir import compile_workflow
+from .ir import _compile_workflow_graph, compile_workflow
 from .persistence import PersistenceError, PostgresStore
 from .replay import (
     ReplayCase,
@@ -144,12 +144,13 @@ def worker_command(
     artifacts: Path = ARTIFACT_OPTION,
 ) -> None:
     selected = _load_workflow(workflow)
-    plan = compile_workflow(selected)
+    compiled = _compile_workflow_graph(selected)
+    plan = compiled.plan
     worker = TaskWorker(
         _store(dsn, artifacts),
         workflow_id=plan.workflow_id,
         definition_digest=plan.digest,
-        modules=build_module_registry(selected, plan),
+        modules=build_module_registry(selected, plan, output=compiled.output),
         worker_id=worker_id,
     )
     boundary = asyncio.run(worker.run_once())

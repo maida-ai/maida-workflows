@@ -9,12 +9,14 @@ from maida_workflows import (
     ExecutionContext,
     Module,
     RuntimeValue,
+    SymbolicValueError,
     Workflow,
     compile_workflow,
     map_over,
     parallel,
     when,
 )
+from maida_workflows.alignment import DiffKind, GraphAligner
 
 
 class AddOne(Module[int, int]):
@@ -133,6 +135,13 @@ def test_explicit_reuse_and_duplicate_replay_key_validation() -> None:
     with pytest.raises(CompileError, match="duplicate replay key"):
         compile_workflow(Duplicate())
 
+    class Mixed(Reused):
+        def build(self, value: RuntimeValue[int]) -> RuntimeValue[int]:
+            return self.shared.at("second")(self.shared(value))
+
+    with pytest.raises(CompileError, match="every occurrence"):
+        compile_workflow(Mixed())
+
 
 @dataclass(frozen=True)
 class Item:
@@ -164,6 +173,8 @@ def test_map_requires_and_records_stable_item_key() -> None:
 
     with pytest.raises(ValueError, match="non-empty"):
         map_over(RuntimeValue.input(list[Item]), ReadItem(), item_key="")
+    with pytest.raises(ValueError, match="not a field"):
+        map_over(RuntimeValue.input(list[Item]), ReadItem(), item_key="missing")
 
 
 def test_branch_parallel_and_nested_workflows_are_replay_addressable() -> None:
@@ -204,6 +215,8 @@ def test_branch_parallel_and_nested_workflows_are_replay_addressable() -> None:
 
 
 def test_invalid_control_and_workflow_contracts_fail_early() -> None:
+    with pytest.raises(TypeError, match="when condition"):
+        when(RuntimeValue.input(int), RuntimeValue.input(int), RuntimeValue.input(int))  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="same output type"):
         when(RuntimeValue.input(bool), RuntimeValue.input(int), RuntimeValue.input(str))
     with pytest.raises(ValueError, match="at least one"):
@@ -220,6 +233,107 @@ def test_invalid_control_and_workflow_contracts_fail_early() -> None:
 
     with pytest.raises(CompileError, match="declares output"):
         compile_workflow(WrongOutput())
+
+    class InvalidChild(Workflow[int, str]):
+        workflow_id = "invalid-child"
+        input_type = int
+        output_type = str
+        add = AddOne()
+
+        def build(self, value: RuntimeValue[int]) -> RuntimeValue[str]:
+            return self.add(value)  # type: ignore[return-value]
+
+    class Parent(Workflow[int, str]):
+        workflow_id = "parent-with-invalid-child"
+        input_type = int
+        output_type = str
+        child = InvalidChild()
+
+        def build(self, value: RuntimeValue[int]) -> RuntimeValue[str]:
+            return self.child(value)
+
+    with pytest.raises(TypeError, match=r"invalid-child.*output contract"):
+        compile_workflow(Parent())
+
+
+def test_runtime_values_reject_ordinary_python_control_flow() -> None:
+    value = RuntimeValue.input(int)
+
+    with pytest.raises(SymbolicValueError, match="when"):
+        bool(value)
+    with pytest.raises(SymbolicValueError, match="map_over"):
+        iter(value)
+    with pytest.raises(SymbolicValueError, match="map_over"):
+        len(value)
+
+
+def test_incompatible_module_handoff_fails_during_graph_construction() -> None:
+    class AsText(Module[int, str]):
+        input_type = int
+        output_type = str
+
+        async def execute(self, value: int, ctx: ExecutionContext) -> str:
+            return str(value)
+
+    with pytest.raises(TypeError, match="input contract"):
+        AddOne()(AsText()(RuntimeValue.input(int)))  # type: ignore[arg-type]
+
+
+def test_class_level_behavior_declarations_change_module_digest() -> None:
+    class Prompted(AddOne):
+        prompt = "version one"
+        offset = 0
+
+    class PromptedWorkflow(Workflow[int, int]):
+        workflow_id = "prompted"
+        input_type = int
+        output_type = int
+
+        def __init__(self) -> None:
+            self.module = Prompted()
+
+        def build(self, value: RuntimeValue[int]) -> RuntimeValue[int]:
+            return self.module(value)
+
+    workflow = PromptedWorkflow()
+    original = compile_workflow(workflow).executable_steps[0].module_digest
+    Prompted.prompt = "version two"
+    changed = compile_workflow(workflow).executable_steps[0].module_digest
+
+    assert original != changed
+
+    workflow.module.offset = 1
+    configured = compile_workflow(workflow).executable_steps[0].module_digest
+    workflow.module.offset = 2
+    reconfigured = compile_workflow(workflow).executable_steps[0].module_digest
+
+    assert configured != reconfigured
+
+
+def test_map_item_identity_changes_are_structural_divergences() -> None:
+    class Mapped(Workflow[list[Item], list[int]]):
+        workflow_id = "map-control-diff"
+        input_type = list[Item]
+        output_type = list[int]
+
+        def __init__(self, item_key: str) -> None:
+            self.item_key = item_key
+            self.read = ReadItem()
+
+        def build(self, value: RuntimeValue[list[Item]]) -> RuntimeValue[list[int]]:
+            return map_over(value, self.read, item_key=self.item_key)
+
+    diff = (
+        GraphAligner()
+        .align(
+            compile_workflow(Mapped("item_id")),
+            compile_workflow(Mapped("value")),
+        )
+        .diff
+    )
+
+    assert diff.first_divergence is not None
+    assert diff.first_divergence.kind is DiffKind.CONTROL_FLOW_CHANGED
 
 
 def test_all_adversarial_workflows_compile_to_replay_addressable_ir() -> None:

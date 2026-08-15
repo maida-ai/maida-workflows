@@ -151,7 +151,7 @@ async def run_demo(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the deterministic native replay exit demo.")
+    parser = argparse.ArgumentParser(description="Run the deterministic native replay demo.")
     parser.add_argument("--dsn", required=True)
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--fixture", type=Path, required=True)

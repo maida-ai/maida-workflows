@@ -77,10 +77,56 @@ class SingleWorkflow(Workflow[int, int]):
         return self.boundary.at("only")(value)
 
 
+class CountingBuildWorkflow(SingleWorkflow):
+    def __init__(self, module: Module[int, int] | None = None) -> None:
+        super().__init__(module)
+        self.build_calls = 0
+
+    def build(self, value: RuntimeValue[int]) -> RuntimeValue[int]:
+        self.build_calls += 1
+        return super().build(value)
+
+
 async def captured(postgres_store: PostgresStore) -> ReplayFixture:
     result = await WorkflowRunner(postgres_store).run(SingleWorkflow(), 1)
     history = postgres_store.load_run_history(result.run_id, tenant_id="local")
     return ReplayFixtureExporter(postgres_store.values).project(history)
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_each_compile_run_or_replay_operation_builds_the_symbolic_graph_once(
+    postgres_store: PostgresStore,
+) -> None:
+    from maida_workflows import compile_workflow
+
+    compiled = CountingBuildWorkflow()
+    compile_workflow(compiled)
+    assert compiled.build_calls == 1
+
+    source = CountingBuildWorkflow()
+    run = await WorkflowRunner(postgres_store).run(source, 1)
+    assert source.build_calls == 1
+    history = postgres_store.load_run_history(run.run_id, tenant_id="local")
+    fixture = ReplayFixtureExporter(postgres_store.values).project(history)
+
+    full = CountingBuildWorkflow()
+    await ReplayEngine(trace_bridge=NoTraceBridge()).replay(
+        full,
+        ReplayCase(fixture, ReplayMode.FULL_STUB),
+    )
+    assert full.build_calls == 1
+
+    selective = CountingBuildWorkflow()
+    await ReplayEngine(trace_bridge=NoTraceBridge()).replay(
+        selective,
+        ReplayCase(
+            fixture,
+            ReplayMode.SELECTIVE,
+            (ReplayKey("replay-edges.boundary", "only"),),
+        ),
+    )
+    assert selective.build_calls == 1
 
 
 @pytest.mark.postgres
@@ -162,6 +208,92 @@ async def test_fixture_execution_instance_and_dependency_integrity_is_validated(
     )
     assert verification.verdict is VerificationVerdict.FAIL
     assert verification.replay_results[0].error_code == "REPLAY_CONTRACT_INVALID"
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_full_stub_requires_and_injects_every_recorded_boundary(
+    postgres_store: PostgresStore,
+) -> None:
+    fixture = await captured(postgres_store)
+    empty_history = replace(fixture, boundaries=())
+
+    with pytest.raises(ReplayContractError, match="boundary"):
+        await ReplayEngine(trace_bridge=NoTraceBridge()).replay(
+            SingleWorkflow(),
+            ReplayCase(empty_history, ReplayMode.FULL_STUB),
+        )
+
+    boundary = fixture.boundaries[0]
+    wrong_output = postgres_store.values.encode(
+        999,
+        schema_digest=boundary.output_schema_digest,
+    )
+    inconsistent = replace(
+        fixture,
+        boundaries=(replace(boundary, output_value=wrong_output),),
+    )
+    with pytest.raises(ReplayContractError, match="root output"):
+        await ReplayEngine(trace_bridge=NoTraceBridge()).replay(
+            SingleWorkflow(),
+            ReplayCase(inconsistent, ReplayMode.FULL_STUB),
+        )
+
+    mislabeled_input = postgres_store.values.encode(
+        "not-an-integer",
+        schema_digest=fixture.root_input.schema_digest,
+    )
+    invalid_value = replace(fixture, root_input=mislabeled_input)
+    with pytest.raises(ReplayContractError, match="root input"):
+        await ReplayEngine(trace_bridge=NoTraceBridge()).replay(
+            SingleWorkflow(),
+            ReplayCase(invalid_value, ReplayMode.FULL_STUB),
+        )
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["branch", "map", "nested-parallel-effect"])
+async def test_full_stub_reconstructs_recorded_control_and_composition_paths(
+    postgres_store: PostgresStore,
+    case: str,
+) -> None:
+    from examples.adversarial_workflows import (
+        AdversarialBranchWorkflow,
+        AdversarialMapWorkflow,
+        AdversarialNestedEffectWorkflow,
+        BatchItem,
+    )
+
+    examples: dict[str, tuple[Workflow[Any, Any], Any, Any]] = {
+        "branch": (
+            AdversarialBranchWorkflow(),
+            {"escalated": True},
+            "urgent",
+        ),
+        "map": (
+            AdversarialMapWorkflow(),
+            [BatchItem("b", " B "), BatchItem("a", " A ")],
+            ["b", "a"],
+        ),
+        "nested-parallel-effect": (
+            AdversarialNestedEffectWorkflow(),
+            "case",
+            ("reviewed:case", "reviewed:case"),
+        ),
+    }
+    workflow, value, expected = examples[case]
+    result = await WorkflowRunner(postgres_store).run(workflow, value)
+    history = postgres_store.load_run_history(result.run_id, tenant_id="local")
+    fixture = ReplayFixtureExporter(postgres_store.values).project(history)
+
+    replayed = await ReplayEngine(trace_bridge=NoTraceBridge()).replay(
+        workflow,
+        ReplayCase(fixture, ReplayMode.FULL_STUB),
+    )
+
+    assert replayed.status is ReplayStatus.PASS
+    assert replayed.output == expected
 
 
 @pytest.mark.asyncio

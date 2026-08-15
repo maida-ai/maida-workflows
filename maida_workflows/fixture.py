@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Never, Protocol, cast
 
 from ._canonical import canonical_data, canonical_json, digest_data
+from .alignment import project_execution_path
 from .artifacts import ArtifactError, ArtifactStore, ValueCodec
 from .ir import PlanIR
 from .models import (
@@ -233,6 +235,57 @@ class ReplayFixtureExporter:
                 FixtureErrorCode.HISTORY_INCOMPLETE,
                 "every executed task requires one accepted boundary record",
             )
+        controls = tuple(
+            {"event_type": event.event_type, "payload": event.payload}
+            for event in history.events
+            if event.event_type in {"BRANCH_DECISION", "MAP_DECISION"}
+        )
+        executed_plan = project_execution_path(
+            PlanIR.from_dict(history.definition.canonical_ir),
+            controls,
+        )
+        decisions_by_node: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for decision in controls:
+            payload = cast(dict[str, Any], decision["payload"])
+            identity = (
+                str(decision["event_type"]),
+                str(payload.get("control_node")),
+            )
+            decisions_by_node.setdefault(identity, []).append(payload)
+
+        expected: Counter[tuple[str, str]] = Counter()
+        for step in executed_plan.steps:
+            if step.kind == "when":
+                branches = decisions_by_node.get(("BRANCH_DECISION", step.node_id), [])
+                if len(branches) != 1 or branches[0].get("selected") not in {"true", "false"}:
+                    self._history_incomplete(
+                        f"control node {step.node_id!r} requires one valid branch decision"
+                    )
+            if step.replay_key is None:
+                continue
+            key = (step.replay_key.module_id, step.replay_key.logical_step)
+            if step.kind != "map_module":
+                expected[key] += 1
+                continue
+            maps = decisions_by_node.get(("MAP_DECISION", step.node_id), [])
+            if len(maps) != 1 or not isinstance(maps[0].get("item_keys"), list):
+                self._history_incomplete(
+                    f"map node {step.node_id!r} requires one valid item-key decision"
+                )
+            item_keys = maps[0]["item_keys"]
+            if len(item_keys) != len(set(map(str, item_keys))):
+                self._history_incomplete(f"map node {step.node_id!r} has duplicate item keys")
+            expected[key] += len(item_keys)
+
+        actual = Counter(
+            (boundary.module_id, boundary.logical_step) for boundary in history.accepted_boundaries
+        )
+        if actual != expected:
+            self._history_incomplete("accepted boundaries do not cover the recorded execution path")
+
+    @staticmethod
+    def _history_incomplete(message: str) -> Never:
+        raise ReplayFixtureError(FixtureErrorCode.HISTORY_INCOMPLETE, message)
 
     def _validate_value(self, value: StoredValue) -> None:
         if value.storage is ValueStorage.UNAVAILABLE:
