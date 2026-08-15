@@ -1,0 +1,77 @@
+[project]
+name = "maida-workflows"
+dynamic = ["version"]
+description = "Durable, replayable workflows for Maida"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = "Apache-2.0"
+authors = [{ name = "Maida.AI" }]
+dependencies = [
+    "maida-ai",
+    "psycopg[binary]>=3.2,<4",
+    "typer>=0.26,<0.27",
+]
+
+[project.scripts]
+maida-workflows = "maida_workflows.cli:app"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.15",
+    "pytest>=9",
+    "pytest-cov>=7",
+    "ruff>=0.16",
+]
+
+[build-system]
+requires = ["hatchling>=1.28,<1.29", "uv-dynamic-versioning"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "uv-dynamic-versioning"
+
+[tool.uv-dynamic-versioning]
+enable = true
+vcs = "git"
+pattern = "default-unprefixed"
+fallback-version = "0.0.0"
+
+[tool.hatch.build.targets.wheel]
+packages = ["maida_workflows", "maida/workflows"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/maida_workflows",
+    "/maida/workflows",
+    "/migrations",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --strict-config"
+testpaths = ["tests"]
+markers = ["postgres: requires a PostgreSQL server"]
+
+[tool.coverage.run]
+branch = true
+source = ["maida_workflows"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["maida_workflows"]
