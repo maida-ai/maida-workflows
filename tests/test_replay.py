@@ -119,6 +119,37 @@ class ChangedChain(Chain):
         self.second = ChangedSecond()
 
 
+class MeteredSecond(Second):
+    async def execute(self, value: int, ctx: ExecutionContext) -> int:
+        self.calls += 1
+        self.seen.append(value)
+        ctx.metadata["usage"] = {
+            "input_tokens": 5,
+            "output_tokens": 2,
+            "cost_usd": 0.10,
+            "latency_ms": 3.0,
+        }
+        return value * 2
+
+
+class ChangedMeteredSecond(MeteredSecond):
+    async def execute(self, value: int, ctx: ExecutionContext) -> int:
+        result = await super().execute(value, ctx)
+        ctx.metadata["usage"] = {
+            "input_tokens": 8,
+            "output_tokens": 3,
+            "cost_usd": 0.25,
+            "latency_ms": 7.0,
+        }
+        return result
+
+
+class MeteredChain(Chain):
+    def __init__(self, second: Second) -> None:
+        self.first = First()
+        self.second = second
+
+
 async def capture_fixture(
     postgres_store: PostgresStore,
     workflow: Workflow[Any, Any],
@@ -155,6 +186,32 @@ async def test_full_stub_and_selective_replay_are_isolated(postgres_store: Postg
     assert selective.comparisons[0].output_changed
     assert selective.trace_ids == ("trace-1",)
     assert selective.live_usage.cost_usd == 0.25
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_selective_replay_classifies_usage_drift_with_unchanged_output(
+    postgres_store: PostgresStore,
+) -> None:
+    fixture = await capture_fixture(postgres_store, MeteredChain(MeteredSecond()), 1)
+
+    result = await ReplayEngine(trace_bridge=FakeTraceBridge()).replay(
+        MeteredChain(ChangedMeteredSecond()),
+        ReplayCase(
+            fixture,
+            ReplayMode.SELECTIVE,
+            (ReplayKey("chain.second", "second"),),
+        ),
+    )
+
+    comparison = result.comparisons[0]
+    assert result.status is ReplayStatus.CHANGED
+    assert not comparison.output_changed
+    assert not comparison.trajectory_changed
+    assert comparison.token_usage_changed
+    assert comparison.cost_changed
+    assert comparison.latency_changed
+    assert comparison.behavior_changed
 
 
 @pytest.mark.postgres

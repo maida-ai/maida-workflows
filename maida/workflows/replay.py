@@ -109,7 +109,20 @@ class ReplayCase:
 
 @dataclass(frozen=True)
 class StepComparison:
-    """Historical-versus-current evidence for one selected boundary instance."""
+    """Historical-versus-current evidence for one selected boundary instance.
+
+    Output and trajectory changes are recorded directly. Token, cost, and
+    latency changes are derived from the two immutable usage records so callers
+    can inspect each dimension without reimplementing comparison semantics.
+
+    Notes
+    -----
+    :attr:`behavior_changed` includes output, trajectory, token, and cost drift.
+    Raw wall-clock latency is exposed separately because ordinary scheduling
+    noise should not turn every otherwise-identical replay into a behavioral
+    change. Use :class:`ReplayBudget` or a verification policy when latency
+    needs a blocking threshold.
+    """
 
     replay_key: ReplayKey
     step_instance_id: str
@@ -122,6 +135,39 @@ class StepComparison:
     historical_usage: Usage
     current_usage: Usage
     trace_id: str | None = None
+
+    @property
+    def token_usage_changed(self) -> bool:
+        """Return whether reported input or output token usage changed."""
+        return (
+            self.historical_usage.input_tokens != self.current_usage.input_tokens
+            or self.historical_usage.output_tokens != self.current_usage.output_tokens
+        )
+
+    @property
+    def cost_changed(self) -> bool:
+        """Return whether reported monetary cost changed."""
+        return self.historical_usage.cost_usd != self.current_usage.cost_usd
+
+    @property
+    def latency_changed(self) -> bool:
+        """Return whether measured wall-clock latency changed."""
+        return self.historical_usage.latency_ms != self.current_usage.latency_ms
+
+    @property
+    def usage_changed(self) -> bool:
+        """Return whether any reported token, cost, or latency value changed."""
+        return self.token_usage_changed or self.cost_changed or self.latency_changed
+
+    @property
+    def behavior_changed(self) -> bool:
+        """Return whether output, trajectory, token, or cost behavior changed."""
+        return (
+            self.output_changed
+            or self.trajectory_changed
+            or self.token_usage_changed
+            or self.cost_changed
+        )
 
 
 @dataclass(frozen=True)
@@ -598,24 +644,21 @@ class ReplayEngine:
             usage_data = dict(metadata.get("usage", {}))
             usage_data.setdefault("latency_ms", elapsed_ms)
             current_usage = Usage(**usage_data)
-            trajectory_changed = current_trajectories != boundary.trajectories
-            output_changed = current_digest != boundary.output_value.digest
-            changed = changed or trajectory_changed or output_changed
-            comparisons.append(
-                StepComparison(
-                    key,
-                    boundary.step_instance_id,
-                    True,
-                    False,
-                    boundary.output_value.digest,
-                    current_digest,
-                    output_changed,
-                    trajectory_changed,
-                    boundary.usage,
-                    current_usage,
-                    trace_id,
-                )
+            comparison = StepComparison(
+                key,
+                boundary.step_instance_id,
+                True,
+                False,
+                boundary.output_value.digest,
+                current_digest,
+                current_digest != boundary.output_value.digest,
+                current_trajectories != boundary.trajectories,
+                boundary.usage,
+                current_usage,
+                trace_id,
             )
+            comparisons.append(comparison)
+            changed = changed or comparison.behavior_changed
             if trace_id:
                 traces.append(trace_id)
             usage = _add_usage(usage, current_usage)
