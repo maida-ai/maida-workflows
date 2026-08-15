@@ -64,7 +64,15 @@ from .dynamic import (
     PlanValidator,
 )
 from .fixture import ReplayFixture, ReplayFixtureError, ReplayFixtureImporter
-from .ir import BindingIR, CompileError, PlanIR, ReplayKey, StepIR, compile_workflow
+from .ir import (
+    BindingIR,
+    CompileError,
+    PlanIR,
+    ReplayKey,
+    StepIR,
+    compile_workflow,
+    module_digest,
+)
 from .models import (
     BoundaryRecord,
     ExecutionMode,
@@ -75,6 +83,7 @@ from .models import (
     StoredValue,
     TaskStatus,
 )
+from .registry import ModuleRegistry, ModuleTemplate
 from .replay import (
     ReplayCase,
     ReplayDivergence,
@@ -151,6 +160,8 @@ __all__ = [
     "LocalExecutor",
     "Module",
     "ModuleCatalog",
+    "ModuleRegistry",
+    "ModuleTemplate",
     "PauseCommand",
     "PlanFragmentIR",
     "PlanIR",
@@ -200,6 +211,7 @@ __all__ = [
     "create_userplane_app",
     "literal",
     "map_over",
+    "module_digest",
     "parallel",
     "parse_command",
     "when",

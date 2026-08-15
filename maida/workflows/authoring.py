@@ -220,10 +220,14 @@ class Module[InputT, OutputT](ABC):
     effects: tuple[Any, ...] = ()
 
     @typing.overload
-    def __call__(self, value: RuntimeValue[InputT], /) -> RuntimeValue[OutputT]: ...
+    def __call__(self, value: RuntimeValue[InputT], /) -> RuntimeValue[OutputT]:
+        """Create output from one typed symbolic input."""
+        ...
 
     @typing.overload
-    def __call__(self, /, **fields: Any) -> RuntimeValue[OutputT]: ...
+    def __call__(self, /, **fields: Any) -> RuntimeValue[OutputT]:
+        """Create output from named structured bindings."""
+        ...
 
     def __call__(
         self,
@@ -323,10 +327,14 @@ class BoundModuleCall[InputT, OutputT]:
     logical_step: str
 
     @typing.overload
-    def __call__(self, value: RuntimeValue[InputT], /) -> RuntimeValue[OutputT]: ...
+    def __call__(self, value: RuntimeValue[InputT], /) -> RuntimeValue[OutputT]:
+        """Create output from one typed symbolic input."""
+        ...
 
     @typing.overload
-    def __call__(self, /, **fields: Any) -> RuntimeValue[OutputT]: ...
+    def __call__(self, /, **fields: Any) -> RuntimeValue[OutputT]:
+        """Create output from named structured bindings."""
+        ...
 
     def __call__(
         self,
