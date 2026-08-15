@@ -40,6 +40,7 @@ from .models import (
     ExecutionMode,
     ExecutionSpec,
     ExecutorCapabilities,
+    PlanTaskProvenance,
     Run,
     RunHistory,
     RunStatus,
@@ -2230,6 +2231,18 @@ class PostgresStore:
             branch_decisions=tuple(row.get("branch_decisions", ())),
             map_decisions=tuple(row.get("map_decisions", ())),
             status=TaskStatus(row["status"]),
+            plan_provenance=(
+                PlanTaskProvenance(
+                    parent_task_id=str(row["parent_task_id"]),
+                    region_id=str(row["plan_region_id"]),
+                    region_instance_id=str(row["plan_region_instance_id"]),
+                    node_key=str(row["plan_node_key"]),
+                    plan_digest=str(row["plan_digest"]),
+                    revision=int(row["plan_revision"]),
+                )
+                if row.get("parent_task_id") is not None
+                else None
+            ),
             accepted_attempt_id=str(row["accepted_attempt_id"])
             if row.get("accepted_attempt_id")
             else None,

@@ -24,6 +24,7 @@ PUBLIC_MODULES = (
     "maida.workflows.interactions",
     "maida.workflows.models",
     "maida.workflows.model",
+    "maida.workflows.materialization",
     "maida.workflows.persistence",
     "maida.workflows.replay",
     "maida.workflows.runtime",

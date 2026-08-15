@@ -669,6 +669,39 @@ class Run:
 
 
 @dataclass(frozen=True)
+class PlanTaskProvenance:
+    """Address one task materialized from a validated generated plan.
+
+    Parameters
+    ----------
+    parent_task_id
+        Accepted planner task whose output contains the source fragment.
+    region_id, region_instance_id
+        Stable dynamic-region definition and concrete runtime occurrence.
+    node_key
+        Generated node identity independent of declaration order.
+    plan_digest, revision
+        Exact source fragment and one-based lineage used for this occurrence.
+
+    Notes
+    -----
+    Revision and fragment digest identify an execution instance. They do not
+    enter the generated node's logical definition position.
+    """
+
+    parent_task_id: str
+    region_id: str
+    region_instance_id: str
+    node_key: str
+    plan_digest: str
+    revision: int
+
+    def to_data(self) -> dict[str, Any]:
+        """Return canonical generated-task provenance for history and replay."""
+        return cast(dict[str, Any], canonical_data(asdict(self)))
+
+
+@dataclass(frozen=True)
 class Task:
     """Durable logical module task pinned to one immutable definition.
 
@@ -710,6 +743,7 @@ class Task:
     branch_decisions: tuple[dict[str, Any], ...]
     map_decisions: tuple[dict[str, Any], ...]
     status: TaskStatus
+    plan_provenance: PlanTaskProvenance | None = None
     accepted_attempt_id: str | None = None
     accepted_boundary: BoundaryRecord | None = None
 
