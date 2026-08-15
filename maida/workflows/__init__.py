@@ -22,6 +22,7 @@ Examples
 ...         return self.upper(value)
 """
 
+from .asgi import UserplaneASGI, create_userplane_app
 from .authoring import (
     BoundModuleCall,
     ExecutionContext,
@@ -81,6 +82,7 @@ from .userplane import (
     SignalCommand,
     WorkflowClient,
     WorkflowRun,
+    parse_command,
 )
 from .verification import VerificationSuite
 
@@ -132,6 +134,7 @@ __all__ = [
     "TaskEnvelope",
     "TaskStatus",
     "TaskWorker",
+    "UserplaneASGI",
     "VerificationSuite",
     "Workflow",
     "WorkflowCatalog",
@@ -141,7 +144,9 @@ __all__ = [
     "WorkflowRunner",
     "WorkflowScheduler",
     "compile_workflow",
+    "create_userplane_app",
     "map_over",
     "parallel",
+    "parse_command",
     "when",
 ]

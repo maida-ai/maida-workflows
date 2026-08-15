@@ -28,6 +28,7 @@ from maida.workflows.userplane import (
     RetryCommand,
     SignalCommand,
     WorkflowClient,
+    parse_command,
 )
 
 
@@ -113,6 +114,12 @@ def test_interaction_requests_validate_durable_addresses() -> None:
         InteractionRequest(request_id="account", kind=InteractionKind.INPUT, prompt="")
     with pytest.raises(ValueError, match="signal_name"):
         InteractionRequest(request_id="wake", kind=InteractionKind.SIGNAL, prompt="Continue?")
+    with pytest.raises(ValueError, match="type must be a string"):
+        parse_command({})
+    with pytest.raises(ValueError, match="command_id"):
+        parse_command({"type": "pause"})
+    with pytest.raises(ValueError, match="invalid pause"):
+        parse_command({"type": "pause", "command_id": "p-1", "extra": True})
 
 
 @pytest.mark.postgres
@@ -151,6 +158,33 @@ def test_event_page_validates_cursor_arguments() -> None:
         run.events(limit=0)
     with pytest.raises(ValueError, match="limit"):
         run.events(limit=1001)
+    with pytest.raises(ValueError, match="run_id"):
+        WorkflowClient(object()).attach(" ")  # type: ignore[arg-type]
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_async_event_stream_omits_worker_protocol_events(
+    postgres_store: PostgresStore,
+) -> None:
+    workflow = UpperWorkflow()
+    run = WorkflowClient(postgres_store).start(workflow, "hello")
+    scheduler = WorkflowScheduler.resume(postgres_store, workflow, run.run_id)
+    worker = TaskWorker(
+        postgres_store,
+        workflow_id=scheduler.plan.workflow_id,
+        definition_digest=scheduler.plan.digest,
+        modules=build_module_registry(workflow, scheduler.plan),
+        worker_id="worker-private",
+    )
+    assert await worker.run_once() is not None
+    WorkflowScheduler.resume(postgres_store, UpperWorkflow(), run.run_id).advance()
+
+    streamed = [event async for event in run.stream(poll_interval=0.001)]
+
+    assert streamed[-1].type == "run.completed"
+    assert "attempt.claimed" not in {event.type for event in streamed}
+    assert all("worker_id" not in event.data for event in streamed)
 
 
 @pytest.mark.postgres

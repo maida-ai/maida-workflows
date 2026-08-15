@@ -75,6 +75,10 @@ def test_catalog_pins_factories_by_definition_digest() -> None:
     assert catalog.register(TwoSteps) == first
     with pytest.raises(ValueError, match="registered"):
         WorkflowCatalog().resolve(first.definition_digest)
+    with pytest.raises(ValueError, match="not registered"):
+        catalog.resolve_workflow("missing")
+    with pytest.raises(TypeError, match="Workflow"):
+        catalog.register(lambda: object())  # type: ignore[arg-type,return-value]
 
 
 @pytest.mark.postgres
@@ -190,3 +194,24 @@ async def test_worker_polling_validates_intervals_without_storage() -> None:
         await worker.serve(stop=lambda: False, poll_interval=0)
     with pytest.raises(ValueError, match="heartbeat_every"):
         await worker.run_once(heartbeat_every=timedelta(0))
+
+
+@pytest.mark.asyncio
+async def test_coordinator_polling_handles_idle_stores_and_validates_limits() -> None:
+    class EmptyStore:
+        def list_active_runs(self, *, limit: int) -> tuple[tuple[str, str, str], ...]:
+            return ()
+
+    coordinator = WorkflowCoordinator(EmptyStore(), WorkflowCatalog())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="limit"):
+        coordinator.run_once(limit=0)
+    with pytest.raises(ValueError, match="poll_interval"):
+        await coordinator.serve(stop=lambda: False, poll_interval=0)
+    checks = 0
+
+    def stop() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks > 1
+
+    assert await coordinator.serve(stop=stop, poll_interval=0.001) == 0

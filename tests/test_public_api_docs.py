@@ -10,6 +10,7 @@ import maida.workflows as workflows
 PUBLIC_MODULES = (
     "maida.workflows",
     "maida.workflows.alignment",
+    "maida.workflows.asgi",
     "maida.workflows.artifacts",
     "maida.workflows.authoring",
     "maida.workflows.baseline",
@@ -26,6 +27,7 @@ PUBLIC_MODULES = (
     "examples",
     "examples.adversarial_workflows",
     "examples.native_replay_demo",
+    "examples.userplane_quickstart",
     "examples.workflow_creation",
     "examples.workflow_creation.easy_first_workflow",
     "examples.workflow_creation.easy_sequential",

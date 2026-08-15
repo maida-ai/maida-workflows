@@ -94,6 +94,29 @@ class WorkflowCatalog:
             raise ValueError("registered workflow factory no longer matches its pinned digest")
         return workflow
 
+    def resolve_workflow(self, workflow_id: str) -> Workflow[Any, Any]:
+        """Return the single registered definition for a workflow ID.
+
+        Raises
+        ------
+        ValueError
+            If no definition is registered or multiple versions make the
+            unversioned application address ambiguous.
+        """
+        matches = [
+            definition
+            for definition in self._definitions.values()
+            if definition.workflow_id == workflow_id
+        ]
+        if not matches:
+            raise ValueError(f"workflow {workflow_id!r} is not registered")
+        if len(matches) > 1:
+            raise ValueError(
+                f"workflow {workflow_id!r} has multiple registered definitions; "
+                "select a deployment-pinned catalog"
+            )
+        return self.resolve(matches[0].definition_digest)
+
 
 class _CoordinatorStore(DurableRuntimeStore, Protocol):
     def list_active_runs(

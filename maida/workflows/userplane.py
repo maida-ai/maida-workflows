@@ -9,6 +9,7 @@ transport supplied by a third party.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -257,6 +258,18 @@ _EVENT_NAMES = {
     "ARTIFACT_CREATED": "artifact.created",
 }
 
+_INTERNAL_EVENT_TYPES = {
+    "ATTEMPT_CLAIMED",
+    "ATTEMPT_HEARTBEAT",
+    "CHECKPOINT_WRITTEN",
+}
+_OPERATIONAL_PAYLOAD_FIELDS = {
+    "checkpoint_digest",
+    "lease_expires_at",
+    "lease_token",
+    "worker_id",
+}
+
 
 @dataclass(frozen=True)
 class RunEvent:
@@ -292,13 +305,16 @@ class RunEvent:
         payload = canonical_data(event.payload)
         if not isinstance(payload, dict):  # pragma: no cover - event payload contract is an object
             raise TypeError("runtime event payload must encode as an object")
+        public_payload = {
+            key: value for key, value in payload.items() if key not in _OPERATIONAL_PAYLOAD_FIELDS
+        }
         return cls(
             sequence=event.event_id,
             type=name,
             run_id=event.run_id,
             task_id=event.task_id,
             attempt_id=event.attempt_id,
-            data=payload,
+            data=public_payload,
             created_at=event.created_at,
         )
 
@@ -313,6 +329,20 @@ class RunEvent:
             "data": self.data,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+
+    def to_sse(self) -> bytes:
+        """Encode the event as one standards-compatible SSE record.
+
+        The durable sequence becomes the SSE ``id`` so browsers and other
+        clients can reconnect through ``Last-Event-ID``. Event payloads use
+        canonical compact JSON.
+        """
+        from ._canonical import canonical_json
+
+        safe_type = self.type.replace("\r", "").replace("\n", "")
+        return (
+            f"id: {self.sequence}\nevent: {safe_type}\ndata: {canonical_json(self.to_data())}\n\n"
+        ).encode()
 
 
 @dataclass(frozen=True)
@@ -402,7 +432,13 @@ class WorkflowRun:
             output=output,
         )
 
-    def events(self, *, after: int = 0, limit: int = 100) -> EventPage:
+    def events(
+        self,
+        *,
+        after: int = 0,
+        limit: int = 100,
+        include_internal: bool = False,
+    ) -> EventPage:
         """Read an ordered event page after a durable sequence cursor.
 
         Parameters
@@ -411,6 +447,9 @@ class WorkflowRun:
             Last sequence already observed. Zero reads from the beginning.
         limit
             Maximum events to return, from 1 through 1000.
+        include_internal
+            Include worker claim, heartbeat, and checkpoint diagnostics. The
+            default application stream omits deployment-level details.
 
         Returns
         -------
@@ -421,16 +460,70 @@ class WorkflowRun:
             raise ValueError("after cursor must be non-negative")
         if limit < 1 or limit > 1000:
             raise ValueError("limit must be between 1 and 1000")
-        loaded = self._store.list_events(
-            self.run_id,
-            tenant_id=self.tenant_id,
-            after=after,
-            limit=limit + 1,
-        )
-        has_more = len(loaded) > limit
-        projected = tuple(RunEvent.from_runtime(event) for event in loaded[:limit])
-        cursor = projected[-1].sequence if projected else after
-        return EventPage(projected, cursor, has_more)
+        projected: list[RunEvent] = []
+        cursor = after
+        while len(projected) < limit:
+            batch_limit = min(1001, max(32, (limit - len(projected)) * 4))
+            loaded = self._store.list_events(
+                self.run_id,
+                tenant_id=self.tenant_id,
+                after=cursor,
+                limit=batch_limit,
+            )
+            if not loaded:
+                return EventPage(tuple(projected), cursor, False)
+            for index, event in enumerate(loaded):
+                cursor = event.event_id
+                if include_internal or event.event_type not in _INTERNAL_EVENT_TYPES:
+                    projected.append(RunEvent.from_runtime(event))
+                if len(projected) == limit:
+                    has_more = index < len(loaded) - 1 or len(loaded) == batch_limit
+                    return EventPage(tuple(projected), cursor, has_more)
+            if len(loaded) < batch_limit:
+                return EventPage(tuple(projected), cursor, False)
+        return EventPage(tuple(projected), cursor, True)  # pragma: no cover - loop returns at limit
+
+    async def stream(
+        self,
+        *,
+        after: int = 0,
+        poll_interval: float = 0.25,
+        include_internal: bool = False,
+    ) -> AsyncIterator[RunEvent]:
+        """Yield reconnectable events until the run reaches a terminal state.
+
+        Parameters
+        ----------
+        after
+            Last durable event sequence already consumed.
+        poll_interval
+            Delay between empty non-terminal event pages.
+        include_internal
+            Include worker protocol diagnostics when true.
+        """
+        if poll_interval <= 0:
+            raise ValueError("poll_interval must be positive")
+        cursor = after
+        while True:
+            page = self.events(
+                after=cursor,
+                limit=100,
+                include_internal=include_internal,
+            )
+            for event in page.events:
+                cursor = event.sequence
+                yield event
+            cursor = max(cursor, page.next_cursor)
+            if not page.has_more and self.snapshot().status in {
+                RunStatus.SUCCEEDED,
+                RunStatus.FAILED,
+                RunStatus.CANCELLED,
+            }:
+                return
+            if not page.has_more:
+                import asyncio
+
+                await asyncio.sleep(poll_interval)
 
     def send(self, command: RunCommand) -> CommandReceipt:
         """Validate and durably apply one idempotent typed command.
@@ -500,3 +593,43 @@ class WorkflowClient:
         if not run_id.strip():
             raise ValueError("run_id must be non-empty")
         return WorkflowRun(self.store, run_id, tenant_id)
+
+
+def parse_command(data: Mapping[str, Any]) -> RunCommand:
+    """Parse a strict JSON command object into its typed Python value.
+
+    Parameters
+    ----------
+    data
+        Mapping containing a supported ``type`` and caller-supplied
+        ``command_id``.
+
+    Raises
+    ------
+    ValueError
+        If the type is unknown, identity is absent, or fields do not match the
+        selected command contract.
+    """
+    command_type = data.get("type")
+    if not isinstance(command_type, str):
+        raise ValueError("command type must be a string")
+    if not isinstance(data.get("command_id"), str):
+        raise ValueError("command_id must be supplied by the caller")
+    command_classes: dict[str, type[RunCommand]] = {
+        CommandType.SIGNAL.value: SignalCommand,
+        CommandType.APPROVE.value: ApproveCommand,
+        CommandType.REJECT.value: RejectCommand,
+        CommandType.INPUT.value: InputCommand,
+        CommandType.PAUSE.value: PauseCommand,
+        CommandType.RESUME.value: ResumeCommand,
+        CommandType.CANCEL.value: CancelCommand,
+        CommandType.RETRY.value: RetryCommand,
+    }
+    command_class = command_classes.get(command_type)
+    if command_class is None:
+        raise ValueError(f"unknown command type {command_type!r}")
+    payload = {key: value for key, value in data.items() if key != "type"}
+    try:
+        return command_class(**payload)
+    except TypeError as exc:
+        raise ValueError(f"invalid {command_type} command: {exc}") from exc

@@ -53,6 +53,26 @@ Use `maida-workflows --help` for compile, database, fixture, diff, replay, and
 verification commands. Fixture export is explicit and writes private local
 files; production payloads are never uploaded automatically.
 
+## Application backend
+
+The same durable run can back a Python service or a frontend without exposing
+worker and lease mechanics. Register workflow factories, create the ASGI
+adapter, and mount it in the server your application already uses:
+
+```python
+from maida.workflows import WorkflowCatalog, create_userplane_app
+
+catalog = WorkflowCatalog([SupportWorkflow])
+app = create_userplane_app(store, catalog)
+```
+
+The adapter exposes run creation, status, typed commands, cursor-paginated
+events, and server-sent events. Starting a run returns immediately and never
+executes module handlers in the web process. Tenant scope comes from a trusted
+host callback; request payloads cannot select their own tenant. See
+[`examples/userplane_quickstart.py`](examples/userplane_quickstart.py) for a
+deterministic, credential-free starting point.
+
 ## Identity and replay contract
 
 Every executable occurrence has three independent identities:
