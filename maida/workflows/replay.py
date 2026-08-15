@@ -32,9 +32,11 @@ from .authoring import (
     _StructuredBinding,
     _WorkflowBinding,
 )
+from .budget import BudgetExceededError, BudgetUsage
 from .fixture import ReplayFixture, _validate_loaded_integrity
 from .interactions import _InteractionModule
 from .ir import PlanIR, ReplayKey, _compile_workflow_graph
+from .model import ModelAdapterRegistry, ModelBroker, ModelSpec
 from .models import EffectKind, EffectRecord, Usage
 from .runtime import _coerce_trajectory, _rehydrate, _stable_instance_id
 
@@ -382,6 +384,30 @@ class ReplayEffectAdapter:
         return recorded_result if recorded_result is not None else {"replay_ack": True}
 
 
+class _ReplayModelMeter:
+    def __init__(self) -> None:
+        self._reservations: dict[str, BudgetUsage] = {}
+        self._ordinal = 0
+
+    def reserve_model(self, name: str, usage: BudgetUsage) -> str:
+        key = f"model:{self._ordinal}:{name}"
+        self._ordinal += 1
+        self._reservations[key] = usage
+        return key
+
+    def commit_model(self, reservation: str, usage: BudgetUsage) -> None:
+        estimated = self._reservations.get(reservation)
+        if estimated is None:
+            raise BudgetExceededError("selective model usage was not reserved")
+        if (
+            usage.wall_time > estimated.wall_time
+            or usage.model_tokens > estimated.model_tokens
+            or usage.tool_calls > estimated.tool_calls
+            or usage.cost_usd > estimated.cost_usd
+        ):
+            raise BudgetExceededError("selective model usage exceeded its reservation")
+
+
 class ReplayEngine:
     """Validate graph correspondence and execute full or selective replay.
 
@@ -395,6 +421,8 @@ class ReplayEngine:
         Factory for a fresh effect-denying :class:`ReplayBroker`.
     worker_policy
         Credential and adapter restrictions for live replay work.
+    model_adapters
+        Explicit replay-safe model providers available to selected modules.
 
     Raises
     ------
@@ -409,11 +437,13 @@ class ReplayEngine:
         trace_bridge: TraceBridge | None = None,
         broker_factory: Callable[[], ReplayBroker] = ReplayBroker,
         worker_policy: ReplayWorkerPolicy | None = None,
+        model_adapters: ModelAdapterRegistry | None = None,
     ) -> None:
         self.aligner = aligner or GraphAligner()
         self.trace_bridge = trace_bridge or MaidaTraceBridge()
         self.broker_factory = broker_factory
         self.worker_policy = worker_policy or ReplayWorkerPolicy()
+        self.model_adapters = model_adapters or ModelAdapterRegistry()
         if self.worker_policy.production_effect_adapters:
             raise ReplayContractError("replay workers cannot register production effect adapters")
 
@@ -600,12 +630,21 @@ class ReplayEngine:
             if not value_matches_type(input_data, module.input_type):
                 raise ReplayContractError(f"recorded input violates {key.as_string()} contract")
             metadata: dict[str, Any] = {}
+            model_meter = _ReplayModelMeter()
+            model_broker = ModelBroker(
+                self.model_adapters,
+                cast(tuple[ModelSpec[Any, Any], ...], module.models),
+                meter=model_meter,
+                metadata=metadata,
+                audit=lambda event_type, payload: None,
+            )
             context = ExecutionContext(
                 run_id=f"replay:{case.fixture.source.run_id}",
                 task_id=f"replay:{boundary.instance_key}",
                 step_instance_id=boundary.step_instance_id,
                 replay=True,
                 broker=broker,
+                models=model_broker,
                 metadata=metadata,
             )
 
@@ -1150,10 +1189,11 @@ def _scrubbed_environment(policy: ReplayWorkerPolicy) -> Iterator[None]:
 
 def _add_usage(left: Usage, right: Usage) -> Usage:
     return Usage(
-        left.input_tokens + right.input_tokens,
-        left.output_tokens + right.output_tokens,
-        left.cost_usd + right.cost_usd,
-        left.latency_ms + right.latency_ms,
+        input_tokens=left.input_tokens + right.input_tokens,
+        output_tokens=left.output_tokens + right.output_tokens,
+        cost_usd=left.cost_usd + right.cost_usd,
+        latency_ms=left.latency_ms + right.latency_ms,
+        tool_calls=left.tool_calls + right.tool_calls,
     )
 
 

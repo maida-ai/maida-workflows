@@ -24,6 +24,7 @@ from ._canonical import (
 )
 from .authoring import Module
 from .ir import _access_contract, module_digest
+from .model import _model_contract
 
 _ALIAS_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
 ModuleFactory = Callable[[], Module[Any, Any]]
@@ -249,7 +250,7 @@ class ModuleRegistry:
         registration = self._registrations[alias]
         template = registration.template
         access = _access_contract(module)
-        return {
+        requirement = {
             "alias": alias,
             "template": (
                 {"id": template.template_id, "version": template.version}
@@ -266,6 +267,10 @@ class ModuleRegistry:
             "effects": list(access["effects"]),
             "effectful": module.effectful,
         }
+        models = _model_contract(module)
+        if models:
+            requirement["models"] = list(models)
+        return requirement
 
     def describe(self) -> tuple[dict[str, Any], ...]:
         """Return deterministic authoring metadata without factories or imports."""

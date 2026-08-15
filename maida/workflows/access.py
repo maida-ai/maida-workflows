@@ -611,6 +611,7 @@ class AccessBroker:
         metadata: dict[str, Any] | None = None,
         _effect_operations: _EffectOperations | None = None,
         _claim: Any = None,
+        _budget_meter: Any = None,
     ) -> None:
         declared = tuple(declarations)
         if any(not isinstance(item, Capability) for item in declared):
@@ -656,6 +657,7 @@ class AccessBroker:
         self.metadata = metadata if metadata is not None else {}
         self._effect_operations = _effect_operations
         self._claim = _claim
+        self._budget_meter = _budget_meter
         self._effect_ordinals: dict[str, int] = {}
         self._effect_called = False
         self._effect_records: list[dict[str, Any]] = []
@@ -798,6 +800,8 @@ class AccessBroker:
                 {**authorized, "reason_code": "adapter-not-registered"},
             )
             raise
+        if self._budget_meter is not None:
+            self._budget_meter.charge_tool(capability.name)
         started = time.perf_counter()
         try:
             response = await adapter.read(operation, request)
@@ -1107,6 +1111,9 @@ class AccessBroker:
             raise AccessContractError(
                 f"effect {effect.name} unsafe retry denied because the adapter is not idempotent"
             )
+
+        if self._budget_meter is not None:
+            self._budget_meter.charge_tool(effect.name)
 
         try:
             attempted = self._effect_operations._mark_effect_attempted(

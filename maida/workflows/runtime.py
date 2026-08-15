@@ -37,9 +37,11 @@ from .authoring import (
     Module,
     Workflow,
 )
+from .budget import BudgetExceededError, BudgetUsage, _LiveBudgetMeter
 from .definitions import BoundWorkflow, bind_workflow
 from .interactions import _InteractionModule
 from .ir import BindingIR, PlanIR, ReplayKey, StepIR, module_digest
+from .model import ModelAdapterRegistry, ModelBroker, ModelSpec
 from .models import (
     AcceptedAttemptProvenance,
     Attempt,
@@ -187,6 +189,23 @@ class DurableRuntimeStore(Protocol):
     def complete_task(self, claim: ClaimedTask, boundary: BoundaryRecord) -> BoundaryRecord:
         """Accept and return the store-authoritative logical boundary."""
         ...
+
+    def _reserve_budget_usage(
+        self,
+        claim: ClaimedTask,
+        *,
+        charge_key: str,
+        kind: str,
+        usage: BudgetUsage,
+    ) -> None: ...
+
+    def _commit_budget_usage(
+        self,
+        claim: ClaimedTask,
+        *,
+        charge_key: str,
+        usage: BudgetUsage,
+    ) -> None: ...
 
     def fail_task(
         self,
@@ -431,6 +450,8 @@ class TaskWorker:
     access_policy
         Optional policy that may narrow each task's compiled access grant and
         reference same-task durable approval evidence for protected effects.
+    model_adapters
+        Deployment-owned providers for the module's declared model endpoints.
     """
 
     def __init__(
@@ -445,6 +466,7 @@ class TaskWorker:
         capabilities: ExecutorCapabilities | None = None,
         connectors: ConnectorRegistry | None = None,
         access_policy: AccessPolicy | None = None,
+        model_adapters: ModelAdapterRegistry | None = None,
     ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts must be positive")
@@ -458,6 +480,7 @@ class TaskWorker:
         self.capabilities = capabilities or ExecutorCapabilities.local_process()
         self.connectors = connectors or ConnectorRegistry()
         self.access_policy = access_policy
+        self.model_adapters = model_adapters or ModelAdapterRegistry()
 
     def claim(
         self,
@@ -677,6 +700,7 @@ class TaskWorker:
                 self.store.park_task(claim, request)
                 return None
         metadata: dict[str, Any] = {}
+        meter = _LiveBudgetMeter(self.store, claim)
         try:
             broker = AccessBroker(
                 self.connectors,
@@ -699,6 +723,7 @@ class TaskWorker:
                 metadata=metadata,
                 _effect_operations=self.store,
                 _claim=claim,
+                _budget_meter=meter,
             )
         except Exception as exc:
             self.fail(
@@ -710,28 +735,55 @@ class TaskWorker:
                 retry=False,
             )
             raise RuntimeContractError("task access contract could not be bound") from exc
+        model_broker = ModelBroker(
+            self.model_adapters,
+            cast(tuple[ModelSpec[Any, Any], ...], module.models),
+            meter=meter,
+            metadata=metadata,
+            audit=lambda event_type, payload: self.store.append_access_event(
+                claim.task.run_id,
+                event_type,
+                payload,
+                task_id=claim.task.task_id,
+                attempt_id=str(claim.attempt.attempt_id),
+            ),
+        )
         context = ExecutionContext(
             run_id=claim.task.run_id,
             task_id=claim.task.task_id,
             step_instance_id=claim.task.step_instance_id,
             broker=broker,
+            models=model_broker,
             metadata=metadata,
         )
         started = time.perf_counter()
         try:
-            output = (
-                module._resolve_data(interaction_resolution)
-                if isinstance(module, _InteractionModule) and interaction_resolution is not None
-                else await module.execute(input_data, context)
-            )
+
+            async def invoke() -> Any:
+                return (
+                    module._resolve_data(interaction_resolution)
+                    if isinstance(module, _InteractionModule) and interaction_resolution is not None
+                    else await module.execute(input_data, context)
+                )
+
+            if claim.task.budget.wall_time is None:
+                output = await invoke()
+            else:
+                try:
+                    async with asyncio.timeout(claim.task.budget.wall_time.total_seconds()):
+                        output = await invoke()
+                except TimeoutError:
+                    raise BudgetExceededError("wall_time budget was exceeded") from None
             if not value_matches_type(output, module.output_type):
                 raise RuntimeContractError(
                     f"module {key_for(claim).as_string()} returned a value outside "
                     "its output contract"
                 )
         except Exception as exc:
-            retry = claim.attempt.attempt_number < self.max_attempts and (
-                not isinstance(exc, AccessContractError) or exc.retryable
+            retry = (
+                not isinstance(exc, BudgetExceededError)
+                and claim.attempt.attempt_number < self.max_attempts
+                and (not isinstance(exc, AccessContractError) or exc.retryable)
             )
             self.fail(
                 envelope,
@@ -1401,6 +1453,8 @@ class WorkflowRunner:
         Optional policy that may narrow, but cannot expand, the access grant
         compiled and persisted for each task. Approval-required effects also
         need a durable evidence reference verified against that same task.
+    model_adapters
+        Provider adapter registry used only at declared model boundaries.
 
     Notes
     -----
@@ -1417,12 +1471,14 @@ class WorkflowRunner:
         max_attempts: int = 3,
         connectors: ConnectorRegistry | None = None,
         access_policy: AccessPolicy | None = None,
+        model_adapters: ModelAdapterRegistry | None = None,
     ) -> None:
         self.store = store
         self.worker_id = worker_id
         self.max_attempts = max_attempts
         self.connectors = connectors or ConnectorRegistry()
         self.access_policy = access_policy
+        self.model_adapters = model_adapters or ModelAdapterRegistry()
 
     async def run[InputT, OutputT](
         self,
@@ -1452,6 +1508,7 @@ class WorkflowRunner:
                 capabilities=ExecutorCapabilities.local_process(),
                 connectors=self.connectors,
                 access_policy=self.access_policy,
+                model_adapters=self.model_adapters,
             )
         )
         last_error: Exception | None = None

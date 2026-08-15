@@ -23,6 +23,7 @@ PUBLIC_MODULES = (
     "maida.workflows.ir",
     "maida.workflows.interactions",
     "maida.workflows.models",
+    "maida.workflows.model",
     "maida.workflows.persistence",
     "maida.workflows.replay",
     "maida.workflows.runtime",

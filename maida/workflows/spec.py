@@ -30,6 +30,7 @@ from .ir import (
     _access_contract,
     module_digest,
 )
+from .model import _model_contract
 from .registry import ModuleRegistry
 
 SPEC_VERSION = "0.1.0"
@@ -949,7 +950,7 @@ class _SpecCompiler:
                 explanation,
             )
         plan = PlanIR(
-            version="0.4.0",
+            version=("0.5.0" if any(step.models for step in self.steps) else "0.4.0"),
             workflow_id=self.spec.workflow_id,
             input_schema=canonical_data(self.spec.input_schema),
             output_schema=canonical_data(self.spec.output_schema),
@@ -1129,6 +1130,7 @@ class _SpecCompiler:
             )
             return
         access = _access_contract(module)
+        models = _model_contract(module)
         budget = module.budget.to_data()
         behavior_digest = module_digest(module)
         control: dict[str, Any] | None = None
@@ -1149,6 +1151,8 @@ class _SpecCompiler:
             "effects": access["effects"],
             "control": control,
         }
+        if models:
+            definition_contract["models"] = models
         if budget != Budget().to_data():
             definition_contract["budget"] = budget
         step = StepIR(
@@ -1164,6 +1168,7 @@ class _SpecCompiler:
             execution=module.execution.to_data(),
             capabilities=access["capabilities"],
             effects=access["effects"],
+            models=models,
             budget=budget,
             control=control,
         )
@@ -1359,6 +1364,7 @@ class _SpecCompiler:
                     execution=child_step.execution,
                     capabilities=child_step.capabilities,
                     effects=child_step.effects,
+                    models=child_step.models,
                     budget=child_step.budget,
                     control=child_step.control,
                 )
@@ -1589,6 +1595,8 @@ def _rewritten_definition_digest(
         "effects": step.effects,
         "control": step.control,
     }
+    if step.models:
+        contract["models"] = step.models
     if step.budget is not None and step.budget != Budget().to_data():
         contract["budget"] = step.budget
     return digest_data(contract)

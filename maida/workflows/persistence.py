@@ -25,7 +25,7 @@ from psycopg.types.json import Jsonb
 from ._canonical import digest_data
 from ._schema import value_matches_schema
 from .artifacts import ValueCodec
-from .budget import Budget
+from .budget import Budget, BudgetExceededError, BudgetUsage
 from .ir import PlanIR, StepIR
 from .models import (
     AcceptedAttemptProvenance,
@@ -60,6 +60,8 @@ _ACCESS_AUDIT_EVENT_TYPES = frozenset(
         "CAPABILITY_USED",
         "EFFECT_DENIED",
         "EFFECT_FAILED",
+        "MODEL_CALLED",
+        "MODEL_RESOLVED",
     }
 )
 
@@ -98,6 +100,39 @@ def _decode_capability_grant(data: Any) -> CapabilityGrant:
         return CapabilityGrant.from_data(data)
     except ValueError as exc:
         raise PersistenceError(f"persisted task capability grant is invalid: {exc}") from exc
+
+
+def _add_budget_usage(left: BudgetUsage, right: BudgetUsage) -> BudgetUsage:
+    return BudgetUsage(
+        wall_time=left.wall_time + right.wall_time,
+        model_tokens=left.model_tokens + right.model_tokens,
+        tool_calls=left.tool_calls + right.tool_calls,
+        cost_usd=left.cost_usd + right.cost_usd,
+    )
+
+
+def _budget_exceeded_dimension(budget: Budget, usage: BudgetUsage) -> str | None:
+    if budget.wall_time is not None and usage.wall_time > budget.wall_time:
+        return "wall_time"
+    if budget.model_tokens is not None and usage.model_tokens > budget.model_tokens:
+        return "model_tokens"
+    if budget.tool_calls is not None and usage.tool_calls > budget.tool_calls:
+        return "tool_calls"
+    if budget.cost_usd is not None and usage.cost_usd > budget.cost_usd:
+        return "cost_usd"
+    return None
+
+
+def _usage_exceeds_reservation(actual: BudgetUsage, reserved: BudgetUsage) -> str | None:
+    if actual.wall_time > reserved.wall_time:
+        return "wall_time"
+    if actual.model_tokens > reserved.model_tokens:
+        return "model_tokens"
+    if actual.tool_calls > reserved.tool_calls:
+        return "tool_calls"
+    if actual.cost_usd > reserved.cost_usd:
+        return "cost_usd"
+    return None
 
 
 @dataclass(frozen=True)
@@ -1102,6 +1137,122 @@ class PostgresStore:
         if cursor.fetchone() is None:
             raise StaleLeaseError(f"lease for task {claim.task.task_id} is stale")
 
+    def _reserve_budget_usage(
+        self,
+        claim: ClaimedTask,
+        *,
+        charge_key: str,
+        kind: str,
+        usage: BudgetUsage,
+    ) -> None:
+        """Reserve live resources transactionally before provider access."""
+        if kind not in {"model", "tool"}:
+            raise ValueError("budget charge kind must be model or tool")
+        with self.connect() as connection, connection.cursor() as cursor:
+            self._lock_effect_claim(cursor, claim)
+            cursor.execute(
+                """
+                SELECT * FROM workflow_budget_usage
+                WHERE task_id = %s AND charge_key = %s
+                FOR UPDATE
+                """,
+                (claim.task.task_id, charge_key),
+            )
+            existing = cursor.fetchone()
+            if existing is not None:
+                if (
+                    existing["kind"] != kind
+                    or existing["reservation"] != usage.to_data()
+                    or str(existing["attempt_id"]) != str(claim.attempt.attempt_id)
+                ):
+                    raise PersistenceError("budget reservation identity conflicts")
+                return
+            cursor.execute(
+                """
+                SELECT reservation, actual, status FROM workflow_budget_usage
+                WHERE task_id = %s FOR UPDATE
+                """,
+                (claim.task.task_id,),
+            )
+            total = BudgetUsage()
+            for row in cursor.fetchall():
+                selected = row["actual"] if row["status"] == "COMMITTED" else row["reservation"]
+                total = _add_budget_usage(total, BudgetUsage.from_data(selected))
+            proposed = _add_budget_usage(total, usage)
+            exceeded = _budget_exceeded_dimension(claim.task.budget, proposed)
+            if exceeded is not None:
+                raise BudgetExceededError(f"{exceeded} budget would be exceeded")
+            cursor.execute(
+                """
+                INSERT INTO workflow_budget_usage (
+                    task_id, charge_key, attempt_id, kind, reservation
+                ) VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    claim.task.task_id,
+                    charge_key,
+                    claim.attempt.attempt_id,
+                    kind,
+                    Jsonb(usage.to_data()),
+                ),
+            )
+            self._append_event(
+                cursor,
+                claim.task.run_id,
+                "BUDGET_RESERVED",
+                {"charge_key": charge_key, "kind": kind, "usage": usage.to_data()},
+                task_id=claim.task.task_id,
+                attempt_id=claim.attempt.attempt_id,
+            )
+
+    def _commit_budget_usage(
+        self,
+        claim: ClaimedTask,
+        *,
+        charge_key: str,
+        usage: BudgetUsage,
+    ) -> None:
+        """Commit measured usage without permitting estimate overruns."""
+        with self.connect() as connection, connection.cursor() as cursor:
+            self._lock_effect_claim(cursor, claim)
+            cursor.execute(
+                """
+                SELECT * FROM workflow_budget_usage
+                WHERE task_id = %s AND charge_key = %s
+                FOR UPDATE
+                """,
+                (claim.task.task_id, charge_key),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise PersistenceError("budget usage was not reserved")
+            if str(row["attempt_id"]) != str(claim.attempt.attempt_id):
+                raise PersistenceError("budget reservation belongs to another attempt")
+            if row["status"] == "COMMITTED":
+                if row["actual"] != usage.to_data():
+                    raise PersistenceError("committed budget usage conflicts")
+                return
+            reservation = BudgetUsage.from_data(row["reservation"])
+            exceeded = _usage_exceeds_reservation(usage, reservation)
+            if exceeded is not None:
+                raise BudgetExceededError(f"model provider exceeded its {exceeded} reservation")
+            cursor.execute(
+                """
+                UPDATE workflow_budget_usage
+                SET actual = %s, status = 'COMMITTED', committed_at = now()
+                WHERE task_id = %s AND charge_key = %s
+                """,
+                (Jsonb(usage.to_data()), claim.task.task_id, charge_key),
+            )
+            self._append_event(
+                cursor,
+                claim.task.run_id,
+                "BUDGET_COMMITTED",
+                {"charge_key": charge_key, "kind": row["kind"], "usage": usage.to_data()},
+                task_id=claim.task.task_id,
+                attempt_id=claim.attempt.attempt_id,
+            )
+
     @staticmethod
     def _validate_effect_operation(
         row: dict[str, Any] | None,
@@ -1189,6 +1340,7 @@ class PostgresStore:
         )
         boundary_data = boundary.to_data()
         uncommitted_effect = False
+        uncommitted_budget = False
         with self.connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -1217,8 +1369,26 @@ class PostgresStore:
             uncommitted_effect = any(
                 row["status"] != _EffectOperationStatus.COMMITTED.value for row in effect_rows
             )
-            if uncommitted_effect:
-                diagnostic = {"reason": "task returned with an uncommitted broker-managed effect"}
+            cursor.execute(
+                """
+                SELECT kind, reservation, actual, status
+                FROM workflow_budget_usage
+                WHERE task_id = %s
+                ORDER BY created_at, charge_key
+                FOR UPDATE
+                """,
+                (task.task_id,),
+            )
+            budget_rows = list(cursor.fetchall())
+            uncommitted_budget = any(row["status"] != "COMMITTED" for row in budget_rows)
+            if uncommitted_effect or uncommitted_budget:
+                diagnostic = {
+                    "reason": (
+                        "task returned with an uncommitted broker-managed effect"
+                        if uncommitted_effect
+                        else "task returned with uncommitted live budget usage"
+                    )
+                }
                 cursor.execute(
                     """
                     UPDATE workflow_tasks
@@ -1245,6 +1415,34 @@ class PostgresStore:
                     attempt_id=claim.attempt.attempt_id,
                 )
             else:
+                if budget_rows:
+                    metered = BudgetUsage()
+                    has_model = False
+                    for row in budget_rows:
+                        metered = _add_budget_usage(metered, BudgetUsage.from_data(row["actual"]))
+                        has_model = has_model or row["kind"] == "model"
+                    preserve_breakdown = (
+                        not has_model
+                        or boundary.usage.input_tokens + boundary.usage.output_tokens
+                        == metered.model_tokens
+                    )
+                    boundary = replace(
+                        boundary,
+                        usage=replace(
+                            boundary.usage,
+                            input_tokens=(
+                                boundary.usage.input_tokens
+                                if preserve_breakdown
+                                else metered.model_tokens
+                            ),
+                            output_tokens=(
+                                boundary.usage.output_tokens if preserve_breakdown else 0
+                            ),
+                            cost_usd=metered.cost_usd,
+                            tool_calls=metered.tool_calls,
+                        ),
+                    )
+                    boundary_data = boundary.to_data()
                 incoming_managed_effect = any(
                     effect.effect_name is not None
                     or effect.ordinal is not None
@@ -1314,6 +1512,8 @@ class PostgresStore:
                 )
         if uncommitted_effect:
             raise PersistenceError("task cannot complete with an uncommitted effect operation")
+        if uncommitted_budget:
+            raise PersistenceError("task cannot complete with uncommitted live budget usage")
         return boundary
 
     def fail_task(

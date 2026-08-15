@@ -42,6 +42,8 @@ class ExecutionContext:
         Whether the module is running as a selective replay target.
     broker
         Runtime-managed broker for supported reads and effects.
+    models
+        Runtime-managed broker for declared, metered model invocations.
     metadata
         Mutable collection for trajectories, usage, and other boundary data.
     """
@@ -51,6 +53,7 @@ class ExecutionContext:
     step_instance_id: str
     replay: bool = False
     broker: Any = None
+    models: Any = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -208,6 +211,8 @@ class Module[InputT, OutputT](ABC):
         Typed external access declarations compiled into the module boundary.
         Explicit :class:`~maida.workflows.Connector` and
         :class:`~maida.workflows.Effect` modules provide the easiest path.
+    models
+        Typed model declarations resolved through the runtime model broker.
     """
 
     module_id: str | None = None
@@ -218,6 +223,7 @@ class Module[InputT, OutputT](ABC):
     budget: Budget = Budget()
     capabilities: tuple[Any, ...] = ()
     effects: tuple[Any, ...] = ()
+    models: tuple[Any, ...] = ()
 
     @typing.overload
     def __call__(self, value: RuntimeValue[InputT], /) -> RuntimeValue[OutputT]:

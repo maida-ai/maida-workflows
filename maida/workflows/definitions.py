@@ -18,6 +18,7 @@ from ._canonical import canonical_data, schema_digest, value_matches_type
 from ._schema import value_matches_schema
 from .authoring import Module, RuntimeValue, Workflow
 from .ir import PlanIR, ReplayKey, _compile_workflow_graph, module_digest
+from .model import _model_contract
 
 
 @dataclass(frozen=True)
@@ -100,6 +101,8 @@ class BoundWorkflow:
                 raise ValueError(f"module input schema does not match {key.as_string()}")
             if schema_digest(module.output_type) != step.output_schema_digest:
                 raise ValueError(f"module output schema does not match {key.as_string()}")
+            if _model_contract(module) != step.models:
+                raise ValueError(f"module model declarations do not match {key.as_string()}")
         object.__setattr__(self, "modules", MappingProxyType(supplied))
         map_item_keys = dict(self.map_item_keys or {})
         expected_maps = {step.node_id for step in self.plan.steps if step.kind == "map_module"}

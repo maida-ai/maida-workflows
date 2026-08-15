@@ -51,7 +51,7 @@ from .authoring import (
     parallel,
     when,
 )
-from .budget import Budget
+from .budget import Budget, BudgetExceededError, BudgetUsage
 from .bundle import (
     WorkflowBundle,
     WorkflowBundleError,
@@ -78,6 +78,13 @@ from .ir import (
     StepIR,
     compile_workflow,
     module_digest,
+)
+from .model import (
+    ModelAdapter,
+    ModelAdapterRegistry,
+    ModelBroker,
+    ModelCallResult,
+    ModelSpec,
 )
 from .models import (
     BoundaryRecord,
@@ -153,6 +160,8 @@ __all__ = [
     "BoundWorkflow",
     "BoundaryRecord",
     "Budget",
+    "BudgetExceededError",
+    "BudgetUsage",
     "CancelCommand",
     "Capability",
     "CapabilityGrant",
@@ -178,6 +187,11 @@ __all__ = [
     "InteractionKind",
     "InteractionRequest",
     "LocalExecutor",
+    "ModelAdapter",
+    "ModelAdapterRegistry",
+    "ModelBroker",
+    "ModelCallResult",
+    "ModelSpec",
     "Module",
     "ModuleCatalog",
     "ModuleRegistry",

@@ -389,12 +389,13 @@ class StoredValue:
 
 @dataclass(frozen=True)
 class Usage:
-    """Token, monetary cost, and latency measurements for one boundary."""
+    """Token, tool, monetary-cost, and latency measurements for one boundary."""
 
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: float = 0.0
     latency_ms: float = 0.0
+    tool_calls: int = 0
 
 
 @dataclass(frozen=True)

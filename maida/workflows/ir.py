@@ -36,11 +36,14 @@ from .authoring import (
     _WorkflowBinding,
 )
 from .budget import Budget
+from .model import _model_contract, _validated_model_contract
 
-IR_VERSION = "0.4.0"
-SUPPORTED_IR_VERSIONS = frozenset({"0.1.0", "0.2.0", "0.3.0", IR_VERSION})
-_ACCESS_IR_VERSIONS = frozenset({"0.2.0", "0.3.0", IR_VERSION})
-_BUDGET_IR_VERSIONS = frozenset({"0.3.0", IR_VERSION})
+IR_VERSION = "0.5.0"
+SUPPORTED_IR_VERSIONS = frozenset({"0.1.0", "0.2.0", "0.3.0", "0.4.0", IR_VERSION})
+_ACCESS_IR_VERSIONS = frozenset({"0.2.0", "0.3.0", "0.4.0", IR_VERSION})
+_BUDGET_IR_VERSIONS = frozenset({"0.3.0", "0.4.0", IR_VERSION})
+_STRUCTURED_IR_VERSIONS = frozenset({"0.4.0", IR_VERSION})
+_MODEL_IR_VERSIONS = frozenset({IR_VERSION})
 
 
 class CompileError(ValueError):
@@ -219,6 +222,8 @@ class StepIR:
         Immutable executor requirements for executable nodes.
     capabilities, effects
         Canonical external read and write declarations.
+    models
+        Credential-free typed model declarations resolved by the live broker.
     budget
         Canonical resource-limit declaration for executable nodes. Measured
         usage is deliberately not part of Workflow IR.
@@ -238,6 +243,7 @@ class StepIR:
     execution: Mapping[str, Any] | None = None
     capabilities: tuple[Mapping[str, Any], ...] = ()
     effects: tuple[Mapping[str, Any], ...] = ()
+    models: tuple[Mapping[str, Any], ...] = ()
     budget: Mapping[str, int | float | None] | None = None
     control: Mapping[str, Any] | None = None
 
@@ -284,8 +290,11 @@ class PlanIR:
         for raw_step, step in zip(encoded["steps"], self.steps, strict=True):
             if step.input_binding is not None:
                 raw_step["input_binding"] = step.input_binding.to_data(
-                    legacy=self.version != IR_VERSION
+                    legacy=self.version not in _STRUCTURED_IR_VERSIONS
                 )
+        if self.version not in _MODEL_IR_VERSIONS:
+            for step in encoded["steps"]:
+                step.pop("models", None)
         if self.version in {"0.1.0", "0.2.0"}:
             for step in encoded["steps"]:
                 step.pop("budget", None)
@@ -327,6 +336,8 @@ class PlanIR:
             raise ValueError("Workflow IR 0.1.0 does not define external access fields")
         if version in {"0.1.0", "0.2.0"} and any("budget" in step for step in data["steps"]):
             raise ValueError(f"Workflow IR {version} does not define budget fields")
+        if version not in _MODEL_IR_VERSIONS and any("models" in step for step in data["steps"]):
+            raise ValueError(f"Workflow IR {version} does not define model fields")
         steps = []
         for raw in data["steps"]:
             binding = raw.get("input_binding")
@@ -336,6 +347,8 @@ class PlanIR:
                 raise ValueError(f"Workflow IR {version} steps require external access fields")
             if version in _BUDGET_IR_VERSIONS and "budget" not in raw:
                 raise ValueError(f"Workflow IR {version} steps require a budget field")
+            if version in _MODEL_IR_VERSIONS and "models" not in raw:
+                raise ValueError(f"Workflow IR {version} steps require a models field")
             budget: dict[str, int | float | None] | None = None
             if version in _BUDGET_IR_VERSIONS:
                 raw_budget = raw["budget"]
@@ -362,10 +375,12 @@ class PlanIR:
                             f"Workflow IR node {raw.get('node_id')!r} budget is not canonical"
                         )
             restored_binding = (
-                BindingIR.from_data(binding, legacy=version != IR_VERSION) if binding else None
+                BindingIR.from_data(binding, legacy=version not in _STRUCTURED_IR_VERSIONS)
+                if binding
+                else None
             )
             if restored_binding is not None and canonical_json(
-                restored_binding.to_data(legacy=version != IR_VERSION)
+                restored_binding.to_data(legacy=version not in _STRUCTURED_IR_VERSIONS)
             ) != canonical_json(binding):
                 raise ValueError("Workflow IR input binding is not canonical")
             steps.append(
@@ -393,6 +408,10 @@ class PlanIR:
                         location=f"Workflow IR node {raw.get('node_id')!r} effects",
                         require_canonical=version in _ACCESS_IR_VERSIONS,
                         error_type=ValueError,
+                    ),
+                    models=_validated_model_contract(
+                        raw.get("models", ()),
+                        require_canonical=version in _MODEL_IR_VERSIONS,
                     ),
                     budget=budget,
                     control=raw.get("control"),
@@ -461,6 +480,7 @@ _MODULE_CONTRACT_FIELDS = {
     "execution",
     "input_type",
     "module_id",
+    "models",
     "output_type",
 }
 
@@ -489,6 +509,7 @@ def _module_configuration(module: Module[Any, Any]) -> dict[str, Any]:
             "effects",
             "input_type",
             "module_id",
+            "models",
             "output_type",
         }
         and not name.startswith("_")
@@ -645,6 +666,9 @@ def module_digest(module: Module[Any, Any]) -> str:
     access = _access_contract(module)
     if access["capabilities"] or access["effects"]:
         parts.append(canonical_json(access).encode())
+    models = _model_contract(module)
+    if models:
+        parts.append(canonical_json({"models": models}).encode())
     if budget != Budget().to_data():
         parts.append(canonical_json({"budget": budget}).encode())
     payload = b"\0".join(parts)
@@ -709,7 +733,10 @@ class _Compiler:
             workflow=self.root_workflow,
             external_input="input",
         )
-        version = IR_VERSION if self.requires_structured_bindings else "0.3.0"
+        has_models = any(step.models for step in self.steps)
+        version = (
+            IR_VERSION if has_models else "0.4.0" if self.requires_structured_bindings else "0.3.0"
+        )
         steps = tuple(self.steps)
         if not self.requires_structured_bindings and all(
             step.budget == Budget().to_data() for step in steps if step.replay_key is not None
@@ -961,6 +988,7 @@ class _Compiler:
         self.modules[key] = module
         behavior_digest = module_digest(module)
         access = _access_contract(module)
+        models = _model_contract(module)
         budget = _budget_contract(module)
         input_digest = schema_digest(module.input_type)
         output_digest = schema_digest(module.output_type)
@@ -975,6 +1003,8 @@ class _Compiler:
             "effects": access["effects"],
             "control": control,
         }
+        if models:
+            definition_contract["models"] = models
         if budget != Budget().to_data():
             definition_contract["budget"] = budget
         definition_digest = digest_data(definition_contract)
@@ -991,6 +1021,7 @@ class _Compiler:
             execution=module.execution.to_data(),
             capabilities=access["capabilities"],
             effects=access["effects"],
+            models=models,
             budget=budget,
             control=control,
         )
@@ -1066,7 +1097,7 @@ def _validate_imported_plan(plan: PlanIR) -> None:
             replay_keys.add(step.replay_key)
             if not set(step.input_binding.source_nodes).issubset(step.dependencies):
                 raise ValueError(f"Workflow IR node {step.node_id!r} omits a binding dependency")
-        elif step.capabilities or step.effects or step.budget is not None:
+        elif step.capabilities or step.effects or step.models or step.budget is not None:
             raise ValueError(
                 f"control Workflow IR node {step.node_id!r} cannot declare module contracts"
             )

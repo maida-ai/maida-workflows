@@ -12,7 +12,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, Self
+from typing import Any, Protocol, Self
 
 _WIRE_FIELDS = frozenset({"cost_usd", "model_tokens", "tool_calls", "wall_time_ms"})
 
@@ -164,3 +164,143 @@ class Budget:
             tool_calls=data["tool_calls"],
             cost_usd=data["cost_usd"],
         )
+
+
+class BudgetExceededError(RuntimeError):
+    """Raised before work would exceed an immutable live resource limit.
+
+    The message names only the exhausted dimension. Provider request content,
+    credentials, and responses are deliberately excluded from the exception
+    so failed-attempt diagnostics remain safe to persist.
+    """
+
+
+@dataclass(frozen=True)
+class BudgetUsage:
+    """Immutable measured or conservatively reserved resource consumption.
+
+    Parameters
+    ----------
+    wall_time
+        Nonnegative elapsed time at millisecond precision.
+    model_tokens
+        Combined model input and output token count.
+    tool_calls
+        Number of supported runtime-managed connector invocations.
+    cost_usd
+        Finite nonnegative provider cost in US dollars.
+
+    Notes
+    -----
+    Model adapters provide a conservative reservation before invocation and
+    measured usage afterward. A reservation that does not fit is denied before
+    the provider is called. Tool calls reserve one unit immediately before the
+    adapter boundary. Full-stub replay creates no live usage.
+    """
+
+    wall_time: timedelta = timedelta(0)
+    model_tokens: int = 0
+    tool_calls: int = 0
+    cost_usd: float = 0.0
+
+    def __post_init__(self) -> None:
+        """Validate strict types and canonical numeric values."""
+        if not isinstance(self.wall_time, timedelta):
+            raise TypeError("wall_time must be a timedelta")
+        milliseconds = _timedelta_milliseconds("wall_time", self.wall_time)
+        if milliseconds < 0:
+            raise ValueError("wall_time must be nonnegative")
+        if type(self.model_tokens) is not int or type(self.tool_calls) is not int:
+            raise TypeError("model_tokens and tool_calls must be integers")
+        _optional_count("model_tokens", self.model_tokens)
+        _optional_count("tool_calls", self.tool_calls)
+        if isinstance(self.cost_usd, bool) or not isinstance(self.cost_usd, (int, float)):
+            raise TypeError("cost_usd must be a number")
+        normalized = float(self.cost_usd)
+        if not math.isfinite(normalized):
+            raise ValueError("cost_usd must be finite")
+        if normalized < 0:
+            raise ValueError("cost_usd must be nonnegative")
+        object.__setattr__(self, "cost_usd", 0.0 if normalized == 0 else normalized)
+
+    @property
+    def wall_time_ms(self) -> int:
+        """Return exact elapsed milliseconds used by durable accounting."""
+        return _timedelta_milliseconds("wall_time", self.wall_time)
+
+    def to_data(self) -> dict[str, int | float]:
+        """Return canonical JSON-compatible resource usage data."""
+        return {
+            "cost_usd": self.cost_usd,
+            "model_tokens": self.model_tokens,
+            "tool_calls": self.tool_calls,
+            "wall_time_ms": self.wall_time_ms,
+        }
+
+    @classmethod
+    def from_data(cls, data: Mapping[str, Any]) -> Self:
+        """Restore exact usage from the canonical wire mapping.
+
+        Raises
+        ------
+        TypeError
+            If a resource uses an ambiguous type.
+        ValueError
+            If fields are missing, unknown, negative, or non-finite.
+        """
+        if set(data) != _WIRE_FIELDS:
+            raise ValueError("usage fields must exactly match the canonical wire contract")
+        milliseconds = data["wall_time_ms"]
+        if type(milliseconds) is not int:
+            raise TypeError("wall_time_ms must be an integer")
+        return cls(
+            wall_time=timedelta(milliseconds=milliseconds),
+            model_tokens=data["model_tokens"],
+            tool_calls=data["tool_calls"],
+            cost_usd=data["cost_usd"],
+        )
+
+
+def _timedelta_milliseconds(name: str, value: timedelta) -> int:
+    microseconds = (value.days * 86_400 + value.seconds) * 1_000_000 + value.microseconds
+    if microseconds % 1_000:
+        raise ValueError(f"{name} must use millisecond precision")
+    return microseconds // 1_000
+
+
+class _BudgetUsageStore(Protocol):
+    def _reserve_budget_usage(
+        self, claim: Any, *, charge_key: str, kind: str, usage: BudgetUsage
+    ) -> None: ...
+
+    def _commit_budget_usage(self, claim: Any, *, charge_key: str, usage: BudgetUsage) -> None: ...
+
+
+class _LiveBudgetMeter:
+    def __init__(self, store: _BudgetUsageStore, claim: Any) -> None:
+        self.store = store
+        self.claim = claim
+        self.ordinal = 0
+
+    def reserve_model(self, name: str, usage: BudgetUsage) -> str:
+        charge_key = self._key("model", name)
+        self.store._reserve_budget_usage(
+            self.claim, charge_key=charge_key, kind="model", usage=usage
+        )
+        return charge_key
+
+    def commit_model(self, reservation: str, usage: BudgetUsage) -> None:
+        self.store._commit_budget_usage(self.claim, charge_key=reservation, usage=usage)
+
+    def charge_tool(self, name: str) -> None:
+        charge_key = self._key("tool", name)
+        usage = BudgetUsage(tool_calls=1)
+        self.store._reserve_budget_usage(
+            self.claim, charge_key=charge_key, kind="tool", usage=usage
+        )
+        self.store._commit_budget_usage(self.claim, charge_key=charge_key, usage=usage)
+
+    def _key(self, kind: str, name: str) -> str:
+        value = f"{self.claim.attempt.attempt_id}:{kind}:{self.ordinal}:{name}"
+        self.ordinal += 1
+        return value
