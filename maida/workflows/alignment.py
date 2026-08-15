@@ -330,7 +330,13 @@ def project_execution_path(
 
 def _control_signature(plan: PlanIR) -> tuple[tuple[Any, ...], ...]:
     return tuple(
-        (step.node_id, step.kind, step.dependencies, step.control)
+        (
+            step.node_id,
+            step.kind,
+            step.dependencies,
+            step.input_binding.to_data() if step.input_binding is not None else None,
+            step.control,
+        )
         for step in plan.steps
         if step.replay_key is None
     )

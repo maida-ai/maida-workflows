@@ -13,7 +13,9 @@ from maida.workflows import (
     Workflow,
     WorkflowRunner,
     compile_workflow,
+    when,
 )
+from maida.workflows.alignment import DiffKind, GraphAligner
 from maida.workflows.fixture import ReplayFixtureExporter
 from maida.workflows.persistence import PostgresStore
 from maida.workflows.replay import ReplayCase, ReplayEngine, ReplayMode, ReplayStatus
@@ -73,6 +75,43 @@ class StructuredWorkflow(Workflow[Request, str]):
         )
 
 
+@dataclass(frozen=True)
+class RoutedRequest:
+    approved: bool
+    urgent: bool
+    message: str
+
+
+class CopyMessage(Module[str, str]):
+    input_type = str
+    output_type = str
+
+    async def execute(self, value: str, ctx: ExecutionContext) -> str:
+        return value
+
+
+class ProjectedConditionWorkflow(Workflow[RoutedRequest, str]):
+    workflow_id = "projected-condition"
+    input_type = RoutedRequest
+    output_type = str
+    condition_field = "approved"
+
+    def __init__(self) -> None:
+        self.approved = CopyMessage()
+        self.rejected = CopyMessage()
+
+    def build(self, value: RuntimeValue[RoutedRequest]) -> RuntimeValue[str]:
+        return when(
+            value.field(self.condition_field),
+            self.approved(value.message),
+            self.rejected(value.message),
+        )
+
+
+class ChangedProjectedConditionWorkflow(ProjectedConditionWorkflow):
+    condition_field = "urgent"
+
+
 def test_keyword_bindings_compile_to_canonical_reconstructable_ir() -> None:
     plan = compile_workflow(StructuredWorkflow())
     restored = PlanIR.from_dict(plan.to_dict())
@@ -108,6 +147,26 @@ def test_runtime_value_field_projection_is_typed_and_attribute_sugar_matches() -
         value.field("missing")
 
 
+def test_field_projection_can_drive_a_when_condition() -> None:
+    plan = compile_workflow(ProjectedConditionWorkflow())
+    branch = next(step for step in plan.steps if step.kind == "when")
+
+    assert branch.input_binding is not None
+    assert branch.input_binding.kind == "field"
+    assert branch.input_binding.path == ("approved",)
+    assert PlanIR.from_dict(plan.to_dict()).canonical_json() == plan.canonical_json()
+
+
+def test_changing_a_projected_when_condition_is_control_flow_divergence() -> None:
+    source = compile_workflow(ProjectedConditionWorkflow())
+    current = compile_workflow(ChangedProjectedConditionWorkflow())
+
+    divergence = GraphAligner().align(source, current).diff.first_divergence
+
+    assert divergence is not None
+    assert divergence.kind is DiffKind.CONTROL_FLOW_CHANGED
+
+
 def test_keyword_binding_rejects_missing_unknown_and_mismatched_fields() -> None:
     module = Greet()
     root = RuntimeValue.input(Request)
@@ -135,6 +194,25 @@ async def test_structured_binding_executes_across_durable_task_handoffs(
     )
 
     assert result.output == "Hello, Ada x1!"
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_projected_condition_routes_across_durable_task_handoffs(
+    postgres_store: PostgresStore,
+) -> None:
+    result = await WorkflowRunner(postgres_store).run(
+        ProjectedConditionWorkflow(),
+        RoutedRequest(approved=False, urgent=True, message="change"),
+    )
+
+    plan = compile_workflow(ProjectedConditionWorkflow())
+    history = postgres_store.load_run_history(result.run_id, tenant_id="local")
+    rejected_step = next(
+        step for step in plan.executable_steps if step.module_id == "projected-condition.rejected"
+    )
+    task = next(task for task in history.tasks if task.logical_step == rejected_step.logical_step)
+    assert task.status.value == "SUCCEEDED"
 
 
 @pytest.mark.postgres

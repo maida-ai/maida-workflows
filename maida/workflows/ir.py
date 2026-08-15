@@ -855,7 +855,36 @@ class _Compiler:
                 ),
                 control={"region": "map", "item_key": item_key},
             )
-        elif expression.kind in {"when", "parallel"}:
+        elif expression.kind == "when":
+            condition_binding = self._compile_input_binding(
+                expression.dependencies[0],
+                path=f"{path}.dep0",
+                workflow=workflow,
+                external_input=external_input,
+            )
+            condition_sources = condition_binding.source_nodes
+            if len(condition_sources) > 1:
+                raise CompileError("a when condition must resolve from one symbolic value")
+            condition_node = condition_sources[0] if condition_sources else "input"
+            branches = tuple(
+                self._visit(
+                    dependency,
+                    path=f"{path}.dep{index}",
+                    workflow=workflow,
+                    external_input=external_input,
+                )
+                for index, dependency in enumerate(expression.dependencies[1:], start=1)
+            )
+            dependencies = (condition_node, *branches)
+            step = StepIR(
+                node_id=node_id,
+                kind="when",
+                dependencies=dependencies,
+                output_schema_digest=schema_digest(value.value_type),
+                input_binding=condition_binding,
+                control={"region": "when"},
+            )
+        elif expression.kind == "parallel":
             dependencies = tuple(
                 self._visit(
                     dependency,
@@ -1100,6 +1129,13 @@ def _validate_imported_plan(plan: PlanIR) -> None:
         elif step.capabilities or step.effects or step.models or step.budget is not None:
             raise ValueError(
                 f"control Workflow IR node {step.node_id!r} cannot declare module contracts"
+            )
+        elif step.input_binding is not None and (
+            step.kind != "when"
+            or not set(step.input_binding.source_nodes).issubset(step.dependencies)
+        ):
+            raise ValueError(
+                f"control Workflow IR node {step.node_id!r} has an invalid condition binding"
             )
         known_nodes.add(step.node_id)
     if plan.output_node not in known_nodes:

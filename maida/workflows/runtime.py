@@ -1166,13 +1166,19 @@ class WorkflowScheduler:
                 scope,
             )
         if step.kind == "when":
-            condition = self._evaluate_node(
-                step.dependencies[0],
-                external=external,
-                scope=scope,
+            condition = (
+                self._resolve_binding(step.input_binding, external=external, scope=scope)
+                if step.input_binding is not None
+                else self._evaluate_node(
+                    step.dependencies[0],
+                    external=external,
+                    scope=scope,
+                )
             )
             if condition is None:
                 return None
+            if not isinstance(condition.value, bool):
+                raise RuntimeContractError("resolved when condition is not a boolean")
             branch_index = 1 if bool(condition.value) else 2
             branch_decision = {
                 "control_node": step.node_id,
