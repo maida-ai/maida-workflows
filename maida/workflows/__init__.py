@@ -52,6 +52,11 @@ from .authoring import (
     when,
 )
 from .budget import Budget
+from .bundle import (
+    WorkflowBundle,
+    WorkflowBundleError,
+    WorkflowPortability,
+)
 from .coordination import CoordinatorProgress, WorkflowCatalog, WorkflowCoordinator
 from .definitions import BoundWorkflow, bind_workflow
 from .dynamic import (
@@ -213,11 +218,14 @@ __all__ = [
     "ValidationIssue",
     "VerificationSuite",
     "Workflow",
+    "WorkflowBundle",
+    "WorkflowBundleError",
     "WorkflowCatalog",
     "WorkflowClient",
     "WorkflowCompilation",
     "WorkflowCoordinator",
     "WorkflowExplanation",
+    "WorkflowPortability",
     "WorkflowRun",
     "WorkflowRunner",
     "WorkflowScheduler",
