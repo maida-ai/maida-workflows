@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -34,13 +35,10 @@ from .access import (
 from .authoring import (
     ExecutionContext,
     Module,
-    RuntimeValue,
     Workflow,
-    _MapBinding,
-    _ModuleBinding,
-    _WorkflowBinding,
 )
-from .ir import PlanIR, ReplayKey, StepIR, _compile_workflow_graph, module_digest
+from .definitions import BoundWorkflow, bind_workflow
+from .ir import PlanIR, ReplayKey, StepIR, module_digest
 from .models import (
     AcceptedAttemptProvenance,
     Attempt,
@@ -61,6 +59,7 @@ from .models import (
 from .persistence import ClaimedTask
 
 _rehydrate = _rehydrate_value
+_NESTED_SCOPE_PATTERN = re.compile(r"\.nested\[([^\]]+)\]")
 
 
 class RuntimeExecutionError(RuntimeError):
@@ -834,22 +833,22 @@ class WorkflowScheduler:
     def __init__(
         self,
         store: DurableRuntimeStore,
-        workflow: Workflow[Any, Any],
-        plan: PlanIR,
-        output: RuntimeValue[Any],
+        definition: BoundWorkflow,
         *,
         run_id: str,
         tenant_id: str,
     ) -> None:
         self.store = store
-        self.workflow = workflow
-        self.plan = plan
-        self.output = output
+        self.definition = definition
+        self.plan = definition.plan
+        # Compatibility for callers that still inspect the native symbolic
+        # graph. Scheduling itself uses only the compiled plan.
+        self.output = definition._authoring_output
         self.run_id = run_id
         self.tenant_id = tenant_id
-        self.steps = {step.node_id: step for step in plan.steps}
+        self.steps = {step.node_id: step for step in self.plan.steps}
         self._tasks: dict[tuple[str, str, str], Task] = {}
-        self._cache: dict[int, _Evaluation | None] = {}
+        self._cache: dict[str, _Evaluation | None] = {}
         self._branch_context: dict[tuple[str, ...], tuple[dict[str, Any], ...]] = {}
         self._control_events: set[tuple[str, str]] = set()
 
@@ -857,7 +856,7 @@ class WorkflowScheduler:
     def submit[InputT, OutputT](
         cls,
         store: DurableRuntimeStore,
-        workflow: Workflow[InputT, OutputT],
+        workflow: Workflow[InputT, OutputT] | BoundWorkflow,
         value: InputT,
         *,
         tenant_id: str = "local",
@@ -869,21 +868,19 @@ class WorkflowScheduler:
         durable run. A later scheduler pass materializes root-ready inputs;
         executors may live in unrelated processes or machines.
         """
-        if not value_matches_type(value, workflow.input_type):
+        definition = workflow if isinstance(workflow, BoundWorkflow) else bind_workflow(workflow)
+        if not value_matches_type(value, definition.input_type):
             raise RuntimeContractError("root input violates the workflow input contract")
-        compiled = _compile_workflow_graph(workflow)
-        root_input = store.values.encode(value, schema_digest=schema_digest(workflow.input_type))
+        root_input = store.values.encode(value, schema_digest=schema_digest(definition.input_type))
         run = store.create_run(
-            compiled.plan,
+            definition.plan,
             tenant_id=tenant_id,
             root_input=root_input,
             execution_mode=execution_mode,
         )
         scheduler = cls(
             store,
-            workflow,
-            compiled.plan,
-            compiled.output,
+            definition,
             run_id=run.run_id,
             tenant_id=tenant_id,
         )
@@ -894,7 +891,7 @@ class WorkflowScheduler:
     def resume(
         cls,
         store: DurableRuntimeStore,
-        workflow: Workflow[Any, Any],
+        workflow: Workflow[Any, Any] | BoundWorkflow,
         run_id: str,
         *,
         tenant_id: str = "local",
@@ -905,15 +902,13 @@ class WorkflowScheduler:
         the run. No module handler is executed while reconstructing control
         state.
         """
-        compiled = _compile_workflow_graph(workflow)
+        definition = workflow if isinstance(workflow, BoundWorkflow) else bind_workflow(workflow)
         history = store.load_run_history(run_id, tenant_id=tenant_id)
-        if history.run.definition_digest != compiled.plan.digest:
+        if history.run.definition_digest != definition.plan.digest:
             raise RuntimeContractError("workflow definition does not match the submitted run")
         return cls(
             store,
-            workflow,
-            compiled.plan,
-            compiled.output,
+            definition,
             run_id=run_id,
             tenant_id=tenant_id,
         )
@@ -925,7 +920,7 @@ class WorkflowScheduler:
             if history.run.root_output is None:
                 raise RuntimeContractError("successful run has no root output")
             output = _rehydrate(
-                self.store.values.decode(history.run.root_output), self.workflow.output_type
+                self.store.values.decode(history.run.root_output), self.definition.output_type
             )
             return ScheduleProgress(self.run_id, RunStatus.SUCCEEDED, 0, output)
         if history.run.status is not RunStatus.RUNNING:
@@ -943,13 +938,11 @@ class WorkflowScheduler:
             if event.event_type in {"BRANCH_DECISION", "MAP_DECISION"}
         }
         root_value = _rehydrate(
-            self.store.values.decode(history.run.root_input), self.workflow.input_type
+            self.store.values.decode(history.run.root_input), self.definition.input_type
         )
         try:
-            result = self._visit(
-                self.output,
-                path="root",
-                workflow=self.workflow,
+            result = self._evaluate_node(
+                self.plan.output_node,
                 external=_Evaluation(root_value),
                 scope=(),
             )
@@ -962,7 +955,7 @@ class WorkflowScheduler:
 
         if result is not None:
             root_output = self.store.values.encode(
-                result.value, schema_digest=schema_digest(self.workflow.output_type)
+                result.value, schema_digest=schema_digest(self.definition.output_type)
             )
             self.store.complete_run(self.run_id, root_output)
             return ScheduleProgress(self.run_id, RunStatus.SUCCEEDED, 0, result.value)
@@ -972,50 +965,29 @@ class WorkflowScheduler:
         return ScheduleProgress(self.run_id, refreshed.run.status, ready)
 
     def _precreate_static_tasks(self) -> None:
-        seen: set[int] = set()
+        seen: set[str] = set()
 
-        def visit(
-            value: RuntimeValue[Any],
-            path: str,
-            owner: Workflow[Any, Any],
-            scope: tuple[str, ...],
-        ) -> None:
-            marker = id(value)
-            if marker in seen:
+        def visit(node_id: str, scope: tuple[str, ...]) -> None:
+            if node_id == "input" or node_id in seen:
                 return
-            seen.add(marker)
-            expression = value._expression
-            if expression.kind == "input":
+            seen.add(node_id)
+            step = self.steps[node_id]
+            scope = _with_nested_scope(node_id, scope)
+            if step.kind == "when":
+                visit(step.dependencies[0], scope)
                 return
-            if expression.kind == "workflow":
-                visit(expression.dependencies[0], f"{path}.input", owner, scope)
-                binding = cast(_WorkflowBinding, expression.payload)
-                nested = binding.workflow
-                visit(
-                    binding.output,
-                    f"{path}.nested[{nested.workflow_id}]",
-                    nested,
-                    (*scope, f"workflow:{nested.workflow_id}"),
-                )
+            if step.kind == "parallel":
+                for index, dependency in enumerate(step.dependencies):
+                    visit(dependency, (*scope, f"parallel:{index}"))
                 return
-            if expression.kind == "when":
-                visit(expression.dependencies[0], f"{path}.dep0", owner, scope)
+            if step.kind == "map_module":
+                visit(step.dependencies[0], scope)
                 return
-            if expression.kind == "parallel":
-                for index, dependency in enumerate(expression.dependencies):
-                    visit(
-                        dependency,
-                        f"{path}.dep{index}",
-                        owner,
-                        (*scope, f"parallel:{index}"),
-                    )
-                return
-            visit(expression.dependencies[0], f"{path}.dep0", owner, scope)
-            if expression.kind == "map":
-                return
-            if expression.kind != "module":  # pragma: no cover - compiler rejects it
-                raise RuntimeContractError(f"unsupported runtime expression {expression.kind!r}")
-            step = self.steps[path]
+            if step.kind != "module":
+                raise RuntimeContractError(f"unsupported runtime IR step {step.kind!r}")
+            if step.input_binding is None:
+                raise RuntimeContractError("module step has no input binding")
+            visit(step.input_binding.source, scope)
             self.store.enqueue_task(
                 self.run_id,
                 step,
@@ -1023,66 +995,39 @@ class WorkflowScheduler:
                 input_value=None,
             )
 
-        visit(self.output, "root", self.workflow, ())
+        visit(self.plan.output_node, ())
 
-    def _visit(
+    def _evaluate_node(
         self,
-        value: RuntimeValue[Any],
+        node_id: str,
         *,
-        path: str,
-        workflow: Workflow[Any, Any],
         external: _Evaluation,
         scope: tuple[str, ...],
     ) -> _Evaluation | None:
-        if value._expression.kind == "input":
+        if node_id == "input":
             return external
-        cache_key = id(value)
-        if cache_key in self._cache:
-            return self._cache[cache_key]
-        result = self._visit_uncached(
-            value,
-            path=path,
-            workflow=workflow,
+        if node_id in self._cache:
+            return self._cache[node_id]
+        result = self._evaluate_step(
+            self.steps[node_id],
             external=external,
-            scope=scope,
+            scope=_with_nested_scope(node_id, scope),
         )
-        self._cache[cache_key] = result
+        self._cache[node_id] = result
         return result
 
-    def _visit_uncached(
+    def _evaluate_step(
         self,
-        value: RuntimeValue[Any],
+        step: StepIR,
         *,
-        path: str,
-        workflow: Workflow[Any, Any],
         external: _Evaluation,
         scope: tuple[str, ...],
     ) -> _Evaluation | None:
-        expression = value._expression
-        if expression.kind == "workflow":
-            source = self._visit(
-                expression.dependencies[0],
-                path=f"{path}.input",
-                workflow=workflow,
-                external=external,
-                scope=scope,
-            )
-            if source is None:
-                return None
-            workflow_binding = cast(_WorkflowBinding, expression.payload)
-            nested = workflow_binding.workflow
-            return self._visit(
-                workflow_binding.output,
-                path=f"{path}.nested[{nested.workflow_id}]",
-                workflow=nested,
-                external=source,
-                scope=(*scope, f"workflow:{nested.workflow_id}"),
-            )
-        if expression.kind == "module":
-            source = self._visit(
-                expression.dependencies[0],
-                path=f"{path}.dep0",
-                workflow=workflow,
+        if step.kind == "module":
+            if step.input_binding is None or step.replay_key is None:
+                raise RuntimeContractError("module step has an incomplete definition")
+            source = self._evaluate_node(
+                step.input_binding.source,
                 external=external,
                 scope=scope,
             )
@@ -1094,13 +1039,12 @@ class WorkflowScheduler:
                     source,
                     branch_decisions=(*source.branch_decisions, *inherited),
                 )
-            module_binding = cast(_ModuleBinding, expression.payload)
-            return self._module_result(self.steps[path], module_binding.module, source, scope)
-        if expression.kind == "when":
-            condition = self._visit(
-                expression.dependencies[0],
-                path=f"{path}.dep0",
-                workflow=workflow,
+            return self._module_result(
+                step, self.definition.modules[step.replay_key], source, scope
+            )
+        if step.kind == "when":
+            condition = self._evaluate_node(
+                step.dependencies[0],
                 external=external,
                 scope=scope,
             )
@@ -1108,16 +1052,14 @@ class WorkflowScheduler:
                 return None
             branch_index = 1 if bool(condition.value) else 2
             branch_decision = {
-                "control_node": path,
+                "control_node": step.node_id,
                 "selected": "true" if branch_index == 1 else "false",
             }
             branch_scope = (*scope, f"branch:{branch_index}")
             self._branch_context[branch_scope] = (branch_decision,)
-            self._append_control_once("BRANCH_DECISION", path, branch_decision)
-            branch = self._visit(
-                expression.dependencies[branch_index],
-                path=f"{path}.dep{branch_index}",
-                workflow=workflow,
+            self._append_control_once("BRANCH_DECISION", step.node_id, branch_decision)
+            branch = self._evaluate_node(
+                step.dependencies[branch_index],
                 external=external,
                 scope=branch_scope,
             )
@@ -1129,16 +1071,14 @@ class WorkflowScheduler:
                 (*condition.branch_decisions, *branch.branch_decisions, branch_decision),
                 (*condition.map_decisions, *branch.map_decisions),
             )
-        if expression.kind == "parallel":
+        if step.kind == "parallel":
             branches = tuple(
-                self._visit(
+                self._evaluate_node(
                     dependency,
-                    path=f"{path}.dep{index}",
-                    workflow=workflow,
                     external=external,
                     scope=(*scope, f"parallel:{index}"),
                 )
-                for index, dependency in enumerate(expression.dependencies)
+                for index, dependency in enumerate(step.dependencies)
             )
             if any(branch is None for branch in branches):
                 return None
@@ -1155,25 +1095,25 @@ class WorkflowScheduler:
                 tuple(decision for branch in complete for decision in branch.branch_decisions),
                 tuple(decision for branch in complete for decision in branch.map_decisions),
             )
-        if expression.kind == "map":
-            source = self._visit(
-                expression.dependencies[0],
-                path=f"{path}.dep0",
-                workflow=workflow,
+        if step.kind == "map_module":
+            if step.replay_key is None:
+                raise RuntimeContractError("mapped module step has no replay key")
+            source = self._evaluate_node(
+                step.dependencies[0],
                 external=external,
                 scope=scope,
             )
             if source is None:
                 return None
-            map_binding = cast(_MapBinding, expression.payload)
             if not isinstance(source.value, (list, tuple)):
                 raise RuntimeContractError("map_over input must evaluate to a sequence")
-            keyed = [(self._item_key(item, map_binding.item_key), item) for item in source.value]
+            key_binding = self._map_key_binding(step)
+            keyed = [(self._item_key(item, key_binding), item) for item in source.value]
             keys = [item_key for item_key, _ in keyed]
             if len(keys) != len(set(keys)):
                 raise RuntimeContractError("map_over item keys must be unique within an execution")
-            map_decision: dict[str, Any] = {"control_node": path, "item_keys": keys}
-            self._append_control_once("MAP_DECISION", path, map_decision)
+            map_decision: dict[str, Any] = {"control_node": step.node_id, "item_keys": keys}
+            self._append_control_once("MAP_DECISION", step.node_id, map_decision)
             mapped: list[Any] = []
             boundaries: list[str] = []
             pending = False
@@ -1185,8 +1125,8 @@ class WorkflowScheduler:
                     (*source.map_decisions, map_decision),
                 )
                 item_result = self._module_result(
-                    self.steps[path],
-                    map_binding.module,
+                    step,
+                    self.definition.modules[step.replay_key],
                     item_source,
                     (*scope, f"item:{item_key}"),
                 )
@@ -1203,7 +1143,18 @@ class WorkflowScheduler:
                 source.branch_decisions,
                 (*source.map_decisions, map_decision),
             )
-        raise RuntimeContractError(f"unsupported runtime expression {expression.kind!r}")
+        raise RuntimeContractError(f"unsupported runtime IR step {step.kind!r}")
+
+    def _map_key_binding(self, step: StepIR) -> str | Callable[[Any], str]:
+        bound = self.definition.map_item_keys
+        if bound is not None and step.node_id in bound:
+            return bound[step.node_id]
+        item_key = (step.control or {}).get("item_key")
+        if isinstance(item_key, Mapping) and isinstance(item_key.get("field"), str):
+            return cast(str, item_key["field"])
+        raise RuntimeContractError(
+            f"map step {step.node_id!r} requires a trusted item-key callback binding"
+        )
 
     def _module_result(
         self,
@@ -1329,27 +1280,27 @@ class WorkflowRunner:
 
     async def run[InputT, OutputT](
         self,
-        workflow: Workflow[InputT, OutputT],
+        workflow: Workflow[InputT, OutputT] | BoundWorkflow,
         value: InputT,
         *,
         tenant_id: str = "local",
         execution_mode: ExecutionMode = ExecutionMode.LIVE,
     ) -> RunResult:
         """Submit and drain a process-isolated workflow through durable tasks."""
+        definition = workflow if isinstance(workflow, BoundWorkflow) else bind_workflow(workflow)
         scheduler = WorkflowScheduler.submit(
             self.store,
-            workflow,
+            definition,
             value,
             tenant_id=tenant_id,
             execution_mode=execution_mode,
         )
-        modules = _build_module_registry(workflow, scheduler.plan, scheduler.output)
         executor = LocalExecutor(
             TaskWorker(
                 self.store,
                 workflow_id=scheduler.plan.workflow_id,
                 definition_digest=scheduler.plan.digest,
-                modules=modules,
+                modules=definition.modules,
                 worker_id=self.worker_id,
                 max_attempts=self.max_attempts,
                 capabilities=ExecutorCapabilities.local_process(),
@@ -1383,44 +1334,10 @@ class WorkflowRunner:
                 )
 
 
-def _build_module_registry(
-    workflow: Workflow[Any, Any],
-    plan: PlanIR,
-    output: RuntimeValue[Any],
-) -> dict[ReplayKey, Module[Any, Any]]:
-    steps = {step.node_id: step for step in plan.executable_steps}
-    found: dict[ReplayKey, Module[Any, Any]] = {}
-    seen: set[int] = set()
-
-    def visit(value: RuntimeValue[Any], path: str, owner: Workflow[Any, Any]) -> None:
-        marker = id(value)
-        if marker in seen:
-            return
-        seen.add(marker)
-        expression = value._expression
-        if expression.kind == "input":
-            return
-        if expression.kind == "workflow":
-            visit(expression.dependencies[0], f"{path}.input", owner)
-            binding = cast(_WorkflowBinding, expression.payload)
-            nested = binding.workflow
-            visit(binding.output, f"{path}.nested[{nested.workflow_id}]", nested)
-            return
-        for index, dependency in enumerate(expression.dependencies):
-            visit(dependency, f"{path}.dep{index}", owner)
-        if expression.kind == "module":
-            module = cast(_ModuleBinding, expression.payload).module
-        elif expression.kind == "map":
-            module = cast(_MapBinding, expression.payload).module
-        else:
-            return
-        key = steps[path].replay_key
-        if key is not None:
-            found[key] = module
-
-    visit(output, "root", workflow)
-    return found
-
-
 def _unique(values: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
+
+
+def _with_nested_scope(node_id: str, scope: tuple[str, ...]) -> tuple[str, ...]:
+    nested = tuple(f"workflow:{name}" for name in _NESTED_SCOPE_PATTERN.findall(node_id))
+    return (*scope, *(item for item in nested if item not in scope))

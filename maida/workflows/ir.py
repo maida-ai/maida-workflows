@@ -303,6 +303,8 @@ class PlanIR:
 class _CompiledWorkflowGraph:
     plan: PlanIR
     output: RuntimeValue[Any]
+    modules: Mapping[ReplayKey, Module[Any, Any]]
+    map_item_keys: Mapping[str, str | Callable[[Any], str]]
 
 
 def _behavior_bytes(module: Module[Any, Any]) -> bytes:
@@ -559,6 +561,8 @@ class _Compiler:
         self.occurrences: Counter[int] = Counter()
         self.implicit_occurrences: set[int] = set()
         self.keys: set[ReplayKey] = set()
+        self.modules: dict[ReplayKey, Module[Any, Any]] = {}
+        self.map_item_keys: dict[str, str | Callable[[Any], str]] = {}
         self.module_paths_by_workflow: dict[int, dict[int, str]] = {}
 
     def compile(self) -> PlanIR:
@@ -597,6 +601,8 @@ class _Compiler:
                 output_node=output_node,
             ),
             output,
+            dict(self.modules),
+            dict(self.map_item_keys),
         )
 
     def _validate_workflow(self, workflow: Workflow[Any, Any]) -> None:
@@ -671,6 +677,7 @@ class _Compiler:
                 if isinstance(binding.item_key, str)
                 else {"callback": _callback_identity(binding.item_key)}
             )
+            self.map_item_keys[path] = binding.item_key
             step = self._module_step(
                 binding.module,
                 binding.logical_step,
@@ -731,6 +738,7 @@ class _Compiler:
         if key in self.keys:
             raise CompileError(f"duplicate replay key {key.as_string()}")
         self.keys.add(key)
+        self.modules[key] = module
         behavior_digest = module_digest(module)
         access = _access_contract(module)
         budget = _budget_contract(module)

@@ -52,6 +52,7 @@ from .authoring import (
 )
 from .budget import Budget
 from .coordination import CoordinatorProgress, WorkflowCatalog, WorkflowCoordinator
+from .definitions import BoundWorkflow, bind_workflow
 from .dynamic import (
     ModuleCatalog,
     PlanFragmentIR,
@@ -119,6 +120,7 @@ __all__ = [
     "ApprovalEvidence",
     "ApproveCommand",
     "BoundModuleCall",
+    "BoundWorkflow",
     "BoundaryRecord",
     "Budget",
     "CancelCommand",
@@ -191,6 +193,7 @@ __all__ = [
     "WorkflowRun",
     "WorkflowRunner",
     "WorkflowScheduler",
+    "bind_workflow",
     "compile_workflow",
     "create_userplane_app",
     "map_over",
