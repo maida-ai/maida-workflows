@@ -12,13 +12,25 @@ from maida.workflows import (
     EffectSpec,
     ExecutionContext,
     Idempotency,
+    Module,
     RuntimeValue,
     Workflow,
     compile_workflow,
 )
-from maida.workflows._canonical import digest_data
+from maida.workflows._canonical import (
+    canonical_json,
+    digest_bytes,
+    digest_data,
+    qualified_name,
+    schema_digest,
+)
 from maida.workflows.alignment import DiffKind, GraphAligner
-from maida.workflows.ir import PlanIR
+from maida.workflows.ir import (
+    PlanIR,
+    _behavior_bytes,
+    _module_configuration,
+    module_digest,
+)
 
 GET_CUSTOMER = Capability(
     "crm.customer.read",
@@ -72,6 +84,14 @@ class FakeBroker:
         return "receipt-1"
 
 
+class PlainModule(Module[str, str]):
+    input_type = str
+    output_type = str
+
+    async def execute(self, value: str, ctx: ExecutionContext) -> str:
+        return value
+
+
 def test_external_access_contracts_are_typed_canonical_and_strict() -> None:
     assert GET_CUSTOMER.to_data() == {
         "connector": "crm",
@@ -93,6 +113,10 @@ def test_external_access_contracts_are_typed_canonical_and_strict() -> None:
         EffectSpec("email.send", connector="email", operation="", input_type=str, output_type=str)
     with pytest.raises(ValueError, match="unique"):
         replace(GET_CUSTOMER, policy_tags=("same", "same"))
+    with pytest.raises(ValueError, match="connector_version"):
+        replace(GET_CUSTOMER, connector_version=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="approval_required"):
+        replace(SEND_EMAIL, approval_required=1)  # type: ignore[arg-type]
 
 
 def test_compiled_ir_exposes_access_contracts_and_loads_legacy_ir() -> None:
@@ -121,6 +145,67 @@ def test_compiled_ir_exposes_access_contracts_and_loads_legacy_ir() -> None:
     invalid_legacy["version"] = "0.1.0"
     with pytest.raises(ValueError, match="does not define external access"):
         PlanIR.from_dict(invalid_legacy)
+
+
+def test_imported_access_contracts_fail_closed_before_graph_alignment() -> None:
+    malformed = compile_workflow(SupportWorkflow()).to_dict()
+    malformed["steps"][0]["capabilities"] = ["not-an-object"]
+    with pytest.raises(ValueError, match="must be an object"):
+        PlanIR.from_dict(malformed)
+
+    wrong_kind = compile_workflow(SupportWorkflow()).to_dict()
+    wrong_kind["steps"][0]["capabilities"] = [SEND_EMAIL.to_data()]
+    with pytest.raises(ValueError, match="kind 'capability'"):
+        PlanIR.from_dict(wrong_kind)
+
+    noncanonical = compile_workflow(SupportWorkflow()).to_dict()
+    capability = GET_CUSTOMER.to_data()
+    capability["policy_tags"] = ["regional", "customer-data"]
+    noncanonical["steps"][0]["capabilities"] = [capability]
+    with pytest.raises(ValueError, match="sorted unique"):
+        PlanIR.from_dict(noncanonical)
+
+    control_access = compile_workflow(SupportWorkflow()).to_dict()
+    control_step = control_access["steps"][0]
+    for field in ("module_id", "logical_step", "module_digest", "definition_digest"):
+        control_step[field] = None
+    control_step["input_binding"] = None
+    with pytest.raises(ValueError, match="control Workflow IR"):
+        PlanIR.from_dict(control_access)
+
+
+def test_compiler_rejects_ambiguous_or_misclassified_access_declarations() -> None:
+    duplicate = SupportWorkflow()
+    duplicate.customer.capabilities = (GET_CUSTOMER, GET_CUSTOMER)
+    with pytest.raises(ValueError, match="duplicate name"):
+        compile_workflow(duplicate)
+
+    wrong_kind = SupportWorkflow()
+    wrong_kind.customer.capabilities = (SEND_EMAIL,)
+    with pytest.raises(ValueError, match="kind 'capability'"):
+        compile_workflow(wrong_kind)
+
+    hidden_effect = SupportWorkflow()
+    hidden_effect.customer.effects = (SEND_EMAIL,)
+    with pytest.raises(ValueError, match="effectful"):
+        compile_workflow(hidden_effect)
+
+
+def test_modules_without_access_keep_their_existing_behavior_digest() -> None:
+    module = PlainModule()
+    legacy_payload = b"\0".join(
+        (
+            qualified_name(module.__class__).encode(),
+            _behavior_bytes(module),
+            canonical_json(_module_configuration(module)).encode(),
+            schema_digest(module.input_type).encode(),
+            schema_digest(module.output_type).encode(),
+            str(module.effectful).encode(),
+            canonical_json(module.execution.to_data()).encode(),
+        )
+    )
+
+    assert module_digest(module) == digest_bytes(legacy_payload)
 
 
 def test_access_changes_keep_replay_identity_and_receive_specific_diff_kinds() -> None:
@@ -163,3 +248,23 @@ async def test_connector_and_effect_modules_route_supported_access_through_broke
     ]
     with pytest.raises(RuntimeError, match="access broker"):
         await Connector(GET_CUSTOMER).execute("ada", ExecutionContext("run", "task", "instance"))
+
+
+@pytest.mark.asyncio
+async def test_execution_uses_the_same_declarations_compiled_into_ir() -> None:
+    broker = FakeBroker()
+    context = ExecutionContext("run", "task", "instance", broker=broker)
+    connector = Connector(GET_CUSTOMER)
+    connector.capabilities = (
+        replace(GET_CUSTOMER, connector="warehouse", operation="lookup_customer"),
+    )
+    effect = Effect(SEND_EMAIL)
+    effect.effects = (replace(SEND_EMAIL, connector="outbox", operation="deliver"),)
+
+    customer = await connector.execute("ada", context)
+    await effect.execute(customer, context)
+
+    assert broker.calls == [
+        ("warehouse", "lookup_customer", "ada"),
+        ("outbox", "deliver", {"email": "ada@example.test"}),
+    ]

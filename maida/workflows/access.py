@@ -47,9 +47,11 @@ def _validate_common(
     _validate_identity("name", name)
     _validate_identity("connector", connector)
     _validate_identity("operation", operation)
-    if connector_version is not None and not connector_version.strip():
+    if connector_version is not None and (
+        not isinstance(connector_version, str) or not connector_version.strip()
+    ):
         raise ValueError("connector_version must be non-empty when supplied")
-    if any(not tag.strip() for tag in policy_tags):
+    if any(not isinstance(tag, str) or not tag.strip() for tag in policy_tags):
         raise ValueError("policy_tags must contain non-empty names")
     if len(set(policy_tags)) != len(policy_tags):
         raise ValueError("policy_tags must be unique")
@@ -107,7 +109,15 @@ class Capability[RequestT, ResponseT]:
         return schema_digest(self.output_type)
 
     def to_data(self) -> dict[str, Any]:
-        """Return the credential-free canonical IR declaration."""
+        """Return the credential-free canonical IR declaration.
+
+        Returns
+        -------
+        dict
+            JSON-compatible data containing stable adapter, operation, schema,
+            and policy identities. Runtime clients and credentials are never
+            included.
+        """
         return {
             "kind": "capability",
             "name": self.name,
@@ -127,6 +137,26 @@ class EffectSpec[RequestT, ResponseT]:
     Effect declarations add stable idempotency and approval semantics to the
     same connector/operation abstraction used for reads. They contain no live
     adapter or credential material.
+
+    Parameters
+    ----------
+    name
+        Stable authorization and audit identity, for example ``email.send``.
+    connector
+        Adapter registry key chosen by the deployment.
+    operation
+        Stable operation name implemented by that adapter.
+    input_type, output_type
+        Python contracts validated around the provider invocation.
+    connector_version
+        Optional immutable adapter/configuration identity. It must not contain
+        credentials.
+    idempotency
+        Guarantee required from the selected adapter before live execution.
+    approval_required
+        Whether policy must observe a prior approval before dispatch.
+    policy_tags
+        Stable tags available to policy hooks and structural verification.
     """
 
     name: str
@@ -150,6 +180,8 @@ class EffectSpec[RequestT, ResponseT]:
         )
         if not isinstance(self.idempotency, Idempotency):
             raise ValueError("idempotency must be an Idempotency value")
+        if type(self.approval_required) is not bool:
+            raise ValueError("approval_required must be a boolean")
         object.__setattr__(self, "policy_tags", tags)
 
     @property
@@ -163,7 +195,15 @@ class EffectSpec[RequestT, ResponseT]:
         return schema_digest(self.output_type)
 
     def to_data(self) -> dict[str, Any]:
-        """Return the credential-free canonical IR declaration."""
+        """Return the credential-free canonical IR declaration.
+
+        Returns
+        -------
+        dict
+            JSON-compatible data containing stable adapter, operation, schema,
+            idempotency, approval, and policy identities. Runtime clients and
+            credentials are never included.
+        """
         return {
             "kind": "effect",
             "name": self.name,
@@ -197,7 +237,6 @@ class Connector[RequestT, ResponseT](Module[RequestT, ResponseT]):
         *,
         module_id: str | None = None,
     ) -> None:
-        self._capability = capability
         self.input_type = capability.input_type
         self.output_type = capability.output_type
         self.module_id = module_id
@@ -207,16 +246,31 @@ class Connector[RequestT, ResponseT](Module[RequestT, ResponseT]):
     async def execute(self, value: RequestT, ctx: ExecutionContext) -> ResponseT:
         """Invoke the declared read through the runtime-managed broker.
 
+        Parameters
+        ----------
+        value
+            Concrete request matching the capability input contract.
+        ctx
+            Runtime context containing the attempt-scoped access broker.
+
+        Returns
+        -------
+        ResponseT
+            Broker result after runtime contract and policy enforcement.
+
         Raises
         ------
         AccessContractError
-            If no broker is bound to this worker attempt.
+            If no broker is bound or the module declaration was corrupted.
         """
         if ctx.broker is None or not callable(getattr(ctx.broker, "read", None)):
             raise AccessContractError("connector execution requires a runtime access broker")
+        if len(self.capabilities) != 1 or not isinstance(self.capabilities[0], Capability):
+            raise AccessContractError("connector module requires exactly one Capability")
+        capability = self.capabilities[0]
         result = await ctx.broker.read(
-            self._capability.connector,
-            self._capability.operation,
+            capability.connector,
+            capability.operation,
             value,
         )
         return cast(ResponseT, result)
@@ -227,6 +281,18 @@ class Effect[RequestT, ResponseT](Module[RequestT, ResponseT]):
 
     Live execution always routes through a broker. Replay workers may validate
     the proposed effect but never construct or call a production adapter.
+
+    Parameters
+    ----------
+    effect
+        Stable typed effect declaration compiled into the workflow definition.
+    module_id
+        Optional replay-stable semantic identity.
+
+    Notes
+    -----
+    An effect module is always classified as effectful. The runtime broker is
+    the only supported path from this boundary to an external write adapter.
     """
 
     effectful = True
@@ -237,7 +303,6 @@ class Effect[RequestT, ResponseT](Module[RequestT, ResponseT]):
         *,
         module_id: str | None = None,
     ) -> None:
-        self._effect = effect
         self.input_type = effect.input_type
         self.output_type = effect.output_type
         self.module_id = module_id
@@ -247,16 +312,31 @@ class Effect[RequestT, ResponseT](Module[RequestT, ResponseT]):
     async def execute(self, value: RequestT, ctx: ExecutionContext) -> ResponseT:
         """Invoke the declared write through the runtime-managed broker.
 
+        Parameters
+        ----------
+        value
+            Concrete request matching the effect input contract.
+        ctx
+            Runtime context containing the attempt-scoped access broker.
+
+        Returns
+        -------
+        ResponseT
+            Durable or newly committed effect result returned by the broker.
+
         Raises
         ------
         AccessContractError
-            If no broker is bound to this worker attempt.
+            If no broker is bound or the module declaration was corrupted.
         """
         if ctx.broker is None or not callable(getattr(ctx.broker, "effect", None)):
             raise AccessContractError("effect execution requires a runtime access broker")
+        if len(self.effects) != 1 or not isinstance(self.effects[0], EffectSpec):
+            raise AccessContractError("effect module requires exactly one EffectSpec")
+        effect = self.effects[0]
         result = await ctx.broker.effect(
-            self._effect.connector,
-            self._effect.operation,
+            effect.connector,
+            effect.operation,
             value,
         )
         return cast(ResponseT, result)

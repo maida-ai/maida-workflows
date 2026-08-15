@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import inspect
 import marshal
+import re
 from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
@@ -199,6 +200,10 @@ class PlanIR:
         steps = []
         for raw in data["steps"]:
             binding = raw.get("input_binding")
+            if data.get("version") == IR_VERSION and (
+                "capabilities" not in raw or "effects" not in raw
+            ):
+                raise ValueError("Workflow IR 0.2.0 steps require external access fields")
             steps.append(
                 StepIR(
                     node_id=raw["node_id"],
@@ -211,8 +216,20 @@ class PlanIR:
                     definition_digest=raw.get("definition_digest"),
                     input_binding=BindingIR(**binding) if binding else None,
                     execution=raw.get("execution"),
-                    capabilities=tuple(raw.get("capabilities", ())),
-                    effects=tuple(raw.get("effects", ())),
+                    capabilities=_validated_access_declarations(
+                        raw.get("capabilities", ()),
+                        expected_kind="capability",
+                        location=f"Workflow IR node {raw.get('node_id')!r} capabilities",
+                        require_canonical=data.get("version") == IR_VERSION,
+                        error_type=ValueError,
+                    ),
+                    effects=_validated_access_declarations(
+                        raw.get("effects", ()),
+                        expected_kind="effect",
+                        location=f"Workflow IR node {raw.get('node_id')!r} effects",
+                        require_canonical=data.get("version") == IR_VERSION,
+                        error_type=ValueError,
+                    ),
                     control=raw.get("control"),
                 )
             )
@@ -297,13 +314,97 @@ def _module_configuration(module: Module[Any, Any]) -> dict[str, Any]:
     configured = {
         name: value
         for name, value in sorted(vars(module).items())
-        if name not in _MODULE_CONTRACT_FIELDS and not name.startswith("_")
+        if name not in {"capabilities", "effects", "input_type", "module_id", "output_type"}
+        and not name.startswith("_")
     }
     return {"class": declared, "instance": configured}
 
 
+_ACCESS_COMMON_FIELDS = frozenset(
+    {
+        "connector",
+        "connector_version",
+        "input_schema_digest",
+        "kind",
+        "name",
+        "operation",
+        "output_schema_digest",
+        "policy_tags",
+    }
+)
+_ACCESS_EFFECT_FIELDS = frozenset({"approval_required", "idempotency"})
+_ACCESS_IDENTITY_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
+
+
+def _validated_access_declarations(
+    raw: Any,
+    *,
+    expected_kind: str,
+    location: str,
+    require_canonical: bool,
+    error_type: type[ValueError],
+) -> tuple[dict[str, Any], ...]:
+    if not isinstance(raw, (list, tuple)):
+        raise error_type(f"{location} must be an array")
+    declarations: list[dict[str, Any]] = []
+    names: set[str] = set()
+    expected_fields = _ACCESS_COMMON_FIELDS | (
+        _ACCESS_EFFECT_FIELDS if expected_kind == "effect" else frozenset()
+    )
+    for index, item in enumerate(raw):
+        if not isinstance(item, Mapping):
+            raise error_type(f"{location}[{index}] must be an object")
+        declaration = cast(dict[str, Any], canonical_data(dict(item)))
+        if declaration.get("kind") != expected_kind:
+            raise error_type(f"{location}[{index}] must have kind {expected_kind!r}")
+        if set(declaration) != expected_fields:
+            raise error_type(
+                f"{location}[{index}] fields do not match the {expected_kind} contract"
+            )
+        for field in ("name", "connector", "operation"):
+            value = declaration[field]
+            if not isinstance(value, str) or _ACCESS_IDENTITY_PATTERN.fullmatch(value) is None:
+                raise error_type(f"{location}[{index}].{field} must be a stable name")
+        version = declaration["connector_version"]
+        if version is not None and (not isinstance(version, str) or not version.strip()):
+            raise error_type(
+                f"{location}[{index}].connector_version must be null or a non-empty string"
+            )
+        for field in ("input_schema_digest", "output_schema_digest"):
+            value = declaration[field]
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise error_type(f"{location}[{index}].{field} must be a sha256 digest")
+        tags = declaration["policy_tags"]
+        if (
+            not isinstance(tags, list)
+            or any(not isinstance(tag, str) or not tag.strip() for tag in tags)
+            or tags != sorted(set(tags))
+        ):
+            raise error_type(
+                f"{location}[{index}].policy_tags must be sorted unique non-empty strings"
+            )
+        if expected_kind == "effect":
+            if declaration["idempotency"] not in {"none", "optional", "required"}:
+                raise error_type(f"{location}[{index}].idempotency is invalid")
+            if type(declaration["approval_required"]) is not bool:
+                raise error_type(f"{location}[{index}].approval_required must be boolean")
+        name = cast(str, declaration["name"])
+        if name in names:
+            raise error_type(f"{location} contains duplicate name {name!r}")
+        names.add(name)
+        declarations.append(declaration)
+    canonical = tuple(sorted(declarations, key=canonical_json))
+    if require_canonical and tuple(declarations) != canonical:
+        raise error_type(f"{location} must be in canonical order")
+    return canonical
+
+
 def _access_contract(module: Module[Any, Any]) -> dict[str, tuple[dict[str, Any], ...]]:
-    def declarations(attribute: str) -> tuple[dict[str, Any], ...]:
+    def declarations(attribute: str, expected_kind: str) -> tuple[dict[str, Any], ...]:
         encoded: list[dict[str, Any]] = []
         for declaration in getattr(module, attribute, ()):
             to_data = getattr(declaration, "to_data", None)
@@ -313,12 +414,21 @@ def _access_contract(module: Module[Any, Any]) -> dict[str, tuple[dict[str, Any]
             if not isinstance(data, dict):
                 raise CompileError(f"module {attribute} declaration must encode as an object")
             encoded.append(cast(dict[str, Any], canonical_data(data)))
-        return tuple(sorted(encoded, key=canonical_json))
+        return _validated_access_declarations(
+            encoded,
+            expected_kind=expected_kind,
+            location=f"module {attribute}",
+            require_canonical=False,
+            error_type=CompileError,
+        )
 
-    return {
-        "capabilities": declarations("capabilities"),
-        "effects": declarations("effects"),
+    access = {
+        "capabilities": declarations("capabilities", "capability"),
+        "effects": declarations("effects", "effect"),
     }
+    if access["effects"] and not module.effectful:
+        raise CompileError("a module declaring effects must set effectful = True")
+    return access
 
 
 def module_digest(module: Module[Any, Any]) -> str:
@@ -338,18 +448,19 @@ def module_digest(module: Module[Any, Any]) -> str:
     str
         Lowercase SHA-256 hexadecimal digest.
     """
-    payload = b"\0".join(
-        (
-            qualified_name(module.__class__).encode(),
-            _behavior_bytes(module),
-            canonical_json(_module_configuration(module)).encode(),
-            schema_digest(module.input_type).encode(),
-            schema_digest(module.output_type).encode(),
-            str(module.effectful).encode(),
-            canonical_json(module.execution.to_data()).encode(),
-            canonical_json(_access_contract(module)).encode(),
-        )
-    )
+    parts = [
+        qualified_name(module.__class__).encode(),
+        _behavior_bytes(module),
+        canonical_json(_module_configuration(module)).encode(),
+        schema_digest(module.input_type).encode(),
+        schema_digest(module.output_type).encode(),
+        str(module.effectful).encode(),
+        canonical_json(module.execution.to_data()).encode(),
+    ]
+    access = _access_contract(module)
+    if access["capabilities"] or access["effects"]:
+        parts.append(canonical_json(access).encode())
+    payload = b"\0".join(parts)
     return digest_bytes(payload)
 
 
@@ -646,6 +757,10 @@ def _validate_imported_plan(plan: PlanIR) -> None:
                     f"executable Workflow IR node {step.node_id!r} has an incomplete definition"
                 )
             replay_keys.add(step.replay_key)
+        elif step.capabilities or step.effects:
+            raise ValueError(
+                f"control Workflow IR node {step.node_id!r} cannot declare external access"
+            )
         known_nodes.add(step.node_id)
     if plan.output_node not in known_nodes:
         raise ValueError(f"Workflow IR output node {plan.output_node!r} does not exist")
