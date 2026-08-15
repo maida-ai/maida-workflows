@@ -38,9 +38,12 @@ from .ir import CompileError, PlanIR, ReplayKey, StepIR, compile_workflow
 from .models import (
     BoundaryRecord,
     ExecutionMode,
+    ExecutionSpec,
+    ExecutorCapabilities,
     RunHistory,
     RunStatus,
     StoredValue,
+    TaskStatus,
 )
 from .replay import (
     ReplayCase,
@@ -48,7 +51,16 @@ from .replay import (
     ReplayMode,
     ReplayResult,
 )
-from .runtime import RunResult, TaskWorker, WorkflowRunner
+from .runtime import (
+    Executor,
+    LocalExecutor,
+    RunResult,
+    ScheduleProgress,
+    TaskEnvelope,
+    TaskWorker,
+    WorkflowRunner,
+    WorkflowScheduler,
+)
 from .verification import VerificationSuite
 
 __all__ = [
@@ -57,6 +69,10 @@ __all__ = [
     "CompileError",
     "ExecutionContext",
     "ExecutionMode",
+    "ExecutionSpec",
+    "Executor",
+    "ExecutorCapabilities",
+    "LocalExecutor",
     "Module",
     "PlanIR",
     "ReplayCase",
@@ -71,13 +87,17 @@ __all__ = [
     "RunResult",
     "RunStatus",
     "RuntimeValue",
+    "ScheduleProgress",
     "StepIR",
     "StoredValue",
     "SymbolicValueError",
+    "TaskEnvelope",
+    "TaskStatus",
     "TaskWorker",
     "VerificationSuite",
     "Workflow",
     "WorkflowRunner",
+    "WorkflowScheduler",
     "compile_workflow",
     "map_over",
     "parallel",

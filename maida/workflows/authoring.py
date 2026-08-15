@@ -17,6 +17,7 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Any, cast
 
 from ._canonical import schema_digest
+from .models import ExecutionSpec
 
 
 class SymbolicValueError(TypeError):
@@ -134,12 +135,16 @@ class Module[InputT, OutputT](ABC):
         Python type returned by the module.
     effectful
         Whether executing the module may commit an external effect.
+    execution
+        Immutable environment requirements used to match durable tasks to
+        capable executors.
     """
 
     module_id: str | None = None
     input_type: type[InputT]
     output_type: type[OutputT]
     effectful: bool = False
+    execution: ExecutionSpec = ExecutionSpec()
 
     def __call__(self, value: RuntimeValue[InputT]) -> RuntimeValue[OutputT]:
         """Create a symbolic output connected to this module occurrence.

@@ -33,6 +33,8 @@ from .models import (
     Definition,
     Event,
     ExecutionMode,
+    ExecutionSpec,
+    ExecutorCapabilities,
     Run,
     RunHistory,
     RunStatus,
@@ -252,8 +254,12 @@ class PostgresStore:
         step: StepIR,
         *,
         step_instance_id: str,
-        input_value: StoredValue,
+        input_value: StoredValue | None,
         dependency_instance_keys: tuple[str, ...] = (),
+        dependency_node_ids: tuple[str, ...] | None = None,
+        capability_grant: tuple[str, ...] | None = None,
+        branch_decisions: tuple[dict[str, Any], ...] = (),
+        map_decisions: tuple[dict[str, Any], ...] = (),
         task_id: str | None = None,
     ) -> Task:
         """Create one durable executable task pinned to a module digest.
@@ -266,14 +272,28 @@ class PostgresStore:
         if step.module_id is None or step.logical_step is None or step.module_digest is None:
             raise ValueError("only executable module steps can be enqueued")
         identifier = task_id or str(uuid4())
+        execution = ExecutionSpec.from_data(dict(step.execution or {}))
+        grant = execution.capabilities if capability_grant is None else capability_grant
+        initial_status = TaskStatus.READY if input_value is not None else TaskStatus.BLOCKED
+        dependencies = dependency_node_ids if dependency_node_ids is not None else step.dependencies
         with self.connect() as connection, connection.cursor() as cursor:
-            self._register_value_artifact(cursor, input_value)
+            if input_value is not None:
+                self._register_value_artifact(cursor, input_value)
             cursor.execute(
                 """
                 INSERT INTO workflow_tasks (
                     task_id, run_id, module_id, logical_step, step_instance_id,
-                    module_digest, dependency_instance_keys, task_input
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    module_digest, node_id, dependency_instance_keys,
+                    dependency_node_ids, task_input, execution_requirements,
+                    execution_isolation, execution_image, execution_cpu,
+                    execution_memory_bytes, required_executor_capabilities,
+                    capability_grant, branch_decisions, map_decisions, status, ready_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                          %s, %s, %s, %s, %s, %s, %s,
+                          CASE WHEN %s = 'READY' THEN now() ELSE NULL END)
+                ON CONFLICT (run_id, module_id, logical_step, step_instance_id)
+                DO NOTHING
+                RETURNING *
                 """,
                 (
                     identifier,
@@ -282,37 +302,122 @@ class PostgresStore:
                     step.logical_step,
                     step_instance_id,
                     step.module_digest,
+                    step.node_id,
                     Jsonb(list(dependency_instance_keys)),
-                    Jsonb(input_value.to_data()),
+                    Jsonb(list(dependencies)),
+                    Jsonb(input_value.to_data()) if input_value is not None else None,
+                    Jsonb(execution.to_data()),
+                    execution.isolation,
+                    execution.image,
+                    execution.cpu,
+                    execution.memory_bytes,
+                    Jsonb(list(execution.capabilities)),
+                    Jsonb(list(grant)),
+                    Jsonb(list(branch_decisions)),
+                    Jsonb(list(map_decisions)),
+                    initial_status.value,
+                    initial_status.value,
                 ),
             )
-            self._append_event(
-                cursor,
-                run_id,
-                "TASK_CREATED",
-                {
-                    "module_id": step.module_id,
-                    "logical_step": step.logical_step,
-                    "step_instance_id": step_instance_id,
-                },
-                task_id=identifier,
+            row = cursor.fetchone()
+            if row is None:
+                cursor.execute(
+                    """
+                    SELECT * FROM workflow_tasks
+                    WHERE run_id = %s AND module_id = %s AND logical_step = %s
+                      AND step_instance_id = %s
+                    """,
+                    (run_id, step.module_id, step.logical_step, step_instance_id),
+                )
+                row = cursor.fetchone()
+                if row is None:  # pragma: no cover - unique conflict guarantees a row
+                    raise PersistenceError("idempotent task creation lost its existing task")
+                recorded_input = (
+                    StoredValue.from_data(row["task_input"]) if row["task_input"] else None
+                )
+                if (
+                    input_value is not None
+                    and recorded_input is not None
+                    and input_value.digest != recorded_input.digest
+                ):
+                    raise InvalidRunStateError("task identity was reused with a different input")
+            else:
+                self._append_event(
+                    cursor,
+                    run_id,
+                    "TASK_CREATED",
+                    {
+                        "module_id": step.module_id,
+                        "logical_step": step.logical_step,
+                        "step_instance_id": step_instance_id,
+                    },
+                    task_id=identifier,
+                )
+                if initial_status is TaskStatus.READY:
+                    self._append_event(cursor, run_id, "TASK_READY", {}, task_id=identifier)
+        return self._task_from_row(row)
+
+    def ready_task(
+        self,
+        task_id: str,
+        *,
+        input_value: StoredValue,
+        dependency_instance_keys: tuple[str, ...],
+        branch_decisions: tuple[dict[str, Any], ...] = (),
+        map_decisions: tuple[dict[str, Any], ...] = (),
+    ) -> Task:
+        """Materialize a blocked task input and atomically make it claimable.
+
+        The scheduler calls this only after every dependency has a durable
+        accepted result. Workers never wait for dependencies themselves.
+        """
+        with self.connect() as connection, connection.cursor() as cursor:
+            self._register_value_artifact(cursor, input_value)
+            cursor.execute(
+                """
+                UPDATE workflow_tasks
+                SET task_input = %s, dependency_instance_keys = %s,
+                    branch_decisions = %s, map_decisions = %s,
+                    status = 'READY', ready_at = now()
+                WHERE task_id = %s AND status = 'BLOCKED'
+                RETURNING *
+                """,
+                (
+                    Jsonb(input_value.to_data()),
+                    Jsonb(list(dependency_instance_keys)),
+                    Jsonb(list(branch_decisions)),
+                    Jsonb(list(map_decisions)),
+                    task_id,
+                ),
             )
-        return Task(
-            task_id=identifier,
-            run_id=run_id,
-            module_id=step.module_id,
-            logical_step=step.logical_step,
-            step_instance_id=step_instance_id,
-            module_digest=step.module_digest,
-            dependency_instance_keys=dependency_instance_keys,
-            input_value=input_value,
-            status=TaskStatus.PENDING,
-        )
+            row = cursor.fetchone()
+            if row is None:
+                cursor.execute("SELECT * FROM workflow_tasks WHERE task_id = %s", (task_id,))
+                row = cursor.fetchone()
+                if row is None:
+                    raise PersistenceError(f"task {task_id} was not found")
+                if row["status"] != TaskStatus.READY.value:
+                    raise InvalidRunStateError(f"task {task_id} cannot become ready")
+                recorded_input = StoredValue.from_data(row["task_input"])
+                if (
+                    recorded_input.digest != input_value.digest
+                    or tuple(row["dependency_instance_keys"]) != dependency_instance_keys
+                    or tuple(row["branch_decisions"]) != branch_decisions
+                    or tuple(row["map_decisions"]) != map_decisions
+                ):
+                    raise InvalidRunStateError(
+                        f"task {task_id} was concurrently readied with different inputs"
+                    )
+            else:
+                self._append_event(cursor, str(row["run_id"]), "TASK_READY", {}, task_id=task_id)
+        return self._task_from_row(row)
 
     def claim_task(
         self,
         *,
         worker_id: str,
+        capabilities: ExecutorCapabilities | None = None,
+        definition_digest: str | None = None,
         lease_for: timedelta = timedelta(minutes=5),
         task_id: str | None = None,
     ) -> ClaimedTask | None:
@@ -334,31 +439,52 @@ class PostgresStore:
         """
         if lease_for <= timedelta(0):
             raise ValueError("lease_for must be positive")
+        offered = capabilities or ExecutorCapabilities.local_process()
         lease_token = uuid4()
         attempt_id = uuid4()
         with self.connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT task_id, status FROM workflow_tasks
-                WHERE (%s::uuid IS NULL OR task_id = %s::uuid)
-                  AND (status = 'PENDING' OR (status = 'LEASED' AND lease_expires_at < now()))
-                ORDER BY created_at, task_id
+                SELECT t.* FROM workflow_tasks t
+                JOIN workflow_runs r ON r.run_id = t.run_id
+                WHERE (%s::uuid IS NULL OR t.task_id = %s::uuid)
+                  AND (%s::text IS NULL OR r.definition_digest = %s::text)
+                  AND (
+                    t.status = 'READY'
+                    OR (t.status IN ('LEASED', 'RUNNING') AND t.lease_expires_at < now())
+                  )
+                  AND t.execution_isolation = ANY(%s)
+                  AND (t.execution_image IS NULL OR t.execution_image = ANY(%s))
+                  AND (t.execution_cpu IS NULL OR t.execution_cpu <= %s)
+                  AND (t.execution_memory_bytes IS NULL OR t.execution_memory_bytes <= %s)
+                  AND t.required_executor_capabilities <@ %s::jsonb
+                ORDER BY COALESCE(t.ready_at, t.created_at), t.task_id
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
                 """,
-                (task_id, task_id),
+                (
+                    task_id,
+                    task_id,
+                    definition_digest,
+                    definition_digest,
+                    list(offered.isolations),
+                    list(offered.images),
+                    offered.cpu if offered.cpu is not None else -1,
+                    offered.memory_bytes if offered.memory_bytes is not None else -1,
+                    Jsonb(sorted(offered.capabilities)),
+                ),
             )
             selected = cursor.fetchone()
             if selected is None:
                 return None
             selected_id = selected["task_id"]
-            if selected["status"] == TaskStatus.LEASED.value:
+            if selected["status"] in {TaskStatus.LEASED.value, TaskStatus.RUNNING.value}:
                 cursor.execute(
                     """
                     UPDATE workflow_attempts
                     SET status = 'ABANDONED', completed_at = now(),
                         diagnostic = '{"reason":"lease expired"}'::jsonb
-                    WHERE task_id = %s AND status = 'RUNNING'
+                    WHERE task_id = %s AND status IN ('CLAIMED', 'RUNNING')
                     """,
                     (selected_id,),
                 )
@@ -386,17 +512,17 @@ class PostgresStore:
             cursor.execute(
                 """
                 INSERT INTO workflow_attempts (
-                    attempt_id, task_id, attempt_number, lease_token, status
-                ) VALUES (%s, %s, %s, %s, 'RUNNING')
-                RETURNING started_at
+                    attempt_id, task_id, attempt_number, lease_token, status, worker_id
+                ) VALUES (%s, %s, %s, %s, 'CLAIMED', %s)
+                RETURNING claimed_at
                 """,
-                (attempt_id, selected_id, attempt_number, lease_token),
+                (attempt_id, selected_id, attempt_number, lease_token, worker_id),
             )
             attempt_row = cursor.fetchone()
             self._append_event(
                 cursor,
                 str(row["run_id"]),
-                "TASK_CLAIMED",
+                "ATTEMPT_CLAIMED",
                 {"worker_id": worker_id, "attempt_number": attempt_number},
                 task_id=str(selected_id),
                 attempt_id=str(attempt_id),
@@ -407,10 +533,110 @@ class PostgresStore:
             task_id=str(selected_id),
             attempt_number=attempt_number,
             lease_token=str(lease_token),
-            status=AttemptStatus.RUNNING,
-            started_at=attempt_row["started_at"] if attempt_row else None,
+            status=AttemptStatus.CLAIMED,
+            claimed_at=attempt_row["claimed_at"] if attempt_row else None,
         )
         return ClaimedTask(task, attempt, worker_id, expires_at)
+
+    def start_task(self, claim: ClaimedTask) -> ClaimedTask:
+        """Mark a claimed attempt running using its lease token."""
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE workflow_tasks SET status = 'RUNNING'
+                WHERE task_id = %s AND status = 'LEASED' AND lease_token = %s
+                RETURNING *
+                """,
+                (claim.task.task_id, claim.attempt.lease_token),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise StaleLeaseError(f"lease for task {claim.task.task_id} is stale")
+            cursor.execute(
+                """
+                UPDATE workflow_attempts SET status = 'RUNNING', started_at = now()
+                WHERE attempt_id = %s AND status = 'CLAIMED'
+                RETURNING started_at
+                """,
+                (claim.attempt.attempt_id,),
+            )
+            attempt_row = cursor.fetchone()
+            if attempt_row is None:
+                raise StaleLeaseError(f"attempt {claim.attempt.attempt_id} cannot start")
+            self._append_event(
+                cursor,
+                claim.task.run_id,
+                "ATTEMPT_STARTED",
+                {"worker_id": claim.worker_id},
+                task_id=claim.task.task_id,
+                attempt_id=claim.attempt.attempt_id,
+            )
+        return ClaimedTask(
+            self._task_from_row(row),
+            Attempt(
+                attempt_id=claim.attempt.attempt_id,
+                task_id=claim.attempt.task_id,
+                attempt_number=claim.attempt.attempt_number,
+                lease_token=claim.attempt.lease_token,
+                status=AttemptStatus.RUNNING,
+                claimed_at=claim.attempt.claimed_at,
+                started_at=attempt_row["started_at"],
+            ),
+            claim.worker_id,
+            claim.lease_expires_at,
+        )
+
+    def heartbeat_task(
+        self,
+        claim: ClaimedTask,
+        *,
+        lease_for: timedelta = timedelta(minutes=5),
+    ) -> datetime:
+        """Extend a live attempt lease and return the new deadline."""
+        if lease_for <= timedelta(0):
+            raise ValueError("lease_for must be positive")
+        expires_at = datetime.now(UTC) + lease_for
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE workflow_tasks SET lease_expires_at = %s
+                WHERE task_id = %s AND status IN ('LEASED', 'RUNNING') AND lease_token = %s
+                """,
+                (expires_at, claim.task.task_id, claim.attempt.lease_token),
+            )
+            if cursor.rowcount != 1:
+                raise StaleLeaseError(f"lease for task {claim.task.task_id} is stale")
+            self._append_event(
+                cursor,
+                claim.task.run_id,
+                "ATTEMPT_HEARTBEAT",
+                {"lease_expires_at": expires_at.isoformat()},
+                task_id=claim.task.task_id,
+                attempt_id=claim.attempt.attempt_id,
+            )
+        return expires_at
+
+    def checkpoint_task(self, claim: ClaimedTask, checkpoint: StoredValue) -> None:
+        """Persist an immutable checkpoint reference for a running attempt."""
+        with self.connect() as connection, connection.cursor() as cursor:
+            self._register_value_artifact(cursor, checkpoint)
+            cursor.execute(
+                """
+                UPDATE workflow_attempts SET checkpoint_ref = %s
+                WHERE attempt_id = %s AND status = 'RUNNING' AND lease_token = %s
+                """,
+                (Jsonb(checkpoint.to_data()), claim.attempt.attempt_id, claim.attempt.lease_token),
+            )
+            if cursor.rowcount != 1:
+                raise StaleLeaseError(f"attempt {claim.attempt.attempt_id} cannot checkpoint")
+            self._append_event(
+                cursor,
+                claim.task.run_id,
+                "CHECKPOINT_WRITTEN",
+                {"checkpoint_digest": checkpoint.digest},
+                task_id=claim.task.task_id,
+                attempt_id=claim.attempt.attempt_id,
+            )
 
     def complete_task(self, claim: ClaimedTask, boundary: BoundaryRecord) -> None:
         """Accept one logical task result using lease-token compare-and-swap.
@@ -450,7 +676,7 @@ class PostgresStore:
                 SET status = 'SUCCEEDED', accepted_attempt_id = %s,
                     accepted_boundary = %s, completed_at = %s,
                     lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL
-                WHERE task_id = %s AND status = 'LEASED' AND lease_token = %s
+                WHERE task_id = %s AND status = 'RUNNING' AND lease_token = %s
                 """,
                 (
                     claim.attempt.attempt_id,
@@ -492,14 +718,14 @@ class PostgresStore:
         StaleLeaseError
             If the claim no longer owns the task lease.
         """
-        next_status = TaskStatus.PENDING if retry else TaskStatus.FAILED
+        next_status = TaskStatus.READY if retry else TaskStatus.FAILED
         with self.connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
                 UPDATE workflow_tasks
                 SET status = %s, lease_owner = NULL, lease_token = NULL,
                     lease_expires_at = NULL
-                WHERE task_id = %s AND status = 'LEASED' AND lease_token = %s
+                WHERE task_id = %s AND status IN ('LEASED', 'RUNNING') AND lease_token = %s
                 """,
                 (next_status.value, claim.task.task_id, claim.attempt.lease_token),
             )
@@ -509,7 +735,7 @@ class PostgresStore:
                 """
                 UPDATE workflow_attempts
                 SET status = 'FAILED', diagnostic = %s, completed_at = now()
-                WHERE attempt_id = %s AND status = 'RUNNING'
+                WHERE attempt_id = %s AND status IN ('CLAIMED', 'RUNNING')
                 """,
                 (Jsonb(diagnostic), claim.attempt.attempt_id),
             )
@@ -649,7 +875,7 @@ class PostgresStore:
                 """
                 SELECT a.* FROM workflow_attempts a
                 JOIN workflow_tasks t ON t.task_id = a.task_id
-                WHERE t.run_id = %s ORDER BY a.started_at, a.attempt_id
+                WHERE t.run_id = %s ORDER BY a.claimed_at, a.attempt_id
                 """,
                 (run_id,),
             )
@@ -694,8 +920,14 @@ class PostgresStore:
             logical_step=row["logical_step"],
             step_instance_id=row["step_instance_id"],
             module_digest=row["module_digest"],
+            node_id=row.get("node_id", row["logical_step"]),
             dependency_instance_keys=tuple(row["dependency_instance_keys"]),
-            input_value=StoredValue.from_data(row["task_input"]),
+            dependency_node_ids=tuple(row.get("dependency_node_ids", ())),
+            input_value=StoredValue.from_data(row["task_input"]) if row["task_input"] else None,
+            execution=ExecutionSpec.from_data(dict(row.get("execution_requirements") or {})),
+            capability_grant=tuple(row.get("capability_grant", ())),
+            branch_decisions=tuple(row.get("branch_decisions", ())),
+            map_decisions=tuple(row.get("map_decisions", ())),
             status=TaskStatus(row["status"]),
             accepted_attempt_id=str(row["accepted_attempt_id"])
             if row.get("accepted_attempt_id")
@@ -711,7 +943,11 @@ class PostgresStore:
             attempt_number=row["attempt_number"],
             lease_token=str(row["lease_token"]),
             status=AttemptStatus(row["status"]),
+            checkpoint=StoredValue.from_data(row["checkpoint_ref"])
+            if row.get("checkpoint_ref")
+            else None,
             diagnostic=row["diagnostic"],
+            claimed_at=row.get("claimed_at"),
             started_at=row["started_at"],
             completed_at=row["completed_at"],
         )

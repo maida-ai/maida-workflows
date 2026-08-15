@@ -917,10 +917,10 @@ def build_module_registry(
         built_output = output
     steps = {step.node_id: step for step in compiled.executable_steps}
     found: dict[ReplayKey, Module[Any, Any]] = {}
-    seen: set[tuple[int, str]] = set()
+    seen: set[int] = set()
 
     def visit(value: RuntimeValue[Any], path: str, owner: Workflow[Any, Any]) -> None:
-        marker = (id(value), path)
+        marker = id(value)
         if marker in seen:
             return
         seen.add(marker)

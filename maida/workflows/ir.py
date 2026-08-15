@@ -98,6 +98,8 @@ class StepIR:
         Replay and content identities for executable nodes.
     input_binding
         Typed source binding for an executable node.
+    execution
+        Immutable executor requirements for executable nodes.
     control
         Canonical control-region metadata when applicable.
     """
@@ -111,6 +113,7 @@ class StepIR:
     module_digest: str | None = None
     definition_digest: str | None = None
     input_binding: BindingIR | None = None
+    execution: Mapping[str, Any] | None = None
     control: Mapping[str, Any] | None = None
 
     @property
@@ -192,6 +195,7 @@ class PlanIR:
                     module_digest=raw.get("module_digest"),
                     definition_digest=raw.get("definition_digest"),
                     input_binding=BindingIR(**binding) if binding else None,
+                    execution=raw.get("execution"),
                     control=raw.get("control"),
                 )
             )
@@ -250,6 +254,7 @@ def _behavior_bytes(module: Module[Any, Any]) -> bytes:
 
 _MODULE_CONTRACT_FIELDS = {
     "effectful",
+    "execution",
     "input_type",
     "module_id",
     "output_type",
@@ -303,6 +308,7 @@ def module_digest(module: Module[Any, Any]) -> str:
             schema_digest(module.input_type).encode(),
             schema_digest(module.output_type).encode(),
             str(module.effectful).encode(),
+            canonical_json(module.execution.to_data()).encode(),
         )
     )
     return digest_bytes(payload)
@@ -517,6 +523,7 @@ class _Compiler:
                 "module_digest": behavior_digest,
                 "input_schema_digest": input_digest,
                 "output_schema_digest": output_digest,
+                "execution": module.execution.to_data(),
                 "control": control,
             }
         )
@@ -530,6 +537,7 @@ class _Compiler:
             module_digest=behavior_digest,
             definition_digest=definition_digest,
             input_binding=BindingIR(source=dependencies[0], schema_digest=input_digest),
+            execution=module.execution.to_data(),
             control=control,
         )
 

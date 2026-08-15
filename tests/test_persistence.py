@@ -93,6 +93,7 @@ def test_leases_retries_stale_completion_and_history(postgres_store: PostgresSto
     final = postgres_store.claim_task(worker_id="recovery-worker", task_id=task.task_id)
     assert final is not None
     assert final.attempt.attempt_number == 3
+    final = postgres_store.start_task(final)
     boundary = blank_boundary(
         workflow_id=plan.workflow_id,
         definition_digest=plan.digest,

@@ -1,14 +1,16 @@
 # Maida Workflows
 
-Maida Workflows is a local-first Python runtime for statically composed,
-durable, replayable AI workflows. It compiles workflow definitions into a
-canonical replay-addressable IR, records accepted module-boundary history in
-PostgreSQL, and projects successful native runs into portable replay fixtures.
+Maida Workflows is a Python runtime for statically composed, durable,
+distributed, replayable AI workflows. It compiles workflow definitions into a
+canonical replay-addressable IR, schedules module attempts through durable task
+envelopes, records accepted module-boundary history in PostgreSQL, and projects
+successful native runs into portable replay fixtures.
 
 The package supports:
 
 - typed modules, branches, stable-key maps, parallel joins, and nested workflows;
-- durable PostgreSQL runs, tasks, attempts, events, definitions, and leases;
+- durable PostgreSQL scheduling, tasks, attempts, events, definitions, and leases;
+- process, container, VM, and microVM execution requirements with executor matching;
 - content-addressed artifacts and replay-complete accepted boundary records;
 - structural diff, zero-live-call full-stub replay, and isolated selective replay;
 - install as the `maida.workflows` namespace subpackage (`from maida import workflows`).
@@ -74,6 +76,17 @@ do not prove replay-complete module boundaries.
 
 ## Durable runtime
 
+Submitting and scheduling a workflow never executes module handlers. A
+`WorkflowScheduler` creates blocked tasks, makes them ready only after durable
+dependencies resolve, and can be reconstructed in another control-plane
+process with `WorkflowScheduler.resume()`. Executors claim only compatible
+ready work through `TaskEnvelope`; downstream tasks are released from accepted
+durable results rather than direct module-to-module calls.
+
+`WorkflowRunner` is the local-development convenience: it hosts the scheduler
+and a process executor together while preserving the same durable claim, lease,
+and compare-and-swap completion protocol used by remote workers.
+
 Start the local PostgreSQL service and migrate it:
 
 ```text
@@ -91,6 +104,9 @@ Key commands are:
 ```text
 maida-workflows compile --workflow package.module:workflow
 maida-workflows run --workflow package.module:workflow --input '{"request":"value"}'
+maida-workflows submit --workflow package.module:workflow --input '{"request":"value"}'
+maida-workflows schedule RUN_ID --workflow package.module:workflow
+maida-workflows worker --workflow package.module:workflow --worker-id worker-1
 maida-workflows trace export RUN_ID --output replay-fixtures/case
 maida-workflows diff replay-fixtures/case --workflow package.module:workflow
 maida-workflows replay replay-fixtures/case --workflow package.module:workflow --mode full-stub

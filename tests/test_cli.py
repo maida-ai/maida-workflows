@@ -23,6 +23,8 @@ def test_cli_help_and_compile_surface() -> None:
     for command in (
         "compile",
         "run",
+        "submit",
+        "schedule",
         "worker",
         "db",
         "trace",
@@ -77,6 +79,33 @@ async def test_cli_exports_replays_diffs_and_baselines_native_history(
     ]
     upgraded = runner.invoke(app, ["db", "upgrade", *common])
     assert upgraded.exit_code == 0
+
+    submitted = runner.invoke(
+        app,
+        [
+            "submit",
+            "--workflow",
+            "examples.workflow_creation.easy_first_workflow:workflow",
+            "--input",
+            '"Ada"',
+            *common,
+        ],
+    )
+    assert submitted.exit_code == 0, submitted.output
+    submitted_data = json.loads(submitted.stdout)
+    assert submitted_data["ready_tasks"] == 1
+    scheduled = runner.invoke(
+        app,
+        [
+            "schedule",
+            submitted_data["run_id"],
+            "--workflow",
+            "examples.workflow_creation.easy_first_workflow:workflow",
+            *common,
+        ],
+    )
+    assert scheduled.exit_code == 0, scheduled.output
+    assert json.loads(scheduled.stdout)["status"] == "RUNNING"
 
     live_run = await asyncio.to_thread(
         runner.invoke,
