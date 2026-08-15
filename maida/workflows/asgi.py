@@ -104,10 +104,15 @@ class UserplaneASGI:
             if method != "POST":
                 raise ValueError("workflow run creation requires POST")
             payload = await self._body(receive)
-            if set(payload) != {"input"}:
-                raise ValueError("run request must contain exactly the input field")
+            if set(payload) not in ({"input"}, {"input", "idempotency_key"}):
+                raise ValueError("run request must contain input and may contain idempotency_key")
             workflow = self.catalog.resolve_workflow(parts[2])
-            run = self.client.start(workflow, payload["input"], tenant_id=tenant_id)
+            run = self.client.start(
+                workflow,
+                payload["input"],
+                tenant_id=tenant_id,
+                idempotency_key=payload.get("idempotency_key"),
+            )
             snapshot = run.snapshot()
             await self._json(
                 send,

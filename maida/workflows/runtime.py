@@ -86,6 +86,7 @@ class DurableRuntimeStore(Protocol):
         root_input: StoredValue,
         execution_mode: ExecutionMode = ExecutionMode.LIVE,
         run_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> Any:
         """Persist a new run pinned to a compiled workflow definition."""
         ...
@@ -943,8 +944,29 @@ class WorkflowScheduler:
         *,
         tenant_id: str = "local",
         execution_mode: ExecutionMode = ExecutionMode.LIVE,
+        idempotency_key: str | None = None,
     ) -> WorkflowScheduler:
         """Compile and durably submit a workflow without running its modules.
+
+        Parameters
+        ----------
+        store
+            Durable control-plane store.
+        workflow, value
+            Trusted definition and typed root value.
+        tenant_id
+            Isolation scope for the durable run.
+        execution_mode
+            Live or verification-live execution classification.
+        idempotency_key
+            Optional tenant-scoped start identity. An exact retry reconstructs
+            the scheduler for the existing run and idempotently recreates no
+            logical tasks.
+
+        Returns
+        -------
+        WorkflowScheduler
+            Non-executing scheduler bound to the durable run.
 
         Static module occurrences are created as blocked tasks in the same
         durable run. A later scheduler pass materializes root-ready inputs;
@@ -962,6 +984,7 @@ class WorkflowScheduler:
             tenant_id=tenant_id,
             root_input=root_input,
             execution_mode=execution_mode,
+            idempotency_key=idempotency_key,
         )
         scheduler = cls(
             store,

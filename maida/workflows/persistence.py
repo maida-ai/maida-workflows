@@ -267,6 +267,7 @@ class PostgresStore:
         root_input: StoredValue,
         execution_mode: ExecutionMode = ExecutionMode.LIVE,
         run_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> Run:
         """Create a running workflow instance pinned to a compiled definition.
 
@@ -282,42 +283,92 @@ class PostgresStore:
             Live or verification-live execution classification.
         run_id
             Optional caller-supplied identifier; a UUID is generated otherwise.
+        idempotency_key
+            Optional tenant-scoped start identity. Exact retries return the
+            existing run; reuse with different definition, input, or execution
+            mode is rejected.
         """
+        if idempotency_key is not None and (
+            not isinstance(idempotency_key, str) or not idempotency_key.strip()
+        ):
+            raise ValueError("idempotency_key must be non-empty when supplied")
         self.register_definition(plan)
         identifier = run_id or str(uuid4())
+        request_digest = digest_data(
+            {
+                "definition_digest": plan.digest,
+                "execution_mode": execution_mode.value,
+                "root_input_digest": root_input.digest,
+                "root_input_schema_digest": root_input.schema_digest,
+            }
+        )
         with self.connect() as connection, connection.cursor() as cursor:
             self._register_value_artifact(cursor, root_input)
-            cursor.execute(
-                """
-                INSERT INTO workflow_runs (
-                    run_id, tenant_id, definition_digest, execution_mode, status,
-                    root_input, root_input_schema_digest
-                ) VALUES (%s, %s, %s, %s, 'RUNNING', %s, %s)
-                """,
-                (
-                    identifier,
-                    tenant_id,
-                    plan.digest,
-                    execution_mode.value,
-                    Jsonb(root_input.to_data()),
-                    root_input.schema_digest,
-                ),
-            )
-            self._append_event(
-                cursor,
+            parameters = (
                 identifier,
-                "RUN_STARTED",
-                {"execution_mode": execution_mode.value},
+                tenant_id,
+                plan.digest,
+                execution_mode.value,
+                Jsonb(root_input.to_data()),
+                root_input.schema_digest,
+                idempotency_key,
+                request_digest if idempotency_key is not None else None,
             )
-        return Run(
-            run_id=identifier,
-            tenant_id=tenant_id,
-            definition_digest=plan.digest,
-            execution_mode=execution_mode,
-            status=RunStatus.RUNNING,
-            root_input=root_input,
-            root_input_schema_digest=root_input.schema_digest,
-        )
+            if idempotency_key is None:
+                cursor.execute(
+                    """
+                    INSERT INTO workflow_runs (
+                        run_id, tenant_id, definition_digest, execution_mode, status,
+                        root_input, root_input_schema_digest, start_idempotency_key,
+                        start_request_digest
+                    ) VALUES (%s, %s, %s, %s, 'RUNNING', %s, %s, %s, %s)
+                    RETURNING *
+                    """,
+                    parameters,
+                )
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO workflow_runs (
+                        run_id, tenant_id, definition_digest, execution_mode, status,
+                        root_input, root_input_schema_digest, start_idempotency_key,
+                        start_request_digest
+                    ) VALUES (%s, %s, %s, %s, 'RUNNING', %s, %s, %s, %s)
+                    ON CONFLICT (tenant_id, start_idempotency_key)
+                    WHERE start_idempotency_key IS NOT NULL DO NOTHING
+                    RETURNING *
+                    """,
+                    parameters,
+                )
+            row = cursor.fetchone()
+            inserted = row is not None
+            if row is None:
+                cursor.execute(
+                    """
+                    SELECT * FROM workflow_runs
+                    WHERE tenant_id = %s AND start_idempotency_key = %s
+                    FOR SHARE
+                    """,
+                    (tenant_id, idempotency_key),
+                )
+                row = cursor.fetchone()
+                if row is None:  # pragma: no cover - unique conflict guarantees a row
+                    raise PersistenceError("idempotent run start lost its existing run")
+                if row["start_request_digest"] != request_digest:
+                    raise InvalidRunStateError(
+                        f"idempotency_key {idempotency_key!r} was reused with different content"
+                    )
+            if inserted:
+                self._append_event(
+                    cursor,
+                    str(row["run_id"]),
+                    "RUN_STARTED",
+                    {
+                        "execution_mode": execution_mode.value,
+                        "idempotent_start": idempotency_key is not None,
+                    },
+                )
+        return self._run_from_row(row)
 
     def enqueue_task(
         self,
@@ -2116,22 +2167,7 @@ class PostgresStore:
             canonical_ir=run_row["canonical_ir"],
             created_at=run_row["definition_created_at"],
         )
-        run = Run(
-            run_id=str(run_row["run_id"]),
-            tenant_id=run_row["tenant_id"],
-            definition_digest=run_row["definition_digest"],
-            execution_mode=ExecutionMode(run_row["execution_mode"]),
-            status=RunStatus(run_row["status"]),
-            root_input=StoredValue.from_data(run_row["root_input"]),
-            root_input_schema_digest=run_row["root_input_schema_digest"],
-            root_output=StoredValue.from_data(run_row["root_output"])
-            if run_row["root_output"]
-            else None,
-            root_output_schema_digest=run_row["root_output_schema_digest"],
-            replayable_reason=run_row["replayable_reason"],
-            created_at=run_row["created_at"],
-            completed_at=run_row["completed_at"],
-        )
+        run = self._run_from_row(run_row)
         return RunHistory(definition, run, tasks, attempts, events)
 
     def list_events(
@@ -2210,6 +2246,25 @@ class PostgresStore:
                 (str(row["run_id"]), row["tenant_id"], row["definition_digest"])
                 for row in cursor.fetchall()
             )
+
+    @staticmethod
+    def _run_from_row(row: Mapping[str, Any]) -> Run:
+        return Run(
+            run_id=str(row["run_id"]),
+            tenant_id=str(row["tenant_id"]),
+            definition_digest=str(row["definition_digest"]),
+            execution_mode=ExecutionMode(row["execution_mode"]),
+            status=RunStatus(row["status"]),
+            root_input=StoredValue.from_data(row["root_input"]),
+            root_input_schema_digest=str(row["root_input_schema_digest"]),
+            root_output=(
+                StoredValue.from_data(row["root_output"]) if row.get("root_output") else None
+            ),
+            root_output_schema_digest=row.get("root_output_schema_digest"),
+            replayable_reason=row.get("replayable_reason"),
+            created_at=row.get("created_at"),
+            completed_at=row.get("completed_at"),
+        )
 
     @staticmethod
     def _task_from_row(row: dict[str, Any]) -> Task:

@@ -89,7 +89,7 @@ async def test_asgi_starts_observes_and_commands_runs_without_execution_affinity
         app,
         "POST",
         "/v1/workflows/greeting-api/runs",
-        body={"input": "Ada"},
+        body={"input": "Ada", "idempotency_key": "webhook-123"},
     )
 
     assert status == 202
@@ -97,6 +97,14 @@ async def test_asgi_starts_observes_and_commands_runs_without_execution_affinity
     started = json.loads(content)
     assert started["status"] == "RUNNING"
     assert GreetingWorkflow.calls == 0
+    repeated_status, _, repeated_content = await _request(
+        app,
+        "POST",
+        "/v1/workflows/greeting-api/runs",
+        body={"input": "Ada", "idempotency_key": "webhook-123"},
+    )
+    assert repeated_status == 202
+    assert json.loads(repeated_content)["run_id"] == started["run_id"]
 
     status, _, content = await _request(app, "GET", f"/v1/runs/{started['run_id']}")
     assert status == 200

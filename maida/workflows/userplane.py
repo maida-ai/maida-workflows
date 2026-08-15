@@ -579,12 +579,37 @@ class WorkflowClient:
         *,
         tenant_id: str = "local",
         execution_mode: ExecutionMode = ExecutionMode.LIVE,
+        idempotency_key: str | None = None,
     ) -> WorkflowRun:
         """Create and schedule a run, returning its durable identity immediately.
 
+        Parameters
+        ----------
+        workflow, value
+            Trusted workflow definition and typed root input.
+        tenant_id
+            Application-derived isolation scope for the new run.
+        execution_mode
+            Live or verification-live execution classification.
+        idempotency_key
+            Optional tenant-scoped event/request identity. Repeating the key
+            with identical definition, input, and mode returns the same run.
+
+        Returns
+        -------
+        WorkflowRun
+            Reconnectable durable handle with no worker affinity.
+
+        Raises
+        ------
+        InvalidRunStateError
+            If the idempotency key was previously used for different content.
+
         The call validates the root input, persists the definition and run, and
         performs one non-executing scheduler pass so dependency-free tasks are
-        ready for remote executors.
+        ready for remote executors. ``idempotency_key`` is tenant-scoped;
+        repeating it with identical content returns the same run, while reuse
+        with different content fails closed.
         """
         scheduler = WorkflowScheduler.submit(
             self.store,
@@ -592,6 +617,7 @@ class WorkflowClient:
             value,
             tenant_id=tenant_id,
             execution_mode=execution_mode,
+            idempotency_key=idempotency_key,
         )
         scheduler.advance()
         return WorkflowRun(self.store, scheduler.run_id, tenant_id)
