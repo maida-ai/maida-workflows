@@ -19,6 +19,7 @@ from typing import Any, Never, Protocol, cast
 from ._canonical import canonical_data, canonical_json, digest_data
 from .alignment import project_execution_path
 from .artifacts import ArtifactError, ArtifactStore, ValueCodec
+from .dynamic import PlanFragmentIR, PlanSignature
 from .ir import PlanIR
 from .models import (
     BoundaryRecord,
@@ -31,7 +32,8 @@ from .models import (
 )
 from .persistence import PostgresStore
 
-FIXTURE_VERSION = "0.1.0"
+FIXTURE_VERSION = "0.2.0"
+LEGACY_FIXTURE_VERSION = "0.1.0"
 
 
 class FixtureErrorCode(StrEnum):
@@ -82,6 +84,86 @@ class ArtifactIntegrity:
 
 
 @dataclass(frozen=True)
+class GeneratedPlanRecord:
+    """Replay-complete provenance for one materialized generated region.
+
+    The source fragment bytes remain in the accepted planner boundary. This
+    record binds that boundary to its trusted resolved signature and every
+    generated node instance without duplicating planner payloads.
+    """
+
+    region_id: str
+    region_instance_id: str
+    source_task_id: str
+    source_instance_key: str
+    revision: int
+    supersedes: str | None
+    plan_digest: str
+    signature: PlanSignature
+    outputs: tuple[str, ...]
+    node_instances: tuple[tuple[str, str], ...]
+
+    def to_data(self) -> dict[str, Any]:
+        """Return canonical plan provenance and resolved behavior data."""
+        return {
+            "node_instances": [
+                {"instance_key": instance_key, "node_key": node_key}
+                for node_key, instance_key in self.node_instances
+            ],
+            "outputs": list(self.outputs),
+            "plan_digest": self.plan_digest,
+            "region_id": self.region_id,
+            "region_instance_id": self.region_instance_id,
+            "revision": self.revision,
+            "signature": self.signature.to_dict(),
+            "source_instance_key": self.source_instance_key,
+            "source_task_id": self.source_task_id,
+            "supersedes": self.supersedes,
+        }
+
+    @classmethod
+    def from_data(cls, data: dict[str, Any]) -> GeneratedPlanRecord:
+        """Restore strict generated-plan provenance from a fixture manifest."""
+        expected = {
+            "node_instances",
+            "outputs",
+            "plan_digest",
+            "region_id",
+            "region_instance_id",
+            "revision",
+            "signature",
+            "source_instance_key",
+            "source_task_id",
+            "supersedes",
+        }
+        if not isinstance(data, dict) or set(data) != expected:
+            raise ValueError("generated plan record fields are invalid")
+        nodes = data["node_instances"]
+        if not isinstance(nodes, list) or any(
+            not isinstance(item, dict) or set(item) != {"instance_key", "node_key"}
+            for item in nodes
+        ):
+            raise ValueError("generated plan node instances are invalid")
+        record = cls(
+            region_id=str(data["region_id"]),
+            region_instance_id=str(data["region_instance_id"]),
+            source_task_id=str(data["source_task_id"]),
+            source_instance_key=str(data["source_instance_key"]),
+            revision=int(data["revision"]),
+            supersedes=data["supersedes"],
+            plan_digest=str(data["plan_digest"]),
+            signature=PlanSignature.from_dict(data["signature"]),
+            outputs=tuple(data["outputs"]),
+            node_instances=tuple(
+                (str(item["node_key"]), str(item["instance_key"])) for item in nodes
+            ),
+        )
+        if record.to_data() != data:
+            raise ValueError("generated plan record is not canonical")
+        return record
+
+
+@dataclass(frozen=True)
 class ReplayFixture:
     """Immutable replay projection of one successful native workflow run.
 
@@ -116,11 +198,12 @@ class ReplayFixture:
     control_decisions: tuple[dict[str, Any], ...]
     artifacts: tuple[ArtifactIntegrity, ...]
     values: ValueCodec = field(compare=False, repr=False)
+    generated_plans: tuple[GeneratedPlanRecord, ...] = ()
     bundle_path: Path | None = field(default=None, compare=False)
 
     def to_manifest(self) -> dict[str, Any]:
         """Return the canonical JSON-compatible fixture manifest."""
-        return cast(
+        manifest = cast(
             dict[str, Any],
             canonical_data(
                 {
@@ -152,6 +235,9 @@ class ReplayFixture:
                 }
             ),
         )
+        if self.version == FIXTURE_VERSION:
+            manifest["generated_plans"] = [record.to_data() for record in self.generated_plans]
+        return manifest
 
     @property
     def digest(self) -> str:
@@ -266,8 +352,9 @@ class ReplayFixtureExporter:
             for event in history.events
             if event.event_type in {"BRANCH_DECISION", "MAP_DECISION"}
         )
+        generated = self._generated_records(history)
         return ReplayFixture(
-            version=FIXTURE_VERSION,
+            version=FIXTURE_VERSION if generated else LEGACY_FIXTURE_VERSION,
             source=SourceProvenance(
                 kind="native_workflow_run",
                 run_id=history.run.run_id,
@@ -282,6 +369,7 @@ class ReplayFixtureExporter:
             control_decisions=controls,
             artifacts=tuple(artifacts[digest] for digest in sorted(artifacts)),
             values=self.source_values,
+            generated_plans=generated,
         )
 
     def export(self, history: RunHistory, output: Path) -> ReplayFixture:
@@ -398,11 +486,106 @@ class ReplayFixtureExporter:
                 self._history_incomplete(f"map node {step.node_id!r} has duplicate item keys")
             expected[key] += len(item_keys)
 
+        generated_instances = {
+            task.accepted_boundary.instance_key
+            for task in history.tasks
+            if task.plan_provenance is not None and task.accepted_boundary is not None
+        }
         actual = Counter(
-            (boundary.module_id, boundary.logical_step) for boundary in history.accepted_boundaries
+            (boundary.module_id, boundary.logical_step)
+            for boundary in history.accepted_boundaries
+            if boundary.instance_key not in generated_instances
         )
         if actual != expected:
             self._history_incomplete("accepted boundaries do not cover the recorded execution path")
+
+        self._generated_records(history)
+
+    def _generated_records(self, history: RunHistory) -> tuple[GeneratedPlanRecord, ...]:
+        boundaries_by_task = {
+            task.task_id: task.accepted_boundary
+            for task in history.tasks
+            if task.accepted_boundary is not None
+        }
+        tasks_by_id = {task.task_id: task for task in history.tasks}
+        records: list[GeneratedPlanRecord] = []
+        seen_instances: set[str] = set()
+        for event in history.events:
+            if event.event_type != "PLAN_MATERIALIZED":
+                continue
+            payload = event.payload
+            try:
+                signature = PlanSignature.from_dict(payload["signature"])
+                source_task_id = str(payload["source_task_id"])
+                source_boundary = boundaries_by_task[source_task_id]
+                if source_boundary is None:
+                    raise KeyError(source_task_id)
+                source_data = self.source_values.decode(source_boundary.output_value)
+                fragment = PlanFragmentIR.from_dict(cast(dict[str, Any], source_data))
+                if fragment.digest != payload["plan_digest"]:
+                    raise ValueError("accepted fragment digest changed")
+                if (
+                    signature.source_fragment_digest != fragment.digest
+                    or signature.region_id != payload["region_id"]
+                    or signature.revision != fragment.revision
+                    or signature.supersedes != fragment.supersedes
+                    or signature.outputs != fragment.outputs
+                    or signature.digest != payload["signature_digest"]
+                ):
+                    raise ValueError("resolved plan signature changed")
+                node_instances: list[tuple[str, str]] = []
+                raw_nodes = payload["node_task_ids"]
+                if not isinstance(raw_nodes, list):
+                    raise ValueError("node task identities are invalid")
+                for item in raw_nodes:
+                    node_key = str(item["node_key"])
+                    task = tasks_by_id[str(item["task_id"])]
+                    provenance = task.plan_provenance
+                    if (
+                        provenance is None
+                        or provenance.node_key != node_key
+                        or provenance.plan_digest != fragment.digest
+                        or task.accepted_boundary is None
+                    ):
+                        raise ValueError("generated task provenance is incomplete")
+                    instance_key = task.accepted_boundary.instance_key
+                    if instance_key in seen_instances:
+                        raise ValueError("generated boundary instance is duplicated")
+                    seen_instances.add(instance_key)
+                    node_instances.append((node_key, instance_key))
+                records.append(
+                    GeneratedPlanRecord(
+                        region_id=str(payload["region_id"]),
+                        region_instance_id=str(payload["region_instance_id"]),
+                        source_task_id=source_task_id,
+                        source_instance_key=source_boundary.instance_key,
+                        revision=int(payload["revision"]),
+                        supersedes=payload.get("supersedes"),
+                        plan_digest=fragment.digest,
+                        signature=signature,
+                        outputs=tuple(payload["outputs"]),
+                        node_instances=tuple(sorted(node_instances)),
+                    )
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                self._history_incomplete(f"generated plan history is incomplete: {exc}")
+        generated_tasks = {
+            task.accepted_boundary.instance_key
+            for task in history.tasks
+            if task.plan_provenance is not None and task.accepted_boundary is not None
+        }
+        if generated_tasks != seen_instances:
+            self._history_incomplete("generated boundaries are not covered by plan history")
+        return tuple(
+            sorted(
+                records,
+                key=lambda item: (
+                    item.region_instance_id,
+                    item.revision,
+                    item.plan_digest,
+                ),
+            )
+        )
 
     @staticmethod
     def _history_incomplete(message: str) -> Never:
@@ -459,10 +642,10 @@ def load_fixture(path: Path) -> ReplayFixture:
             FixtureErrorCode.FIXTURE_INVALID,
             "fixture manifest is not canonical JSON",
         )
-    if data.get("version") != FIXTURE_VERSION:
+    if data.get("version") not in {LEGACY_FIXTURE_VERSION, FIXTURE_VERSION}:
         raise ReplayFixtureError(
             FixtureErrorCode.FIXTURE_VERSION_UNSUPPORTED,
-            f"expected fixture {FIXTURE_VERSION}, found {data.get('version')!r}",
+            f"expected a supported fixture version, found {data.get('version')!r}",
         )
     try:
         workflow = data["workflow"]
@@ -484,6 +667,9 @@ def load_fixture(path: Path) -> ReplayFixture:
             control_decisions=tuple(data["control_decisions"]),
             artifacts=tuple(ArtifactIntegrity(**item) for item in data["artifacts"]),
             values=codec,
+            generated_plans=tuple(
+                GeneratedPlanRecord.from_data(item) for item in data.get("generated_plans", [])
+            ),
             bundle_path=bundle_root,
         )
     except ReplayFixtureError:
@@ -491,7 +677,7 @@ def load_fixture(path: Path) -> ReplayFixture:
     except (KeyError, TypeError, ValueError) as exc:
         raise ReplayFixtureError(
             FixtureErrorCode.FIXTURE_INVALID,
-            "fixture manifest does not satisfy ReplayFixture 0.1.0",
+            "fixture manifest does not satisfy its replay contract",
         ) from exc
     if fixture.to_manifest() != data:
         raise ReplayFixtureError(
@@ -528,4 +714,74 @@ def _validate_loaded_integrity(fixture: ReplayFixture) -> None:
                 raise ReplayFixtureError(
                     FixtureErrorCode.ARTIFACT_INTEGRITY,
                     f"artifact {integrity.digest} size does not match its manifest",
+                )
+    boundaries = {boundary.instance_key: boundary for boundary in fixture.boundaries}
+    generated_instances: set[str] = set()
+    for record in fixture.generated_plans:
+        source = boundaries.get(record.source_instance_key)
+        if source is None:
+            raise ReplayFixtureError(
+                FixtureErrorCode.FIXTURE_INVALID,
+                "generated plan source boundary is absent",
+            )
+        try:
+            source_data = fixture.values.decode(source.output_value)
+            fragment = PlanFragmentIR.from_dict(cast(dict[str, Any], source_data))
+        except (TypeError, ValueError, ArtifactError) as exc:
+            raise ReplayFixtureError(
+                FixtureErrorCode.FIXTURE_INVALID,
+                "generated plan source value is invalid",
+            ) from exc
+        if (
+            fragment.digest != record.plan_digest
+            or record.signature.source_fragment_digest != record.plan_digest
+            or fragment.revision != record.revision
+            or fragment.supersedes != record.supersedes
+            or fragment.outputs != record.outputs
+            or record.signature.outputs != record.outputs
+            or record.signature.region_id != record.region_id
+        ):
+            raise ReplayFixtureError(
+                FixtureErrorCode.FIXTURE_INVALID,
+                "generated plan lineage or signature is inconsistent",
+            )
+        instances = dict(record.node_instances)
+        descriptors = {
+            cast(str, descriptor["key"]): descriptor
+            for descriptor in record.signature.resolved_nodes
+        }
+        if set(instances) != set(descriptors):
+            raise ReplayFixtureError(
+                FixtureErrorCode.FIXTURE_INVALID,
+                "generated plan node coverage is inconsistent",
+            )
+        for node_key, instance_key in record.node_instances:
+            if instance_key in generated_instances:
+                raise ReplayFixtureError(
+                    FixtureErrorCode.FIXTURE_INVALID,
+                    "generated boundary instance appears in multiple plans",
+                )
+            generated_instances.add(instance_key)
+            generated_boundary = boundaries.get(instance_key)
+            descriptor = descriptors[node_key]
+            if generated_boundary is None or (
+                generated_boundary.module_id != descriptor["module_id"]
+                or generated_boundary.logical_step != f"dynamic/{record.region_id}/nodes/{node_key}"
+                or generated_boundary.module_digest != descriptor["module_digest"]
+                or generated_boundary.output_schema_digest != descriptor["output_schema_digest"]
+            ):
+                raise ReplayFixtureError(
+                    FixtureErrorCode.FIXTURE_INVALID,
+                    "generated boundary does not match its trusted descriptor",
+                )
+            expected_dependencies = [record.source_instance_key]
+            for dependency in cast(tuple[str, ...], descriptor["dependencies"]):
+                if dependency != "$input":
+                    expected_dependencies.append(instances[dependency])
+            if generated_boundary.dependency_instance_keys != tuple(
+                dict.fromkeys(expected_dependencies)
+            ):
+                raise ReplayFixtureError(
+                    FixtureErrorCode.FIXTURE_INVALID,
+                    "generated boundary dependency topology is inconsistent",
                 )

@@ -68,7 +68,7 @@ from .dynamic import (
     PlanValidationError,
     PlanValidator,
 )
-from .fixture import ReplayFixture, ReplayFixtureError, ReplayFixtureImporter
+from .fixture import GeneratedPlanRecord, ReplayFixture, ReplayFixtureError, ReplayFixtureImporter
 from .interactions import Approval, ApprovalDecision, Input, WaitForSignal
 from .ir import (
     BindingIR,
@@ -192,6 +192,7 @@ __all__ = [
     "ExecutionSpec",
     "Executor",
     "ExecutorCapabilities",
+    "GeneratedPlanRecord",
     "Idempotency",
     "Input",
     "InputCommand",

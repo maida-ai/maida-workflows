@@ -33,11 +33,12 @@ from .authoring import (
     _WorkflowBinding,
 )
 from .budget import BudgetExceededError, BudgetUsage
+from .dynamic import PlanFragmentIR, PlanSignature, PlanValidationError, PlanValidator
 from .fixture import ReplayFixture, _validate_loaded_integrity
 from .interactions import _InteractionModule
-from .ir import PlanIR, ReplayKey, _compile_workflow_graph
+from .ir import BindingIR, PlanIR, ReplayKey, StepIR, _compile_workflow_graph, module_digest
 from .model import ModelAdapterRegistry, ModelBroker, ModelSpec
-from .models import EffectKind, EffectRecord, Usage
+from .models import BoundaryRecord, EffectKind, EffectRecord, Usage
 from .runtime import _coerce_trajectory, _rehydrate, _stable_instance_id
 
 
@@ -423,6 +424,14 @@ class ReplayEngine:
         Credential and adapter restrictions for live replay work.
     model_adapters
         Explicit replay-safe model providers available to selected modules.
+    generated_validators
+        Trusted current validators keyed by generated-region identity. A
+        fixture containing generated plans cannot replay without the matching
+        validator because imported resolved signatures are never authority.
+    generated_modules
+        Exact current module objects for generated replay keys. Full-stub uses
+        them only to validate typed contracts; selective replay may execute an
+        explicitly selected non-effectful boundary.
 
     Raises
     ------
@@ -438,12 +447,16 @@ class ReplayEngine:
         broker_factory: Callable[[], ReplayBroker] = ReplayBroker,
         worker_policy: ReplayWorkerPolicy | None = None,
         model_adapters: ModelAdapterRegistry | None = None,
+        generated_validators: Mapping[str, PlanValidator] | None = None,
+        generated_modules: Mapping[ReplayKey, Module[Any, Any]] | None = None,
     ) -> None:
         self.aligner = aligner or GraphAligner()
         self.trace_bridge = trace_bridge or MaidaTraceBridge()
         self.broker_factory = broker_factory
         self.worker_policy = worker_policy or ReplayWorkerPolicy()
         self.model_adapters = model_adapters or ModelAdapterRegistry()
+        self.generated_validators = dict(generated_validators or {})
+        self.generated_modules = dict(generated_modules or {})
         if self.worker_policy.production_effect_adapters:
             raise ReplayContractError("replay workers cannot register production effect adapters")
 
@@ -499,7 +512,20 @@ class ReplayEngine:
                 blocking=False,
                 message=f"graph correspondence stopped at {change.location}",
             )
+        generated_signatures, generated_divergence = self._align_generated(case.fixture)
+        if generated_divergence is not None:
+            return ReplayResult(
+                status=ReplayStatus.REPLAY_DIVERGENCE,
+                mode=case.mode,
+                divergence=generated_divergence,
+                blocking=False,
+                message=(
+                    "generated graph correspondence stopped at "
+                    f"{generated_divergence.change.location}"
+                ),
+            )
         self._validate_contracts(workflow, current, case.fixture)
+        self._validate_generated_contracts(case.fixture, generated_signatures)
         historical_output = await _StubGraphExecutor(current, case.fixture).execute(
             workflow,
             compiled.output,
@@ -521,7 +547,88 @@ class ReplayEngine:
             case,
             historical_output,
             compiled.output,
+            generated_signatures,
         )
+
+    def _align_generated(
+        self, fixture: ReplayFixture
+    ) -> tuple[dict[tuple[str, int], PlanSignature], ReplayDivergence | None]:
+        current: dict[tuple[str, int], PlanSignature] = {}
+        for record in fixture.generated_plans:
+            validator = self.generated_validators.get(record.region_id)
+            if validator is None:
+                raise ReplayContractError(
+                    f"generated region {record.region_id!r} has no trusted current validator"
+                )
+            source = _boundary_by_instance(fixture, record.source_instance_key)
+            fragment = _decode_fragment(fixture, source)
+            try:
+                signature = validator.validate(
+                    fragment,
+                    region_input_schema_digest=source.input_schema_digest,
+                    expected_output_schema_digests=record.signature.output_schema_digests,
+                    expected_revision=record.revision,
+                    expected_supersedes=record.supersedes,
+                )
+            except PlanValidationError as exc:
+                raise ReplayContractError(
+                    f"generated region {record.region_id!r} no longer satisfies policy: {exc.code}"
+                ) from exc
+            alignment = self.aligner.align(
+                _signature_plan(record.signature),
+                _signature_plan(signature),
+            )
+            if alignment.diff.first_divergence is not None:
+                change = alignment.diff.first_divergence
+                return current, ReplayDivergence(change, alignment.diff)
+            current[(record.region_instance_id, record.revision)] = signature
+        return current, None
+
+    def _validate_generated_contracts(
+        self,
+        fixture: ReplayFixture,
+        signatures: Mapping[tuple[str, int], PlanSignature],
+    ) -> None:
+        for record in fixture.generated_plans:
+            signature = signatures[(record.region_instance_id, record.revision)]
+            descriptors = {
+                cast(str, descriptor["key"]): descriptor for descriptor in signature.resolved_nodes
+            }
+            for node_key, instance_key in record.node_instances:
+                boundary = _boundary_by_instance(fixture, instance_key)
+                descriptor = descriptors[node_key]
+                key = ReplayKey(
+                    cast(str, descriptor["module_id"]),
+                    f"dynamic/{record.region_id}/nodes/{node_key}",
+                )
+                module = self.generated_modules.get(key)
+                if module is None:
+                    raise ReplayContractError(
+                        f"generated boundary {key.as_string()} has no current module binding"
+                    )
+                if module_digest(module) != descriptor["module_digest"]:
+                    raise ReplayContractError(
+                        f"generated module {key.as_string()} does not match its trusted catalog pin"
+                    )
+                if boundary.input_schema_digest != schema_digest(
+                    module.input_type
+                ) or boundary.output_schema_digest != schema_digest(module.output_type):
+                    raise ReplayContractError(
+                        f"generated boundary {boundary.instance_key} cannot be injected "
+                        "into current schemas"
+                    )
+                recorded_input = _rehydrate(
+                    fixture.values.decode(boundary.input_value), module.input_type
+                )
+                recorded_output = _rehydrate(
+                    fixture.values.decode(boundary.output_value), module.output_type
+                )
+                if not value_matches_type(recorded_input, module.input_type):
+                    raise ReplayContractError(f"recorded input violates {key.as_string()} contract")
+                if not value_matches_type(recorded_output, module.output_type):
+                    raise ReplayContractError(
+                        f"recorded output violates {key.as_string()} contract"
+                    )
 
     def _validate_contracts(
         self,
@@ -542,8 +649,15 @@ class ReplayEngine:
             for step in current.executable_steps
             if step.replay_key is not None
         }
+        generated_instances = {
+            instance_key
+            for record in fixture.generated_plans
+            for _node_key, instance_key in record.node_instances
+        }
         seen_instances: set[str] = set()
         for boundary in fixture.boundaries:
+            if boundary.instance_key in generated_instances:
+                continue
             key = ReplayKey(boundary.module_id, boundary.logical_step)
             step = current_by_key.get(key)
             if step is None:
@@ -576,11 +690,13 @@ class ReplayEngine:
         case: ReplayCase,
         historical_output: Any,
         built_output: RuntimeValue[Any],
+        generated_signatures: Mapping[tuple[str, int], PlanSignature],
     ) -> ReplayResult:
         selected = set(case.live_steps)
         available = {
             step.replay_key for step in current.executable_steps if step.replay_key is not None
         }
+        available.update(self.generated_modules)
         unknown = selected - available
         if unknown:
             labels = ", ".join(sorted(key.as_string() for key in unknown))
@@ -596,6 +712,7 @@ class ReplayEngine:
                 f"selected step(s) have no recorded execution in this fixture: {labels}"
             )
         modules = build_module_registry(workflow, current, output=built_output)
+        modules.update(self.generated_modules)
         comparisons: list[StepComparison] = []
         traces: list[str] = []
         usage = Usage()
@@ -697,6 +814,25 @@ class ReplayEngine:
                 raise ReplayContractError(
                     f"selective output from {key.as_string()} violates its current schema"
                 )
+            generated_divergence = self._validate_live_planner_output(
+                case.fixture,
+                boundary,
+                output,
+                generated_signatures,
+            )
+            if generated_divergence is not None:
+                return ReplayResult(
+                    status=ReplayStatus.REPLAY_DIVERGENCE,
+                    mode=case.mode,
+                    comparisons=tuple(comparisons),
+                    divergence=generated_divergence,
+                    trace_ids=tuple([*traces, *([trace_id] if trace_id else [])]),
+                    blocking=False,
+                    message=(
+                        "selective planner produced an incompatible generated graph at "
+                        f"{generated_divergence.change.location}"
+                    ),
+                )
             current_digest = digest_data(output)
             current_trajectories = tuple(
                 _coerce_trajectory(item) for item in metadata.get("trajectories", [])
@@ -745,11 +881,136 @@ class ReplayEngine:
             message="downstream continuation used accepted historical outputs",
         )
 
+    def _validate_live_planner_output(
+        self,
+        fixture: ReplayFixture,
+        boundary: BoundaryRecord,
+        output: Any,
+        current_signatures: Mapping[tuple[str, int], PlanSignature],
+    ) -> ReplayDivergence | None:
+        records = tuple(
+            record
+            for record in fixture.generated_plans
+            if record.source_instance_key == boundary.instance_key
+        )
+        if not records:
+            return None
+        try:
+            fragment = PlanFragmentIR.from_dict(cast(Mapping[str, Any], output))
+        except (TypeError, ValueError) as exc:
+            raise ReplayContractError(
+                "selective planner output is not a canonical generated fragment"
+            ) from exc
+        for record in records:
+            validator = self.generated_validators[record.region_id]
+            try:
+                proposed = validator.validate(
+                    fragment,
+                    region_input_schema_digest=boundary.input_schema_digest,
+                    expected_output_schema_digests=record.signature.output_schema_digests,
+                    expected_revision=record.revision,
+                    expected_supersedes=record.supersedes,
+                )
+            except PlanValidationError as exc:
+                raise ReplayContractError(
+                    f"selective planner output failed generated policy: {exc.code}"
+                ) from exc
+            current = current_signatures[(record.region_instance_id, record.revision)]
+            alignment = self.aligner.align(_signature_plan(current), _signature_plan(proposed))
+            if alignment.diff.first_divergence is not None:
+                return ReplayDivergence(alignment.diff.first_divergence, alignment.diff)
+        return None
+
 
 @dataclass(frozen=True)
 class _StubEvaluation:
     value: Any
     dependency_instance_keys: tuple[str, ...] = ()
+
+
+def _boundary_by_instance(fixture: ReplayFixture, instance_key: str) -> BoundaryRecord:
+    boundary = next(
+        (item for item in fixture.boundaries if item.instance_key == instance_key),
+        None,
+    )
+    if boundary is None:
+        raise ReplayContractError(f"recorded boundary {instance_key!r} is unavailable")
+    return boundary
+
+
+def _decode_fragment(fixture: ReplayFixture, boundary: BoundaryRecord) -> PlanFragmentIR:
+    try:
+        value = fixture.values.decode(boundary.output_value)
+        return PlanFragmentIR.from_dict(cast(Mapping[str, Any], value))
+    except (TypeError, ValueError) as exc:
+        raise ReplayContractError(
+            f"recorded planner boundary {boundary.instance_key} is not a canonical fragment"
+        ) from exc
+
+
+def _signature_plan(signature: PlanSignature) -> PlanIR:
+    """Project one resolved generated signature into the shared graph model."""
+    steps: list[StepIR] = []
+    for descriptor in signature.resolved_nodes:
+        node_key = cast(str, descriptor["key"])
+        dependencies = tuple(
+            "input" if dependency == "$input" else f"nodes/{dependency}"
+            for dependency in cast(tuple[str, ...], descriptor["dependencies"])
+        )
+        input_schemas = tuple(cast(tuple[str, ...], descriptor["input_schema_digests"]))
+        input_schema = (
+            input_schemas[0]
+            if len(input_schemas) == 1
+            else digest_data({"ordered_input_schemas": input_schemas})
+        )
+        binding = BindingIR(
+            schema_digest=input_schema,
+            kind="source",
+            source=dependencies[0] if dependencies else "input",
+        )
+        steps.append(
+            StepIR(
+                node_id=f"nodes/{node_key}",
+                kind="module",
+                dependencies=dependencies,
+                output_schema_digest=cast(str, descriptor["output_schema_digest"]),
+                module_id=cast(str, descriptor["module_id"]),
+                logical_step=f"dynamic/{signature.region_id}/nodes/{node_key}",
+                module_digest=cast(str, descriptor["module_digest"]),
+                definition_digest=digest_data(
+                    {
+                        "module_id": descriptor["module_id"],
+                        "module_digest": descriptor["module_digest"],
+                        "logical_step": f"dynamic/{signature.region_id}/nodes/{node_key}",
+                    }
+                ),
+                input_binding=binding,
+                execution=cast(Mapping[str, Any], descriptor["execution"]),
+                capabilities=tuple(cast(tuple[Mapping[str, Any], ...], descriptor["capabilities"])),
+                effects=tuple(cast(tuple[Mapping[str, Any], ...], descriptor["effects"])),
+                budget=cast(Mapping[str, int | float | None], descriptor["budget"]),
+            )
+        )
+    output_dependencies = tuple(f"nodes/{key}" for key in signature.outputs)
+    steps.append(
+        StepIR(
+            node_id="output",
+            kind="parallel",
+            dependencies=output_dependencies,
+            output_schema_digest=digest_data(
+                {"ordered_output_schemas": signature.output_schema_digests}
+            ),
+            control={"region": "generated_output", "outputs": signature.outputs},
+        )
+    )
+    return PlanIR(
+        version="0.4.0",
+        workflow_id=f"dynamic:{signature.region_id}",
+        input_schema={"digest": signature.region_input_schema_digest},
+        output_schema={"digests": list(signature.output_schema_digests)},
+        steps=tuple(steps),
+        output_node="output",
+    )
 
 
 class _StubGraphExecutor:
@@ -798,7 +1059,16 @@ class _StubGraphExecutor:
             raise ReplayContractError(
                 "injected graph result does not match the recorded root output"
             )
-        expected_boundaries = {boundary.instance_key for boundary in self.fixture.boundaries}
+        generated_instances = {
+            instance_key
+            for record in self.fixture.generated_plans
+            for _node_key, instance_key in record.node_instances
+        }
+        expected_boundaries = {
+            boundary.instance_key
+            for boundary in self.fixture.boundaries
+            if boundary.instance_key not in generated_instances
+        }
         missing = expected_boundaries - self.used_boundaries
         if missing:
             raise ReplayContractError(
