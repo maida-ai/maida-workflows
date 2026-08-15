@@ -1,3 +1,10 @@
+"""Exercise branch, stable-map, nested, parallel, and effect boundaries.
+
+These deterministic workflows provide compact integration fixtures for
+compiler, runtime, fixture, and full-stub replay tests. They are also useful as
+reference compositions when validating custom stores or replay integrations.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -14,6 +21,8 @@ from maida.workflows import (
 
 
 class IsEscalated(Module[dict[str, object], bool]):
+    """Read an escalation flag from a request mapping."""
+
     input_type = dict[str, object]
     output_type = bool
 
@@ -22,6 +31,8 @@ class IsEscalated(Module[dict[str, object], bool]):
 
 
 class Route(Module[dict[str, object], str]):
+    """Return the queue configured for one explicit branch occurrence."""
+
     input_type = dict[str, object]
     output_type = str
 
@@ -33,6 +44,8 @@ class Route(Module[dict[str, object], str]):
 
 
 class AdversarialBranchWorkflow(Workflow[dict[str, object], str]):
+    """Compile two routes and choose one from a runtime escalation flag."""
+
     workflow_id = "adversarial-branch"
     input_type = dict[str, object]
     output_type = str
@@ -50,11 +63,15 @@ class AdversarialBranchWorkflow(Workflow[dict[str, object], str]):
 
 @dataclass(frozen=True)
 class BatchItem:
+    """Mapped item with stable domain identity and a text payload."""
+
     stable_id: str
     payload: str
 
 
 class NormalizeItem(Module[BatchItem, str]):
+    """Normalize the payload of one stable mapped item."""
+
     input_type = BatchItem
     output_type = str
 
@@ -63,6 +80,8 @@ class NormalizeItem(Module[BatchItem, str]):
 
 
 class AdversarialMapWorkflow(Workflow[list[BatchItem], list[str]]):
+    """Map normalization by stable item ID rather than list position."""
+
     workflow_id = "adversarial-map"
     input_type = list[BatchItem]
     output_type = list[str]
@@ -77,6 +96,8 @@ class AdversarialMapWorkflow(Workflow[list[BatchItem], list[str]]):
 
 
 class Review(Module[str, str]):
+    """Produce a deterministic review marker for an input string."""
+
     input_type = str
     output_type = str
 
@@ -85,6 +106,8 @@ class Review(Module[str, str]):
 
 
 class ChildReviewWorkflow(Workflow[str, str]):
+    """Wrap the review module as a reusable child workflow."""
+
     workflow_id = "adversarial-child-review"
     input_type = str
     output_type = str
@@ -95,6 +118,8 @@ class ChildReviewWorkflow(Workflow[str, str]):
 
 
 class AuditEffect(Module[str, str]):
+    """Effect-classified boundary used to prove replay never invokes effects."""
+
     input_type = str
     output_type = str
     effectful = True
@@ -104,6 +129,8 @@ class AuditEffect(Module[str, str]):
 
 
 class AdversarialNestedEffectWorkflow(Workflow[str, tuple[str, str]]):
+    """Join a nested review with an explicitly effectful audit boundary."""
+
     workflow_id = "adversarial-nested-effect"
     input_type = str
     output_type = tuple[str, str]

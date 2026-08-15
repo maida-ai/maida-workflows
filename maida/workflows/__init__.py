@@ -1,3 +1,27 @@
+"""Build, run, and replay typed Maida workflows.
+
+The package-level namespace contains the stable authoring and execution API.
+Start with :class:`Module` and :class:`Workflow`, compile definitions with
+:func:`compile_workflow`, and use :class:`WorkflowRunner` for local durable
+execution.
+
+Examples
+--------
+>>> from maida.workflows import ExecutionContext, Module, RuntimeValue, Workflow
+>>> class Upper(Module[str, str]):
+...     input_type = str
+...     output_type = str
+...     async def execute(self, value: str, ctx: ExecutionContext) -> str:
+...         return value.upper()
+>>> class UpperWorkflow(Workflow[str, str]):
+...     workflow_id = "upper"
+...     input_type = str
+...     output_type = str
+...     upper = Upper()
+...     def build(self, value: RuntimeValue[str]) -> RuntimeValue[str]:
+...         return self.upper(value)
+"""
+
 from .authoring import (
     BoundModuleCall,
     ExecutionContext,

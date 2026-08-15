@@ -1,3 +1,11 @@
+"""Store immutable value payloads by content digest on the local filesystem.
+
+Small canonical values can remain inline in :class:`StoredValue`; larger values
+are written through :class:`ArtifactStore`. :class:`ValueCodec` presents the
+same encode/decode interface for both representations and verifies every digest
+before returning bytes.
+"""
+
 from __future__ import annotations
 
 import json
@@ -14,18 +22,29 @@ class ArtifactError(RuntimeError):
 
 
 class MissingArtifactError(ArtifactError):
-    pass
+    """Raised when a referenced content-addressed blob does not exist."""
 
 
 class CorruptArtifactError(ArtifactError):
-    pass
+    """Raised when stored bytes do not match their expected digest."""
 
 
 class UnavailableValueError(ArtifactError):
-    pass
+    """Raised when a required value was recorded as unavailable."""
 
 
 class ArtifactStore:
+    """Private filesystem store for immutable SHA-256-addressed bytes.
+
+    Parameters
+    ----------
+    root
+        Directory containing digest-partitioned blob paths.
+    create
+        Create ``root`` with restrictive permissions when true. Set to false
+        when opening an existing read-only bundle.
+    """
+
     def __init__(self, root: Path, *, create: bool = True) -> None:
         self.root = root
         if create:
@@ -33,11 +52,22 @@ class ArtifactStore:
             os.chmod(self.root, 0o700)
 
     def relative_path(self, digest: str) -> Path:
+        """Return the two-level relative path for a validated SHA-256 digest.
+
+        Raises
+        ------
+        ValueError
+            If ``digest`` is not lowercase 64-character hexadecimal text.
+        """
         if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
             raise ValueError("artifact digest must be a lowercase SHA-256 hex value")
         return Path(digest[:2]) / digest[2:]
 
     def put(self, content: bytes) -> str:
+        """Store immutable bytes and return their SHA-256 content address.
+
+        Existing identical content is reused without mutation.
+        """
         digest = digest_bytes(content)
         relative = self.relative_path(digest)
         directory = self.root / relative.parent
@@ -57,6 +87,15 @@ class ArtifactStore:
         return digest
 
     def get(self, digest: str) -> bytes:
+        """Load bytes after verifying their path and content digest.
+
+        Raises
+        ------
+        MissingArtifactError
+            If the digest path does not exist.
+        CorruptArtifactError
+            If the stored bytes hash to a different digest.
+        """
         path = self.root / self.relative_path(digest)
         try:
             content = path.read_bytes()
@@ -69,6 +108,17 @@ class ArtifactStore:
 
 
 class ValueCodec:
+    """Encode typed canonical values inline or through an artifact store.
+
+    Parameters
+    ----------
+    artifacts
+        Content-addressed store for values larger than ``inline_limit``.
+    inline_limit
+        Maximum canonical JSON byte length retained inline. Zero forces all
+        non-empty values into the artifact store.
+    """
+
     def __init__(self, artifacts: ArtifactStore, *, inline_limit: int = 16_384) -> None:
         if inline_limit < 0:
             raise ValueError("inline_limit must not be negative")
@@ -76,6 +126,20 @@ class ValueCodec:
         self.inline_limit = inline_limit
 
     def encode(self, value: Any, *, schema_digest: str) -> StoredValue:
+        """Encode a value and choose inline or artifact-backed storage.
+
+        Parameters
+        ----------
+        value
+            Canonically serializable typed value.
+        schema_digest
+            Digest of the declared type contract for the value.
+
+        Returns
+        -------
+        StoredValue
+            Immutable value reference containing content and schema digests.
+        """
         data = canonical_json(value).encode()
         digest = digest_bytes(data)
         if len(data) <= self.inline_limit:
@@ -94,6 +158,7 @@ class ValueCodec:
         )
 
     def unavailable(self, *, schema_digest: str, digest: str, reason: str) -> StoredValue:
+        """Create a non-replayable reference for a missing or redacted value."""
         return StoredValue(
             schema_digest=schema_digest,
             digest=digest,
@@ -102,6 +167,15 @@ class ValueCodec:
         )
 
     def bytes(self, value: StoredValue) -> bytes:
+        """Resolve canonical bytes and verify their recorded content digest.
+
+        Raises
+        ------
+        UnavailableValueError
+            If the reference is explicitly unavailable.
+        MissingArtifactError, CorruptArtifactError
+            If artifact content cannot satisfy its integrity contract.
+        """
         if value.storage is ValueStorage.UNAVAILABLE:
             reason = value.unavailable_reason or "unknown reason"
             raise UnavailableValueError(f"required value is unavailable: {reason}")
@@ -119,4 +193,5 @@ class ValueCodec:
         return content
 
     def decode(self, value: StoredValue) -> Any:
+        """Resolve, verify, and decode a stored canonical JSON value."""
         return json.loads(self.bytes(value))

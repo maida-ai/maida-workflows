@@ -1,4 +1,9 @@
-"""Expert: combine stable maps, parallel joins, branches, nesting, and replay keys."""
+"""Combine stable maps, parallel joins, branches, nesting, and replay keys.
+
+The workflow demonstrates a larger static graph while remaining deterministic
+and offline. Explicit ``.at(...)`` positions make reused or semantically named
+module occurrences easy to align across definition changes.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +19,8 @@ from maida.workflows import (
 
 
 class ReviewDocument(Module[dict[str, str], str]):
+    """Normalize one document and label it as flagged or acceptable."""
+
     input_type = dict[str, str]
     output_type = str
 
@@ -24,6 +31,8 @@ class ReviewDocument(Module[dict[str, str], str]):
 
 
 class CountFlags(Module[list[str], int]):
+    """Count flagged reviews in a mapped result collection."""
+
     input_type = list[str]
     output_type = int
 
@@ -32,6 +41,8 @@ class CountFlags(Module[list[str], int]):
 
 
 class SummarizeReviews(Module[list[str], str]):
+    """Join mapped document reviews into one deterministic summary."""
+
     input_type = list[str]
     output_type = str
 
@@ -40,6 +51,8 @@ class SummarizeReviews(Module[list[str], str]):
 
 
 class NeedsEscalation(Module[tuple[int, str], bool]):
+    """Return whether the joined review context contains any flags."""
+
     input_type = tuple[int, str]
     output_type = bool
 
@@ -49,6 +62,8 @@ class NeedsEscalation(Module[tuple[int, str], bool]):
 
 
 class BuildEscalation(Module[tuple[int, str], str]):
+    """Render the human-escalation branch from review context."""
+
     input_type = tuple[int, str]
     output_type = str
 
@@ -59,6 +74,8 @@ class BuildEscalation(Module[tuple[int, str], str]):
 
 
 class BuildAutomaticResult(Module[tuple[int, str], str]):
+    """Render the automatic branch when no escalation is required."""
+
     input_type = tuple[int, str]
     output_type = str
 
@@ -68,6 +85,8 @@ class BuildAutomaticResult(Module[tuple[int, str], str]):
 
 
 class MarkReady(Module[str, str]):
+    """Mark a routed report as ready for delivery."""
+
     input_type = str
     output_type = str
 
@@ -76,6 +95,8 @@ class MarkReady(Module[str, str]):
 
 
 class DeliveryWorkflow(Workflow[str, str]):
+    """Reusable child workflow for the final delivery marker."""
+
     workflow_id = "onboarding-delivery"
     input_type = str
     output_type = str
@@ -88,6 +109,8 @@ class DeliveryWorkflow(Workflow[str, str]):
 
 
 class PolishReport(Module[str, str]):
+    """Normalize report whitespace at two explicitly named occurrences."""
+
     module_id = "onboarding.report-polish"
     input_type = str
     output_type = str
@@ -97,6 +120,8 @@ class PolishReport(Module[str, str]):
 
 
 class ReplayReadyReviewWorkflow(Workflow[list[dict[str, str]], str]):
+    """Review documents and compose the result with stable replay addresses."""
+
     workflow_id = "onboarding-replay-ready"
     input_type = list[dict[str, str]]
     output_type = str

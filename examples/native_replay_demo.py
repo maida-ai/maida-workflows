@@ -1,3 +1,11 @@
+"""Capture a native run and demonstrate full-stub and selective replay.
+
+The demo changes one same-identity decision module, reports the structural
+digest change, proves full-stub replay performs zero live calls, executes only
+the changed boundary selectively, and verifies that replay never invokes the
+sentinel production effect.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -25,23 +33,31 @@ from maida.workflows.runtime import WorkflowRunner
 
 @dataclass(frozen=True)
 class Ticket:
+    """Input ticket with stable identity and free-form text."""
+
     ticket_id: str
     text: str
 
 
 @dataclass(frozen=True)
 class Draft:
+    """Normalized ticket representation produced by preparation."""
+
     ticket_id: str
     normalized: str
 
 
 @dataclass(frozen=True)
 class Decision:
+    """Queue-selection result for one ticket."""
+
     ticket_id: str
     queue: str
 
 
 class Prepare(Module[Ticket, Draft]):
+    """Normalize ticket text while counting live handler calls."""
+
     input_type = Ticket
     output_type = Draft
 
@@ -54,6 +70,8 @@ class Prepare(Module[Ticket, Draft]):
 
 
 class DecideV1(Module[Draft, Decision]):
+    """Historical decision behavior that always selects the standard queue."""
+
     input_type = Draft
     output_type = Decision
 
@@ -66,6 +84,8 @@ class DecideV1(Module[Draft, Decision]):
 
 
 class DecideV2(DecideV1):
+    """Current decision behavior that routes refund requests to specialists."""
+
     async def execute(self, value: Draft, ctx: ExecutionContext) -> Decision:
         self.calls += 1
         queue = "specialist" if "refund" in value.normalized else "standard"
@@ -73,6 +93,8 @@ class DecideV2(DecideV1):
 
 
 class ProductionNotification(Module[Decision, Decision]):
+    """Effect-classified sentinel that records every real invocation."""
+
     input_type = Decision
     output_type = Decision
     effectful = True
@@ -86,6 +108,8 @@ class ProductionNotification(Module[Decision, Decision]):
 
 
 class TicketWorkflow(Workflow[Ticket, Decision]):
+    """Prepare, route, and notify for one ticket using stable logical steps."""
+
     workflow_id = "native-replay-demo"
     input_type = Ticket
     output_type = Decision
@@ -108,6 +132,25 @@ async def run_demo(
     *,
     trace_bridge: TraceBridge | None = None,
 ) -> dict[str, Any]:
+    """Run the complete deterministic native replay demonstration.
+
+    Parameters
+    ----------
+    dsn
+        PostgreSQL connection string for local durable history.
+    artifact_root
+        Private directory for source-run content-addressed values.
+    fixture_output
+        New directory where the canonical fixture bundle is exported.
+    trace_bridge
+        Optional trace adapter, primarily for deterministic tests.
+
+    Returns
+    -------
+    dict
+        JSON-compatible evidence covering diff, replay status, live-call counts,
+        output comparison, and production-effect sentinels.
+    """
     store = PostgresStore(dsn, ValueCodec(ArtifactStore(artifact_root), inline_limit=64))
     store.upgrade()
     production_effects: list[str] = []
@@ -151,6 +194,7 @@ async def run_demo(
 
 
 def main() -> None:
+    """Parse CLI arguments, run the demo, and print deterministic JSON evidence."""
     parser = argparse.ArgumentParser(description="Run the deterministic native replay demo.")
     parser.add_argument("--dsn", required=True)
     parser.add_argument("--artifacts", type=Path, required=True)

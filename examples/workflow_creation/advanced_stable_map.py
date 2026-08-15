@@ -1,4 +1,9 @@
-"""Advanced: map over runtime data using stable domain keys for replay identity."""
+"""Map over runtime data using stable domain keys for execution identity.
+
+Each document is addressed by its ``id`` field rather than list position. A
+reordered input therefore keeps the same per-document step instance identities
+while preserving the caller's output order.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +11,8 @@ from maida.workflows import ExecutionContext, Module, RuntimeValue, Workflow, ma
 
 
 class NormalizeDocument(Module[dict[str, str], str]):
+    """Normalize one keyed document to compact lowercase text."""
+
     input_type = dict[str, str]
     output_type = str
 
@@ -14,6 +21,8 @@ class NormalizeDocument(Module[dict[str, str], str]):
 
 
 class JoinDocuments(Module[list[str], str]):
+    """Join normalized documents while preserving their runtime order."""
+
     input_type = list[str]
     output_type = str
 
@@ -22,6 +31,8 @@ class JoinDocuments(Module[list[str], str]):
 
 
 class StableDocumentMapWorkflow(Workflow[list[dict[str, str]], str]):
+    """Normalize a runtime document collection with ID-based map identity."""
+
     workflow_id = "onboarding-stable-map"
     input_type = list[dict[str, str]]
     output_type = str

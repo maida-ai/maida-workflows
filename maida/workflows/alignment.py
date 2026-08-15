@@ -1,3 +1,10 @@
+"""Compare compiled workflow graphs by stable replay identity and topology.
+
+The aligner uses one exact correspondence model for static definition diffs and
+replay validation. Behavior and schema changes remain aligned, while ambiguous
+identity, ordering, dependency, or control-flow changes stop correspondence.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
@@ -8,6 +15,8 @@ from .ir import PlanIR, ReplayKey, StepIR
 
 
 class DiffKind(StrEnum):
+    """Classification of a structural or behavior-bearing graph change."""
+
     MODULE_DIGEST_CHANGED = "MODULE_DIGEST_CHANGED"
     SCHEMA_CHANGED = "SCHEMA_CHANGED"
     INSERTION = "INSERTION"
@@ -19,6 +28,8 @@ class DiffKind(StrEnum):
 
 @dataclass(frozen=True)
 class GraphChange:
+    """One localized difference between historical and current workflow IR."""
+
     kind: DiffKind
     location: str
     replay_key: ReplayKey | None
@@ -29,23 +40,30 @@ class GraphChange:
 
 @dataclass(frozen=True)
 class GraphDiff:
+    """Ordered structural changes discovered during exact graph alignment."""
+
     changes: tuple[GraphChange, ...] = ()
 
     @property
     def has_changes(self) -> bool:
+        """Return whether any resolvable or divergent change was recorded."""
         return bool(self.changes)
 
     @property
     def first_divergence(self) -> GraphChange | None:
+        """Return the first change that prevents exact correspondence."""
         return next((change for change in self.changes if not change.resolvable), None)
 
     @property
     def aligned(self) -> bool:
+        """Return whether all observed changes preserve graph correspondence."""
         return self.first_divergence is None
 
 
 @dataclass(frozen=True)
 class AlignmentPair:
+    """Historical and current executable steps sharing one replay key."""
+
     replay_key: ReplayKey
     historical: StepIR
     current: StepIR
@@ -53,14 +71,30 @@ class AlignmentPair:
 
 @dataclass(frozen=True)
 class GraphAlignment:
+    """Matched executable steps together with their structured graph diff."""
+
     pairs: tuple[AlignmentPair, ...]
     diff: GraphDiff
 
 
 class GraphAligner:
-    """One exact correspondence algorithm shared by structural diff and replay."""
+    """Align two workflow definitions without guessing correspondence."""
 
     def align(self, historical: PlanIR, current: PlanIR) -> GraphAlignment:
+        """Compare historical and current plans by exact replay identity.
+
+        Parameters
+        ----------
+        historical
+            Baseline or source workflow definition.
+        current
+            Definition being evaluated.
+
+        Returns
+        -------
+        GraphAlignment
+            Matched steps and ordered changes up to the first divergence.
+        """
         old_steps = historical.executable_steps
         new_steps = current.executable_steps
         old_by_key = {step.replay_key: step for step in old_steps}

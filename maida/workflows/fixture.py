@@ -1,3 +1,11 @@
+"""Project completed native runs into portable replay fixtures.
+
+A replay fixture is a canonical manifest plus content-addressed blobs. This
+module validates source history, preserves accepted module boundaries and
+control decisions, exports bundles with restrictive permissions, and fails
+closed when required values or integrity evidence are unavailable.
+"""
+
 from __future__ import annotations
 
 import json
@@ -27,6 +35,8 @@ FIXTURE_VERSION = "0.1.0"
 
 
 class FixtureErrorCode(StrEnum):
+    """Stable reason code for fixture import, export, or integrity failure."""
+
     TRACE_NOT_REPLAYABLE = "TRACE_NOT_REPLAYABLE"
     RUN_NOT_TERMINAL = "RUN_NOT_TERMINAL"
     RUN_NOT_SUCCESSFUL = "RUN_NOT_SUCCESSFUL"
@@ -38,6 +48,14 @@ class FixtureErrorCode(StrEnum):
 
 
 class ReplayFixtureError(RuntimeError):
+    """Raised when a source cannot satisfy the replay fixture contract.
+
+    Attributes
+    ----------
+    code
+        Machine-readable :class:`FixtureErrorCode` describing the failure.
+    """
+
     def __init__(self, code: FixtureErrorCode, message: str) -> None:
         self.code = code
         super().__init__(f"{code.value}: {message}")
@@ -45,6 +63,8 @@ class ReplayFixtureError(RuntimeError):
 
 @dataclass(frozen=True)
 class SourceProvenance:
+    """Origin and completion metadata for a replay fixture."""
+
     kind: str
     run_id: str
     tenant_id: str
@@ -54,6 +74,8 @@ class SourceProvenance:
 
 @dataclass(frozen=True)
 class ArtifactIntegrity:
+    """Digest, size, and media type of one fixture blob."""
+
     digest: str
     size_bytes: int
     media_type: str
@@ -61,6 +83,30 @@ class ArtifactIntegrity:
 
 @dataclass(frozen=True)
 class ReplayFixture:
+    """Immutable replay projection of one successful native workflow run.
+
+    Attributes
+    ----------
+    version
+        Replay fixture schema version.
+    source
+        Native run provenance without external payload upload.
+    workflow_ir
+        Canonical workflow definition used by the source run.
+    root_input, root_output
+        Typed references to the recorded root values.
+    boundaries
+        Accepted replay-complete module boundary records.
+    control_decisions
+        Recorded branch and map decisions for the executed path.
+    artifacts
+        Integrity metadata for content-addressed blobs.
+    values
+        Codec used to resolve inline and artifact-backed value references.
+    bundle_path
+        Local bundle location when loaded from or exported to disk.
+    """
+
     version: str
     source: SourceProvenance
     workflow_ir: PlanIR
@@ -73,6 +119,7 @@ class ReplayFixture:
     bundle_path: Path | None = field(default=None, compare=False)
 
     def to_manifest(self) -> dict[str, Any]:
+        """Return the canonical JSON-compatible fixture manifest."""
         return cast(
             dict[str, Any],
             canonical_data(
@@ -108,19 +155,44 @@ class ReplayFixture:
 
     @property
     def digest(self) -> str:
+        """Return the SHA-256 digest of the canonical fixture manifest."""
         return digest_data(self.to_manifest())
 
 
 class ReplayFixtureImporter(Protocol):
-    def import_source(self, source: str) -> ReplayFixture: ...
+    """Interface for converting an approved source into a replay fixture."""
+
+    def import_source(self, source: str) -> ReplayFixture:
+        """Import a source identifier or path as a validated fixture.
+
+        Parameters
+        ----------
+        source
+            Source-specific native run identifier or canonical bundle path.
+
+        Returns
+        -------
+        ReplayFixture
+            Validated fixture ready for replay.
+        """
+        ...
 
 
 class NativeRunFixtureImporter:
+    """Import completed native runs from a tenant-scoped PostgreSQL store."""
+
     def __init__(self, store: PostgresStore, *, tenant_id: str) -> None:
         self.store = store
         self.tenant_id = tenant_id
 
     def import_source(self, source: str) -> ReplayFixture:
+        """Project a completed native run ID into an in-memory fixture.
+
+        Raises
+        ------
+        ReplayFixtureError
+            If the run is inaccessible, incomplete, or not replayable.
+        """
         try:
             history = self.store.load_run_history(source, tenant_id=self.tenant_id)
         except Exception as exc:
@@ -132,15 +204,44 @@ class NativeRunFixtureImporter:
 
 
 class CanonicalBundleImporter:
+    """Load previously exported canonical fixture bundles from local storage."""
+
     def import_source(self, source: str) -> ReplayFixture:
+        """Load and validate the bundle at ``source``."""
         return load_fixture(Path(source))
 
 
 class ReplayFixtureExporter:
+    """Validate native history and export deterministic private bundles.
+
+    Parameters
+    ----------
+    source_values
+        Codec capable of resolving every value referenced by the source run.
+    """
+
     def __init__(self, source_values: ValueCodec) -> None:
         self.source_values = source_values
 
     def project(self, history: RunHistory) -> ReplayFixture:
+        """Create an in-memory fixture projection from native run history.
+
+        Parameters
+        ----------
+        history
+            Successful terminal run with complete accepted boundaries and
+            available root/module values.
+
+        Returns
+        -------
+        ReplayFixture
+            Canonical projection that still references the source value store.
+
+        Raises
+        ------
+        ReplayFixtureError
+            If status, execution coverage, values, or artifacts are incomplete.
+        """
         self._validate_history(history)
         if history.run.root_output is None or history.run.completed_at is None:
             raise ReplayFixtureError(
@@ -184,6 +285,26 @@ class ReplayFixtureExporter:
         )
 
     def export(self, history: RunHistory, output: Path) -> ReplayFixture:
+        """Write a canonical fixture bundle with restrictive permissions.
+
+        Parameters
+        ----------
+        history
+            Replay-complete successful native run history.
+        output
+            New local directory for ``manifest.json`` and blob content.
+
+        Returns
+        -------
+        ReplayFixture
+            Fixture bound to the newly written bundle.
+
+        Raises
+        ------
+        ReplayFixtureError
+            If the source is invalid, an artifact fails integrity checks, or
+            the output path already exists.
+        """
         projected = self.project(history)
         try:
             output.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -300,6 +421,24 @@ class ReplayFixtureExporter:
 
 
 def load_fixture(path: Path) -> ReplayFixture:
+    """Load and validate a canonical replay bundle from local storage.
+
+    Parameters
+    ----------
+    path
+        Bundle directory or direct path to its canonical ``manifest.json``.
+
+    Returns
+    -------
+    ReplayFixture
+        Integrity-checked fixture with a local blob codec.
+
+    Raises
+    ------
+    ReplayFixtureError
+        If the source is not a canonical bundle or any manifest, value, schema,
+        or artifact integrity check fails.
+    """
     manifest_path = path / "manifest.json" if path.is_dir() else path
     if not manifest_path.is_file():
         raise ReplayFixtureError(

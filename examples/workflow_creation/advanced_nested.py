@@ -1,4 +1,9 @@
-"""Advanced: register a reusable child workflow inside a parent workflow."""
+"""Compose a reusable child workflow inside a parent workflow.
+
+``AnalysisWorkflow`` owns two independent analysis modules. The parent treats
+that child like a typed component and passes its symbolic tuple output to the
+final renderer.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +11,8 @@ from maida.workflows import ExecutionContext, Module, RuntimeValue, Workflow, pa
 
 
 class ExtractTitle(Module[str, str]):
+    """Extract and trim the first line of a document."""
+
     input_type = str
     output_type = str
 
@@ -14,6 +21,8 @@ class ExtractTitle(Module[str, str]):
 
 
 class CountWords(Module[str, int]):
+    """Count whitespace-delimited words in the complete document."""
+
     input_type = str
     output_type = int
 
@@ -22,6 +31,8 @@ class CountWords(Module[str, int]):
 
 
 class AnalysisWorkflow(Workflow[str, tuple[str, int]]):
+    """Produce a title and word count as a typed parallel result."""
+
     workflow_id = "onboarding-analysis"
     input_type = str
     output_type = tuple[str, int]
@@ -35,6 +46,8 @@ class AnalysisWorkflow(Workflow[str, tuple[str, int]]):
 
 
 class RenderReport(Module[tuple[str, int], str]):
+    """Render title and word-count analysis as a compact report."""
+
     input_type = tuple[str, int]
     output_type = str
 
@@ -44,6 +57,8 @@ class RenderReport(Module[tuple[str, int], str]):
 
 
 class ReportWorkflow(Workflow[str, str]):
+    """Compose :class:`AnalysisWorkflow` with the final report renderer."""
+
     workflow_id = "onboarding-nested"
     input_type = str
     output_type = str

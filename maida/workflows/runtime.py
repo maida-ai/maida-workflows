@@ -1,3 +1,11 @@
+"""Execute compiled workflows as durable typed module boundaries.
+
+The runtime records runs, tasks, attempts, accepted boundary values, usage, and
+control decisions through a :class:`DurableRuntimeStore`. Most applications use
+:class:`WorkflowRunner`; worker services use :class:`TaskWorker` to claim and
+complete already-created tasks.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -35,14 +43,16 @@ from .persistence import ClaimedTask
 
 
 class RuntimeExecutionError(RuntimeError):
-    pass
+    """Base error raised when durable workflow execution cannot continue."""
 
 
 class RuntimeContractError(RuntimeExecutionError):
-    pass
+    """Raised when runtime data or registered code violates a pinned contract."""
 
 
 class DurableRuntimeStore(Protocol):
+    """Persistence operations required by the workflow runner and workers."""
+
     values: Any
 
     def create_run(
@@ -53,7 +63,9 @@ class DurableRuntimeStore(Protocol):
         root_input: StoredValue,
         execution_mode: ExecutionMode = ExecutionMode.LIVE,
         run_id: str | None = None,
-    ) -> Any: ...
+    ) -> Any:
+        """Persist a new run pinned to a compiled workflow definition."""
+        ...
 
     def enqueue_task(
         self,
@@ -64,7 +76,9 @@ class DurableRuntimeStore(Protocol):
         input_value: StoredValue,
         dependency_instance_keys: tuple[str, ...] = (),
         task_id: str | None = None,
-    ) -> Any: ...
+    ) -> Any:
+        """Create or return one durable logical task for an execution instance."""
+        ...
 
     def claim_task(
         self,
@@ -72,9 +86,13 @@ class DurableRuntimeStore(Protocol):
         worker_id: str,
         lease_for: timedelta = timedelta(minutes=5),
         task_id: str | None = None,
-    ) -> ClaimedTask | None: ...
+    ) -> ClaimedTask | None:
+        """Lease one pending task, optionally restricted to a task ID."""
+        ...
 
-    def complete_task(self, claim: ClaimedTask, boundary: BoundaryRecord) -> None: ...
+    def complete_task(self, claim: ClaimedTask, boundary: BoundaryRecord) -> None:
+        """Accept a boundary result using the claim's compare-and-swap token."""
+        ...
 
     def fail_task(
         self,
@@ -82,11 +100,17 @@ class DurableRuntimeStore(Protocol):
         diagnostic: dict[str, Any],
         *,
         retry: bool,
-    ) -> None: ...
+    ) -> None:
+        """Record a failed attempt and optionally make its task retryable."""
+        ...
 
-    def complete_run(self, run_id: str, root_output: StoredValue) -> None: ...
+    def complete_run(self, run_id: str, root_output: StoredValue) -> None:
+        """Mark a run successful with its immutable root output."""
+        ...
 
-    def fail_run(self, run_id: str, diagnostic: dict[str, Any]) -> None: ...
+    def fail_run(self, run_id: str, diagnostic: dict[str, Any]) -> None:
+        """Mark a run failed and persist a diagnostic event."""
+        ...
 
     def append_event(
         self,
@@ -96,11 +120,25 @@ class DurableRuntimeStore(Protocol):
         *,
         task_id: str | None = None,
         attempt_id: str | None = None,
-    ) -> None: ...
+    ) -> None:
+        """Append an ordered run, task, or attempt event."""
+        ...
 
 
 @dataclass(frozen=True)
 class RunResult:
+    """Successful terminal output returned by :class:`WorkflowRunner`.
+
+    Attributes
+    ----------
+    run_id
+        Durable identifier of the completed run.
+    output
+        Rehydrated workflow output matching its root contract.
+    definition_digest
+        Digest of the compiled workflow definition used for execution.
+    """
+
     run_id: str
     output: Any
     definition_digest: str
@@ -141,7 +179,23 @@ def _coerce_effect(value: dict[str, Any]) -> EffectRecord:
 
 
 class TaskWorker:
-    """Lease/checkpoint recovery worker with no replay-resolution dependency."""
+    """Claim and execute durable module tasks without replay substitution.
+
+    Parameters
+    ----------
+    store
+        Durable runtime store containing tasks and typed values.
+    workflow_id
+        Workflow identity recorded on accepted boundaries.
+    definition_digest
+        Compiled definition digest that registered modules must match.
+    modules
+        Current module instances keyed by exact replay address.
+    worker_id
+        Stable diagnostic identity of this worker process.
+    max_attempts
+        Maximum attempts allowed for a logical task.
+    """
 
     def __init__(
         self,
@@ -164,6 +218,25 @@ class TaskWorker:
         self.max_attempts = max_attempts
 
     async def run_once(self, *, task_id: str | None = None) -> BoundaryRecord | None:
+        """Claim and execute at most one durable task.
+
+        Parameters
+        ----------
+        task_id
+            Optional exact task to claim; otherwise any eligible task may be
+            leased.
+
+        Returns
+        -------
+        BoundaryRecord or None
+            Accepted result, or ``None`` when no task can be claimed.
+
+        Raises
+        ------
+        RuntimeContractError
+            If no matching module is registered, its digest differs from the
+            task definition, or persisted input violates the module contract.
+        """
         claim = self.store.claim_task(worker_id=self.worker_id, task_id=task_id)
         if claim is None:
             return None
@@ -285,10 +358,25 @@ class TaskWorker:
 
 
 def key_for(claim: ClaimedTask) -> ReplayKey:
+    """Return the exact replay key carried by a claimed task."""
     return ReplayKey(claim.task.module_id, claim.task.logical_step)
 
 
 class WorkflowRunner:
+    """Compile and execute a workflow while recording durable history.
+
+    Parameters
+    ----------
+    store
+        Durable runtime store used for definitions, runs, tasks, and values.
+    worker_id
+        Diagnostic identity attached to locally executed attempts.
+    max_attempts
+        Maximum attempts allowed for each logical task.
+    broker
+        Optional runtime-managed broker exposed through :class:`ExecutionContext`.
+    """
+
     def __init__(
         self,
         store: DurableRuntimeStore,
@@ -310,6 +398,31 @@ class WorkflowRunner:
         tenant_id: str = "local",
         execution_mode: ExecutionMode = ExecutionMode.LIVE,
     ) -> RunResult:
+        """Execute one workflow from a concrete root input.
+
+        Parameters
+        ----------
+        workflow
+            Typed workflow instance to compile and execute.
+        value
+            Concrete root input matching ``workflow.input_type``.
+        tenant_id
+            Tenant scope recorded on the durable run.
+        execution_mode
+            Live or verification-live mode stored with the run.
+
+        Returns
+        -------
+        RunResult
+            Durable run ID, concrete terminal output, and definition digest.
+
+        Raises
+        ------
+        RuntimeContractError
+            If root or module values violate declared contracts.
+        RuntimeExecutionError
+            If a task cannot be claimed or completed successfully.
+        """
         if not value_matches_type(value, workflow.input_type):
             raise RuntimeContractError("root input violates the workflow input contract")
         compiled = _compile_workflow_graph(workflow)

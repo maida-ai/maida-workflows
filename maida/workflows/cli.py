@@ -1,3 +1,10 @@
+"""Command-line entry points for compiling, running, exporting, and replaying.
+
+The supported command surface is exposed through the ``maida-workflows``
+executable. Python applications should normally import the typed APIs from
+``maida.workflows`` instead of calling command functions directly.
+"""
+
 from __future__ import annotations
 
 import asyncio

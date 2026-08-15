@@ -1,4 +1,9 @@
-"""Intermediate: choose one runtime branch with the explicit when primitive."""
+"""Choose one runtime path with the explicit :func:`when` primitive.
+
+Both routes are present in the compiled graph, while only the route selected by
+the concrete priority executes. Ordinary Python ``if`` cannot inspect the
+symbolic condition during workflow construction.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +11,8 @@ from maida.workflows import ExecutionContext, Module, RuntimeValue, Workflow, wh
 
 
 class IsUrgent(Module[dict[str, str], bool]):
+    """Return whether a ticket requests urgent handling."""
+
     input_type = dict[str, str]
     output_type = bool
 
@@ -14,6 +21,8 @@ class IsUrgent(Module[dict[str, str], bool]):
 
 
 class RouteToHumanReview(Module[dict[str, str], str]):
+    """Choose the human-review queue for an urgent ticket."""
+
     input_type = dict[str, str]
     output_type = str
 
@@ -22,6 +31,8 @@ class RouteToHumanReview(Module[dict[str, str], str]):
 
 
 class RouteToAutomaticReply(Module[dict[str, str], str]):
+    """Choose automatic reply handling for a routine ticket."""
+
     input_type = dict[str, str]
     output_type = str
 
@@ -30,6 +41,8 @@ class RouteToAutomaticReply(Module[dict[str, str], str]):
 
 
 class TicketRoutingWorkflow(Workflow[dict[str, str], str]):
+    """Compile both ticket routes and select one from a runtime condition."""
+
     workflow_id = "onboarding-branching"
     input_type = dict[str, str]
     output_type = str

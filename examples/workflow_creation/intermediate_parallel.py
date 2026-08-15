@@ -1,4 +1,8 @@
-"""Intermediate: run independent modules in parallel and join their outputs."""
+"""Express independent analyses with :func:`parallel` and a typed join.
+
+The three analysis modules receive the same symbolic input. Their outputs are
+collected in a typed tuple that ``RenderStatistics`` consumes in argument order.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +10,8 @@ from maida.workflows import ExecutionContext, Module, RuntimeValue, Workflow, pa
 
 
 class CountWords(Module[str, int]):
+    """Count whitespace-delimited words in a string."""
+
     input_type = str
     output_type = int
 
@@ -14,6 +20,8 @@ class CountWords(Module[str, int]):
 
 
 class CountCharacters(Module[str, int]):
+    """Count every character in the input string."""
+
     input_type = str
     output_type = int
 
@@ -22,6 +30,8 @@ class CountCharacters(Module[str, int]):
 
 
 class Uppercase(Module[str, str]):
+    """Return an uppercase copy of the input text."""
+
     input_type = str
     output_type = str
 
@@ -30,6 +40,8 @@ class Uppercase(Module[str, str]):
 
 
 class RenderStatistics(Module[tuple[int, int, str], dict[str, object]]):
+    """Convert the ordered parallel results into a named statistics mapping."""
+
     input_type = tuple[int, int, str]
     output_type = dict[str, object]
 
@@ -47,6 +59,8 @@ class RenderStatistics(Module[tuple[int, int, str], dict[str, object]]):
 
 
 class TextStatisticsWorkflow(Workflow[str, dict[str, object]]):
+    """Run three independent analyses and render their joined result."""
+
     workflow_id = "onboarding-parallel"
     input_type = str
     output_type = dict[str, object]

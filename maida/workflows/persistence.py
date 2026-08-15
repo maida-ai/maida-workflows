@@ -1,3 +1,11 @@
+"""Persist workflow definitions, runs, tasks, attempts, events, and artifacts.
+
+The PostgreSQL store provides checksummed migrations, tenant-scoped history,
+task leasing, compare-and-swap completion, and immutable accepted boundaries.
+Application code normally constructs :class:`PostgresStore` with a
+:class:`~maida.workflows.artifacts.ValueCodec` and passes it to the runtime.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -36,27 +44,29 @@ from .models import (
 
 
 class PersistenceError(RuntimeError):
-    pass
+    """Base error for durable store and migration failures."""
 
 
 class MigrationChecksumError(PersistenceError):
-    pass
+    """Raised when an applied migration no longer matches its checksum."""
 
 
 class StaleLeaseError(PersistenceError):
-    pass
+    """Raised when task completion uses an expired or replaced lease token."""
 
 
 class TenantAccessError(PersistenceError):
-    pass
+    """Raised when a run is requested from the wrong tenant scope."""
 
 
 class InvalidRunStateError(PersistenceError):
-    pass
+    """Raised when a run transition is invalid for its current state."""
 
 
 @dataclass(frozen=True)
 class ClaimedTask:
+    """Durable task and attempt leased to one worker until a deadline."""
+
     task: Task
     attempt: Attempt
     worker_id: str
@@ -72,11 +82,31 @@ def _migration_files(directory: Path | None = None) -> tuple[Path, ...]:
 
 
 class MigrationRunner:
+    """Apply packaged SQL migrations exactly once and verify their checksums.
+
+    Parameters
+    ----------
+    connection
+        Open psycopg connection used inside migration transactions.
+    directory
+        Optional migration directory, primarily for tests. Packaged migrations
+        are used by default.
+    """
+
     def __init__(self, connection: psycopg.Connection[Any], directory: Path | None = None) -> None:
         self.connection = connection
         self.directory = directory
 
     def upgrade(self) -> None:
+        """Apply pending migrations under a PostgreSQL advisory lock.
+
+        Raises
+        ------
+        PersistenceError
+            If no migrations are available.
+        MigrationChecksumError
+            If an already-applied migration file has changed.
+        """
         files = _migration_files(self.directory)
         if not files:
             raise PersistenceError("no database migrations were packaged")
@@ -117,20 +147,34 @@ class MigrationRunner:
 
 
 class PostgresStore:
+    """PostgreSQL implementation of durable workflow storage.
+
+    Parameters
+    ----------
+    dsn
+        PostgreSQL connection string. It is retained locally and never embedded
+        in fixtures or baselines.
+    values
+        Codec used for typed inline and artifact-backed payload references.
+    """
+
     def __init__(self, dsn: str, values: ValueCodec) -> None:
         self.dsn = dsn
         self.values = values
 
     @contextmanager
     def connect(self) -> Iterator[psycopg.Connection[dict[str, Any]]]:
+        """Yield a dictionary-row psycopg connection and close it afterward."""
         with psycopg.connect(self.dsn, row_factory=dict_row) as connection:
             yield connection
 
     def upgrade(self) -> None:
+        """Apply all packaged database migrations safely."""
         with self.connect() as connection:
             MigrationRunner(connection).upgrade()
 
     def register_definition(self, plan: PlanIR) -> Definition:
+        """Persist a canonical workflow definition if it is not already known."""
         with self.connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -151,6 +195,21 @@ class PostgresStore:
         execution_mode: ExecutionMode = ExecutionMode.LIVE,
         run_id: str | None = None,
     ) -> Run:
+        """Create a running workflow instance pinned to a compiled definition.
+
+        Parameters
+        ----------
+        plan
+            Canonical workflow definition.
+        tenant_id
+            Tenant scope used for later history access.
+        root_input
+            Typed immutable reference to the concrete root input.
+        execution_mode
+            Live or verification-live execution classification.
+        run_id
+            Optional caller-supplied identifier; a UUID is generated otherwise.
+        """
         self.register_definition(plan)
         identifier = run_id or str(uuid4())
         with self.connect() as connection, connection.cursor() as cursor:
@@ -197,6 +256,13 @@ class PostgresStore:
         dependency_instance_keys: tuple[str, ...] = (),
         task_id: str | None = None,
     ) -> Task:
+        """Create one durable executable task pinned to a module digest.
+
+        Raises
+        ------
+        ValueError
+            If ``step`` is a control node without executable module identity.
+        """
         if step.module_id is None or step.logical_step is None or step.module_digest is None:
             raise ValueError("only executable module steps can be enqueued")
         identifier = task_id or str(uuid4())
@@ -250,6 +316,22 @@ class PostgresStore:
         lease_for: timedelta = timedelta(minutes=5),
         task_id: str | None = None,
     ) -> ClaimedTask | None:
+        """Lease one pending or expired task using ``SKIP LOCKED`` semantics.
+
+        Parameters
+        ----------
+        worker_id
+            Diagnostic identity of the claiming worker.
+        lease_for
+            Positive period before another worker may reclaim the task.
+        task_id
+            Optional exact task restriction.
+
+        Returns
+        -------
+        ClaimedTask or None
+            New attempt and lease, or ``None`` when nothing is eligible.
+        """
         if lease_for <= timedelta(0):
             raise ValueError("lease_for must be positive")
         lease_token = uuid4()
@@ -331,6 +413,15 @@ class PostgresStore:
         return ClaimedTask(task, attempt, worker_id, expires_at)
 
     def complete_task(self, claim: ClaimedTask, boundary: BoundaryRecord) -> None:
+        """Accept one logical task result using lease-token compare-and-swap.
+
+        Raises
+        ------
+        ValueError
+            If boundary identity differs from the claimed task.
+        StaleLeaseError
+            If another worker has already replaced or completed the lease.
+        """
         task = claim.task
         if (
             boundary.module_id != task.module_id
@@ -394,6 +485,13 @@ class PostgresStore:
         *,
         retry: bool,
     ) -> None:
+        """Record a failed attempt and optionally return its task to pending.
+
+        Raises
+        ------
+        StaleLeaseError
+            If the claim no longer owns the task lease.
+        """
         next_status = TaskStatus.PENDING if retry else TaskStatus.FAILED
         with self.connect() as connection, connection.cursor() as cursor:
             cursor.execute(
@@ -425,6 +523,13 @@ class PostgresStore:
             )
 
     def complete_run(self, run_id: str, root_output: StoredValue) -> None:
+        """Mark a running workflow successful after every task is accepted.
+
+        Raises
+        ------
+        InvalidRunStateError
+            If tasks remain incomplete or the run is no longer running.
+        """
         with self.connect() as connection, connection.cursor() as cursor:
             self._register_value_artifact(cursor, root_output)
             cursor.execute(
@@ -451,6 +556,7 @@ class PostgresStore:
             self._append_event(cursor, run_id, "RUN_COMPLETED", {})
 
     def fail_run(self, run_id: str, diagnostic: dict[str, Any]) -> None:
+        """Mark a running workflow failed and append its diagnostic event."""
         with self.connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -471,6 +577,7 @@ class PostgresStore:
         task_id: str | None = None,
         attempt_id: str | None = None,
     ) -> None:
+        """Append an ordered diagnostic or control event to a run."""
         with self.connect() as connection, connection.cursor() as cursor:
             self._append_event(cursor, run_id, event_type, payload, task_id, attempt_id)
 
@@ -508,6 +615,15 @@ class PostgresStore:
         )
 
     def load_run_history(self, run_id: str, *, tenant_id: str) -> RunHistory:
+        """Load complete tenant-scoped definition and execution history.
+
+        Raises
+        ------
+        PersistenceError
+            If ``run_id`` does not exist.
+        TenantAccessError
+            If the run belongs to a different tenant.
+        """
         with self.connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -621,6 +737,11 @@ def blank_boundary(
     input_value: StoredValue,
     output_value: StoredValue,
 ) -> BoundaryRecord:
+    """Construct a minimal accepted boundary for persistence integration tests.
+
+    This helper is intended for store conformance tests that exercise leasing
+    and compare-and-swap behavior without invoking a module handler.
+    """
     now = datetime.now(UTC).isoformat()
     return BoundaryRecord(
         workflow_id=workflow_id,

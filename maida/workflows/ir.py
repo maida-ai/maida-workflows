@@ -1,3 +1,11 @@
+"""Compile workflow definitions into canonical, replay-addressable IR.
+
+The public objects in this module describe workflow structure without runtime
+payloads. :func:`compile_workflow` is the usual entry point; :class:`PlanIR`
+and :class:`StepIR` support inspection, deterministic serialization, and
+structural comparison.
+"""
+
 from __future__ import annotations
 
 import inspect
@@ -29,26 +37,71 @@ IR_VERSION = "0.1.0"
 
 
 class CompileError(ValueError):
-    """A workflow cannot be assigned unambiguous replay identities."""
+    """Raised when a workflow cannot compile to a valid static definition."""
 
 
 @dataclass(frozen=True, order=True)
 class ReplayKey:
+    """Stable address of one executable module occurrence.
+
+    Attributes
+    ----------
+    module_id
+        Stable identity of the semantic component.
+    logical_step
+        Stable position of this occurrence in the workflow definition.
+    """
+
     module_id: str
     logical_step: str
 
     def as_string(self) -> str:
+        """Return the canonical ``module_id@logical_step`` representation."""
         return f"{self.module_id}@{self.logical_step}"
 
 
 @dataclass(frozen=True)
 class BindingIR:
+    """Typed dependency binding for an executable IR step.
+
+    Attributes
+    ----------
+    source
+        Node identifier that supplies the step input.
+    schema_digest
+        Digest of the input type contract expected by the step.
+    """
+
     source: str
     schema_digest: str
 
 
 @dataclass(frozen=True)
 class StepIR:
+    """One executable or control node in a compiled workflow.
+
+    Executable nodes carry module identity and definition digests. Control
+    nodes, such as branches and parallel joins, retain dependency topology and
+    their output schema but have no :attr:`replay_key`.
+
+    Attributes
+    ----------
+    node_id
+        Deterministic hierarchical node identifier.
+    kind
+        Node kind, such as ``module``, ``map_module``, ``when``, or ``parallel``.
+    dependencies
+        Node identifiers that must produce values before this node.
+    output_schema_digest
+        Digest of the node output contract.
+    module_id, logical_step, module_digest, definition_digest
+        Replay and content identities for executable nodes.
+    input_binding
+        Typed source binding for an executable node.
+    control
+        Canonical control-region metadata when applicable.
+    """
+
     node_id: str
     kind: str
     dependencies: tuple[str, ...]
@@ -62,6 +115,7 @@ class StepIR:
 
     @property
     def replay_key(self) -> ReplayKey | None:
+        """Return the replay address, or ``None`` for a control node."""
         if self.module_id is None or self.logical_step is None:
             return None
         return ReplayKey(self.module_id, self.logical_step)
@@ -69,6 +123,26 @@ class StepIR:
 
 @dataclass(frozen=True)
 class PlanIR:
+    """Canonical static definition of a workflow.
+
+    ``PlanIR`` contains schemas, ordered steps, dependency topology, stable
+    replay identities, and a terminal node. Its canonical JSON and digest are
+    deterministic for the same workflow definition.
+
+    Attributes
+    ----------
+    version
+        Workflow IR schema version.
+    workflow_id
+        Stable workflow identity supplied by the author.
+    input_schema, output_schema
+        Canonical root value schemas.
+    steps
+        Ordered executable and control nodes.
+    output_node
+        Node identifier that supplies the workflow result.
+    """
+
     version: str
     workflow_id: str
     input_schema: Mapping[str, Any]
@@ -77,10 +151,29 @@ class PlanIR:
     output_node: str
 
     def to_dict(self) -> dict[str, Any]:
+        """Return a deterministic JSON-compatible representation of the plan."""
         return cast(dict[str, Any], canonical_data(asdict(self)))
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> PlanIR:
+        """Validate and construct a plan from serialized data.
+
+        Parameters
+        ----------
+        data
+            Mapping containing a supported IR version and complete step graph.
+
+        Returns
+        -------
+        PlanIR
+            Validated immutable plan.
+
+        Raises
+        ------
+        ValueError
+            If the version, replay identities, topology, or output node is
+            invalid.
+        """
         if data.get("version") != IR_VERSION:
             raise ValueError(
                 f"unsupported Workflow IR version {data.get('version')!r}; expected {IR_VERSION}"
@@ -114,14 +207,17 @@ class PlanIR:
         return plan
 
     def canonical_json(self) -> str:
+        """Serialize the plan as deterministic canonical JSON."""
         return canonical_json(self.to_dict())
 
     @property
     def digest(self) -> str:
+        """Return the SHA-256 content digest of the canonical plan."""
         return digest_data(self.to_dict())
 
     @property
     def executable_steps(self) -> tuple[StepIR, ...]:
+        """Return only steps that have replay-addressable module identities."""
         return tuple(step for step in self.steps if step.replay_key is not None)
 
 
@@ -183,6 +279,22 @@ def _module_configuration(module: Module[Any, Any]) -> dict[str, Any]:
 
 
 def module_digest(module: Module[Any, Any]) -> str:
+    """Compute the behavior-bearing content digest for a module definition.
+
+    The digest covers the module class artifact, public configuration, declared
+    input/output schemas, and effect classification. Stable component and step
+    identities are intentionally excluded.
+
+    Parameters
+    ----------
+    module
+        Module instance whose definition should be identified.
+
+    Returns
+    -------
+    str
+        Lowercase SHA-256 hexadecimal digest.
+    """
     payload = b"\0".join(
         (
             qualified_name(module.__class__).encode(),
@@ -423,6 +535,31 @@ class _Compiler:
 
 
 def compile_workflow(workflow: Workflow[Any, Any]) -> PlanIR:
+    """Compile a workflow into deterministic static IR.
+
+    Parameters
+    ----------
+    workflow
+        Workflow instance with registered modules and a pure ``build`` method.
+
+    Returns
+    -------
+    PlanIR
+        Canonical replay-addressable workflow definition.
+
+    Raises
+    ------
+    CompileError
+        If module identities, topology, or the root output contract are invalid.
+    TypeError
+        If a symbolic handoff violates a declared type contract.
+
+    Examples
+    --------
+    >>> plan = compile_workflow(MyWorkflow())  # doctest: +SKIP
+    >>> plan.workflow_id
+    'my-workflow'
+    """
     return _Compiler(workflow).compile()
 
 

@@ -1,3 +1,11 @@
+"""Evaluate replay cases under configurable verification policies.
+
+Verification converts replay outcomes and fixture/contract errors into one
+stable pass/fail result. Divergence and changed behavior are diagnostic by
+default and can be promoted to blocking outcomes through
+:class:`VerificationPolicy`.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
@@ -17,23 +25,45 @@ from .replay import (
 
 
 class VerificationVerdict(StrEnum):
+    """Aggregate pass or fail verdict for a verification suite."""
+
     PASS = "PASS"
     FAIL = "FAIL"
 
 
 @dataclass(frozen=True)
 class VerificationPolicy:
+    """Rules that promote diagnostic replay outcomes to blocking failures.
+
+    Attributes
+    ----------
+    replay_divergence_blocking
+        Fail when historical and current graphs cannot be aligned exactly.
+    behavior_change_blocking
+        Fail when a selectively executed module changes output or trajectory.
+    """
+
     replay_divergence_blocking: bool = False
     behavior_change_blocking: bool = False
 
 
 @dataclass(frozen=True)
 class VerificationSuite:
+    """Collection of replay cases evaluated as one behavioral check.
+
+    Attributes
+    ----------
+    replay_tests
+        Ordered full-stub and selective replay cases to evaluate.
+    """
+
     replay_tests: tuple[ReplayCase, ...] = ()
 
 
 @dataclass(frozen=True)
 class VerificationCaseResult:
+    """Normalized result or contract error for one replay case."""
+
     result: ReplayResult | None
     error_code: str | None = None
     message: str = ""
@@ -42,6 +72,8 @@ class VerificationCaseResult:
 
 @dataclass(frozen=True)
 class VerificationResult:
+    """Aggregate verdict with ordered per-case replay evidence."""
+
     verdict: VerificationVerdict
     replay_results: tuple[VerificationCaseResult, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -54,6 +86,29 @@ async def verify_workflow(
     policy: VerificationPolicy | None = None,
     engine: ReplayEngine | None = None,
 ) -> VerificationResult:
+    """Run a verification suite against the current workflow.
+
+    Parameters
+    ----------
+    workflow
+        Current workflow definition and module implementations.
+    suite
+        Ordered replay cases to validate and compare.
+    policy
+        Optional rules for treating divergence or changed behavior as blocking.
+    engine
+        Optional configured replay engine, useful for custom tracing or tests.
+
+    Returns
+    -------
+    VerificationResult
+        Aggregate verdict and one normalized result per replay case.
+
+    Notes
+    -----
+    Invalid fixtures and contract or selector errors always block. Graph
+    divergence and changed behavior follow the supplied policy.
+    """
     selected_policy = policy or VerificationPolicy()
     selected_engine = engine or ReplayEngine()
     results: list[VerificationCaseResult] = []

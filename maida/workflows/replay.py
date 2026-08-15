@@ -1,3 +1,11 @@
+"""Replay accepted workflow boundaries without repeating production effects.
+
+Full-stub replay validates and injects every recorded output on the historical
+execution path. Selective replay executes only explicitly selected,
+non-effectful module boundaries against their exact recorded inputs, compares
+the new behavior, and continues downstream with historical outputs.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -29,11 +37,15 @@ from .runtime import _coerce_trajectory, _rehydrate, _stable_instance_id
 
 
 class ReplayMode(StrEnum):
+    """Supported strategy for substituting historical module boundaries."""
+
     FULL_STUB = "full-stub"
     SELECTIVE = "selective"
 
 
 class ReplayStatus(StrEnum):
+    """Outcome classification returned by :class:`ReplayEngine`."""
+
     PASS = "PASS"
     CHANGED = "CHANGED"
     REPLAY_DIVERGENCE = "REPLAY_DIVERGENCE"
@@ -43,19 +55,31 @@ class ReplayStatus(StrEnum):
 
 
 class ReplayContractError(RuntimeError):
-    pass
+    """Raised when fixture data cannot satisfy current workflow contracts."""
 
 
 class ReplaySelectorError(ValueError):
-    pass
+    """Raised when a selective replay target is invalid or ambiguous."""
 
 
 class ReplayEffectViolation(RuntimeError):
-    pass
+    """Raised when replay code attempts a runtime-managed external effect."""
 
 
 @dataclass(frozen=True)
 class ReplayBudget:
+    """Optional limits applied only to selectively executed live work.
+
+    Attributes
+    ----------
+    max_cost_usd
+        Maximum cumulative cost reported by selected boundaries.
+    max_latency_ms
+        Maximum cumulative latency for selected boundaries.
+    max_model_calls
+        Maximum selected boundaries that report model-token usage.
+    """
+
     max_cost_usd: float | None = None
     max_latency_ms: float | None = None
     max_model_calls: int | None = None
@@ -63,6 +87,20 @@ class ReplayBudget:
 
 @dataclass(frozen=True)
 class ReplayCase:
+    """Fixture, mode, selectors, and optional budget for one replay test.
+
+    Attributes
+    ----------
+    fixture
+        Validated native replay fixture.
+    mode
+        Full-stub or selective substitution strategy.
+    live_steps
+        Exact replay keys to execute in selective mode.
+    budget
+        Optional limits for new selective execution only.
+    """
+
     fixture: ReplayFixture
     mode: ReplayMode
     live_steps: tuple[ReplayKey, ...] = ()
@@ -71,6 +109,8 @@ class ReplayCase:
 
 @dataclass(frozen=True)
 class StepComparison:
+    """Historical-versus-current evidence for one selected boundary instance."""
+
     replay_key: ReplayKey
     step_instance_id: str
     executed_live: bool
@@ -86,12 +126,46 @@ class StepComparison:
 
 @dataclass(frozen=True)
 class ReplayDivergence:
+    """First unresolvable graph change and its complete structural diff.
+
+    Attributes
+    ----------
+    change
+        First insertion, deletion, reorder, topology, or control-flow mismatch.
+    diff
+        Structured changes observed before correspondence stopped.
+    """
+
     change: GraphChange
     diff: GraphDiff
 
 
 @dataclass(frozen=True)
 class ReplayResult:
+    """Deterministic outcome and evidence produced by a replay case.
+
+    Attributes
+    ----------
+    status
+        Replay outcome classification.
+    mode
+        Strategy used for this result.
+    output
+        Historical terminal output after validated continuation.
+    comparisons
+        Per-instance comparisons for selectively targeted boundaries.
+    divergence
+        Structured graph divergence when correspondence is impossible.
+    trace_ids
+        Maida trace identifiers created by selectively live attempts.
+    live_usage
+        Usage charged only by selectively executed boundaries.
+    blocking
+        Whether this result must fail verification under the active policy.
+    message
+        Human-readable result summary.
+    """
+
     status: ReplayStatus
     mode: ReplayMode
     output: Any = None
@@ -104,15 +178,22 @@ class ReplayResult:
 
 
 class TraceBridge(Protocol):
-    async def trace[OutputT](
-        self, name: str, callback: Callable[[], Awaitable[OutputT]]
-    ) -> tuple[OutputT, str | None]: ...
+    """Adapter that wraps selectively live attempts in a tracing system."""
 
-
-class MaidaTraceBridge:
     async def trace[OutputT](
         self, name: str, callback: Callable[[], Awaitable[OutputT]]
     ) -> tuple[OutputT, str | None]:
+        """Execute ``callback`` and return its output with an optional trace ID."""
+        ...
+
+
+class MaidaTraceBridge:
+    """Trace selectively executed boundaries with ordinary Maida tracing."""
+
+    async def trace[OutputT](
+        self, name: str, callback: Callable[[], Awaitable[OutputT]]
+    ) -> tuple[OutputT, str | None]:
+        """Execute a callback inside a Maida run and return its trace ID."""
         from maida.tracing import traced_run  # type: ignore[import-untyped]
         from opentelemetry import trace
 
@@ -124,6 +205,12 @@ class MaidaTraceBridge:
 
 @dataclass(frozen=True)
 class ReplayWorkerPolicy:
+    """Credential and adapter restrictions for selectively live execution.
+
+    ``production_effect_adapters`` must remain empty. ``allowed_environment``
+    names the small set of process variables copied into the replay attempt.
+    """
+
     grant: str = "replay-only"
     production_effect_adapters: tuple[str, ...] = ()
     allowed_environment: tuple[str, ...] = (
@@ -135,10 +222,21 @@ class ReplayWorkerPolicy:
     )
 
     def scrub_environment(self, environment: Mapping[str, str]) -> dict[str, str]:
+        """Return only environment entries explicitly allowed for replay."""
         return {key: value for key, value in environment.items() if key in self.allowed_environment}
 
 
 class ReplayBroker:
+    """Serve recorded or explicitly replay-safe reads and deny every effect.
+
+    Parameters
+    ----------
+    recorded_reads
+        Responses keyed by ``(adapter, request_digest)``.
+    replay_safe_live_reads
+        Explicitly approved read-only adapters available when a call opts in.
+    """
+
     def __init__(
         self,
         *,
@@ -150,6 +248,7 @@ class ReplayBroker:
         self.effect_attempts = 0
 
     async def effect(self, adapter: str, operation: str, request: Any) -> Any:
+        """Record an effect attempt and fail replay without calling an adapter."""
         self.effect_attempts += 1
         raise ReplayEffectViolation(
             f"supported effect path {adapter}.{operation} was attempted during replay"
@@ -163,6 +262,14 @@ class ReplayBroker:
         *,
         allow_live: bool = False,
     ) -> Any:
+        """Return a recorded read or an explicitly approved live-read response.
+
+        Raises
+        ------
+        ReplayContractError
+            If no recorded response exists and no approved live-read adapter is
+            both registered and requested.
+        """
         key = (adapter, digest_data({"operation": operation, "request": request}))
         if key in self.recorded_reads:
             return self.recorded_reads[key]
@@ -186,6 +293,16 @@ class ReplayEffectAdapter:
         recorded: EffectRecord,
         recorded_result: Any = None,
     ) -> Any:
+        """Compare a proposed effect with history and return a safe response.
+
+        No connector or effect handler is invoked. A matching proposal returns
+        ``recorded_result`` or a synthetic acknowledgement.
+
+        Raises
+        ------
+        ReplayContractError
+            If adapter, operation, or request content differs from history.
+        """
         proposed_digest = digest_data(request)
         if (
             recorded.kind is not EffectKind.ATTEMPTED
@@ -198,6 +315,25 @@ class ReplayEffectAdapter:
 
 
 class ReplayEngine:
+    """Validate graph correspondence and execute full or selective replay.
+
+    Parameters
+    ----------
+    aligner
+        Exact graph correspondence engine. Defaults to :class:`GraphAligner`.
+    trace_bridge
+        Trace adapter used only for selectively executed module attempts.
+    broker_factory
+        Factory for a fresh effect-denying :class:`ReplayBroker`.
+    worker_policy
+        Credential and adapter restrictions for live replay work.
+
+    Raises
+    ------
+    ReplayContractError
+        If the worker policy registers a production effect adapter.
+    """
+
     def __init__(
         self,
         *,
@@ -218,6 +354,35 @@ class ReplayEngine:
         workflow: Workflow[InputT, OutputT],
         case: ReplayCase,
     ) -> ReplayResult:
+        """Replay a fixture against the current workflow definition.
+
+        Parameters
+        ----------
+        workflow
+            Current workflow whose contracts and identities are authoritative.
+        case
+            Fixture, replay mode, selective targets, and optional budget.
+
+        Returns
+        -------
+        ReplayResult
+            Validated historical output, comparisons, divergence, and usage.
+
+        Raises
+        ------
+        ReplayFixtureError
+            If fixture values or artifacts fail integrity validation.
+        ReplayContractError
+            If recorded data cannot be injected into current typed contracts.
+        ReplaySelectorError
+            If live selectors are missing, unknown, or invalid for the mode.
+
+        Notes
+        -----
+        Full-stub mode invokes no module handlers. Selective mode never executes
+        an ``effectful`` module and treats any broker effect attempt as a hard
+        violation.
+        """
         _validate_loaded_integrity(case.fixture)
         compiled = _compile_workflow_graph(workflow)
         current = compiled.plan
@@ -738,6 +903,11 @@ def build_module_registry(
     *,
     output: RuntimeValue[Any] | None = None,
 ) -> dict[ReplayKey, Module[Any, Any]]:
+    """Return current module instances indexed by exact replay key.
+
+    This is an advanced integration helper for workers that need to bind a
+    compiled definition to executable Python module instances.
+    """
     if plan is None or output is None:
         compiled_graph = _compile_workflow_graph(workflow)
         compiled = compiled_graph.plan
@@ -781,6 +951,13 @@ def build_module_registry(
 
 
 def resolve_selectors(plan: PlanIR, selectors: Sequence[str]) -> tuple[ReplayKey, ...]:
+    """Resolve ``module:ID`` and ``step:ID`` selectors to exact replay keys.
+
+    Raises
+    ------
+    ReplaySelectorError
+        If a selector is malformed, matches nothing, or matches multiple steps.
+    """
     keys = tuple(step.replay_key for step in plan.executable_steps if step.replay_key is not None)
     selected: list[ReplayKey] = []
     for selector in selectors:
@@ -803,6 +980,7 @@ def resolve_selectors(plan: PlanIR, selectors: Sequence[str]) -> tuple[ReplayKey
 
 
 def json_from_bytes(content: bytes) -> Any:
+    """Decode UTF-8 JSON bytes used by a recorded replay value."""
     import json
 
     return json.loads(content)
@@ -866,6 +1044,13 @@ def _budget_violation(
 
 
 def assert_replay_worker_environment(policy: ReplayWorkerPolicy | None = None) -> dict[str, str]:
+    """Validate a replay policy and return its scrubbed current environment.
+
+    Raises
+    ------
+    ReplayContractError
+        If the selected policy registers any production effect adapter.
+    """
     selected = policy or ReplayWorkerPolicy()
     if selected.production_effect_adapters:
         raise ReplayContractError("replay workers cannot register production effect adapters")

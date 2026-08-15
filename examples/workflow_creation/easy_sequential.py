@@ -1,4 +1,8 @@
-"""Easy: compose modules by passing one symbolic output to the next module."""
+"""Compose a two-stage workflow by chaining symbolic outputs.
+
+``NormalizeName`` produces the exact typed input consumed by ``Greet``. The
+workflow remains declarative: neither module executes while ``build`` runs.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +10,8 @@ from maida.workflows import ExecutionContext, Module, RuntimeValue, Workflow
 
 
 class NormalizeName(Module[str, str]):
+    """Collapse whitespace and title-case a supplied name."""
+
     input_type = str
     output_type = str
 
@@ -14,6 +20,8 @@ class NormalizeName(Module[str, str]):
 
 
 class Greet(Module[str, str]):
+    """Format a normalized name as a greeting."""
+
     input_type = str
     output_type = str
 
@@ -22,6 +30,8 @@ class Greet(Module[str, str]):
 
 
 class SequentialGreetingWorkflow(Workflow[str, str]):
+    """Normalize a name and pass its symbolic output to the greeting module."""
+
     workflow_id = "onboarding-sequential"
     input_type = str
     output_type = str
