@@ -1284,6 +1284,31 @@ class PostgresStore:
             )
             return tuple(self._event_from_row(row) for row in cursor.fetchall())
 
+    def list_active_runs(self, *, limit: int = 100) -> tuple[tuple[str, str, str], ...]:
+        """Return running run identities for definition-pinned coordination.
+
+        The control-plane query carries only run, tenant, and definition
+        identities. Root values and application payloads remain in durable
+        storage and are loaded only by the matching scheduler.
+        """
+        if limit < 1 or limit > 10_000:
+            raise ValueError("limit must be between 1 and 10000")
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT run_id, tenant_id, definition_digest
+                FROM workflow_runs
+                WHERE status = 'RUNNING'
+                ORDER BY created_at, run_id
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            return tuple(
+                (str(row["run_id"]), row["tenant_id"], row["definition_digest"])
+                for row in cursor.fetchall()
+            )
+
     @staticmethod
     def _task_from_row(row: dict[str, Any]) -> Task:
         boundary = row.get("accepted_boundary")

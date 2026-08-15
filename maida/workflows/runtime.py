@@ -9,6 +9,7 @@ development convenience.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import time
 import types
@@ -415,7 +416,13 @@ class TaskWorker:
             raise TypeError("interaction request payload must be a mapping")
         self.store.park_task(envelope._claim(), request_data)
 
-    async def run_once(self, *, task_id: str | None = None) -> BoundaryRecord | None:
+    async def run_once(
+        self,
+        *,
+        task_id: str | None = None,
+        lease_for: timedelta = timedelta(minutes=5),
+        heartbeat_every: timedelta | None = None,
+    ) -> BoundaryRecord | None:
         """Claim and execute at most one durable task.
 
         Parameters
@@ -423,6 +430,11 @@ class TaskWorker:
         task_id
             Optional exact task to claim; otherwise any eligible task may be
             leased.
+        lease_for
+            Duration of each claim and automatic heartbeat extension.
+        heartbeat_every
+            Interval between automatic heartbeats. Defaults to one third of
+            ``lease_for`` and must be shorter than the lease.
 
         Returns
         -------
@@ -435,38 +447,89 @@ class TaskWorker:
             If no matching module is registered, its digest differs from the
             task definition, or persisted input violates the module contract.
         """
-        envelope = self.claim(task_id=task_id)
+        interval = lease_for / 3 if heartbeat_every is None else heartbeat_every
+        if interval <= timedelta(0) or interval >= lease_for:
+            raise ValueError("heartbeat_every must be positive and shorter than lease_for")
+        envelope = self.claim(task_id=task_id, lease_for=lease_for)
         if envelope is None:
             return None
         envelope = self.start(envelope)
-        claim = envelope._claim()
-        key = ReplayKey(claim.task.module_id, claim.task.logical_step)
+        heartbeat = asyncio.create_task(self._heartbeat_loop(envelope, lease_for, interval))
         try:
-            module = self.modules[key]
-        except KeyError as exc:
-            self.fail(
-                envelope,
-                {"reason": f"no module registered for {key.as_string()}"},
-                retry=False,
+            claim = envelope._claim()
+            key = ReplayKey(claim.task.module_id, claim.task.logical_step)
+            try:
+                module = self.modules[key]
+            except KeyError as exc:
+                self.fail(
+                    envelope,
+                    {"reason": f"no module registered for {key.as_string()}"},
+                    retry=False,
+                )
+                raise RuntimeContractError(f"no module registered for {key.as_string()}") from exc
+            try:
+                input_data = _rehydrate(
+                    self.store.values.decode(envelope.input_ref), module.input_type
+                )
+            except Exception as exc:
+                self.fail(
+                    envelope,
+                    {"reason": str(exc), "exception_type": type(exc).__qualname__},
+                    retry=False,
+                )
+                raise RuntimeContractError("task input reference could not be resolved") from exc
+            return await self._execute_claim(
+                module,
+                claim,
+                input_data,
+                branch_decisions=claim.task.branch_decisions,
+                map_decisions=claim.task.map_decisions,
+                broker=self.broker,
             )
-            raise RuntimeContractError(f"no module registered for {key.as_string()}") from exc
-        try:
-            input_data = _rehydrate(self.store.values.decode(envelope.input_ref), module.input_type)
-        except Exception as exc:
-            self.fail(
-                envelope,
-                {"reason": str(exc), "exception_type": type(exc).__qualname__},
-                retry=False,
-            )
-            raise RuntimeContractError("task input reference could not be resolved") from exc
-        return await self._execute_claim(
-            module,
-            claim,
-            input_data,
-            branch_decisions=claim.task.branch_decisions,
-            map_decisions=claim.task.map_decisions,
-            broker=self.broker,
-        )
+        finally:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+
+    async def serve(
+        self,
+        *,
+        stop: Callable[[], bool],
+        poll_interval: float = 0.25,
+    ) -> int:
+        """Poll and execute compatible tasks until ``stop`` returns true.
+
+        Parameters
+        ----------
+        stop
+            Caller-owned predicate used for graceful process shutdown.
+        poll_interval
+            Delay after an empty claim pass.
+
+        Returns
+        -------
+        int
+            Number of accepted boundaries produced by this worker.
+        """
+        if poll_interval <= 0:
+            raise ValueError("poll_interval must be positive")
+        processed = 0
+        while not stop():
+            boundary = await self.run_once()
+            if boundary is None:
+                await asyncio.sleep(poll_interval)
+            else:
+                processed += 1
+        return processed
+
+    async def _heartbeat_loop(
+        self,
+        envelope: TaskEnvelope,
+        lease_for: timedelta,
+        interval: timedelta,
+    ) -> None:
+        while True:
+            await asyncio.sleep(interval.total_seconds())
+            self.heartbeat(envelope, lease_for=lease_for)
 
     async def _execute_claim(
         self,

@@ -14,6 +14,7 @@ PUBLIC_MODULES = (
     "maida.workflows.authoring",
     "maida.workflows.baseline",
     "maida.workflows.cli",
+    "maida.workflows.coordination",
     "maida.workflows.fixture",
     "maida.workflows.ir",
     "maida.workflows.models",

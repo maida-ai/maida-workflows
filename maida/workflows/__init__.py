@@ -33,6 +33,7 @@ from .authoring import (
     parallel,
     when,
 )
+from .coordination import CoordinatorProgress, WorkflowCatalog, WorkflowCoordinator
 from .fixture import ReplayFixture, ReplayFixtureError, ReplayFixtureImporter
 from .ir import CompileError, PlanIR, ReplayKey, StepIR, compile_workflow
 from .models import (
@@ -91,6 +92,7 @@ __all__ = [
     "CommandReceipt",
     "CommandType",
     "CompileError",
+    "CoordinatorProgress",
     "EventPage",
     "ExecutionContext",
     "ExecutionMode",
@@ -132,7 +134,9 @@ __all__ = [
     "TaskWorker",
     "VerificationSuite",
     "Workflow",
+    "WorkflowCatalog",
     "WorkflowClient",
+    "WorkflowCoordinator",
     "WorkflowRun",
     "WorkflowRunner",
     "WorkflowScheduler",
