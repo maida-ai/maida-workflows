@@ -46,6 +46,7 @@ from .authoring import (
     RuntimeValue,
     SymbolicValueError,
     Workflow,
+    literal,
     map_over,
     parallel,
     when,
@@ -63,7 +64,7 @@ from .dynamic import (
     PlanValidator,
 )
 from .fixture import ReplayFixture, ReplayFixtureError, ReplayFixtureImporter
-from .ir import CompileError, PlanIR, ReplayKey, StepIR, compile_workflow
+from .ir import BindingIR, CompileError, PlanIR, ReplayKey, StepIR, compile_workflow
 from .models import (
     BoundaryRecord,
     ExecutionMode,
@@ -119,6 +120,7 @@ __all__ = [
     "AccessPolicy",
     "ApprovalEvidence",
     "ApproveCommand",
+    "BindingIR",
     "BoundModuleCall",
     "BoundWorkflow",
     "BoundaryRecord",
@@ -196,6 +198,7 @@ __all__ = [
     "bind_workflow",
     "compile_workflow",
     "create_userplane_app",
+    "literal",
     "map_over",
     "parallel",
     "parse_command",

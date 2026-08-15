@@ -26,8 +26,10 @@ from .authoring import (
     Module,
     RuntimeValue,
     Workflow,
+    _FieldBinding,
     _MapBinding,
     _ModuleBinding,
+    _StructuredBinding,
     _WorkflowBinding,
 )
 from .fixture import ReplayFixture, _validate_loaded_integrity
@@ -813,6 +815,52 @@ class _StubGraphExecutor:
             )
             module_binding = cast(_ModuleBinding, expression.payload)
             result = self._inject(path, module_binding.module, source, scope)
+        elif expression.kind == "literal":
+            result = _StubEvaluation(expression.payload)
+        elif expression.kind == "field":
+            root, projected_path = self._field_root(value)
+            source = await self._visit(
+                root,
+                path=path,
+                workflow=workflow,
+                external=external,
+                scope=scope,
+            )
+            projected = source.value
+            try:
+                for name in projected_path:
+                    projected = (
+                        projected[name]
+                        if isinstance(projected, Mapping)
+                        else getattr(projected, name)
+                    )
+            except (AttributeError, KeyError, TypeError) as exc:
+                raise ReplayContractError(
+                    f"field binding {'.'.join(projected_path)!r} is unavailable"
+                ) from exc
+            result = _StubEvaluation(projected, source.dependency_instance_keys)
+        elif expression.kind == "object":
+            structured = cast(_StructuredBinding, expression.payload)
+            children = [
+                await self._visit(
+                    dependency,
+                    path=f"{path}.field[{name}]",
+                    workflow=workflow,
+                    external=external,
+                    scope=scope,
+                )
+                for name, dependency in zip(structured.names, expression.dependencies, strict=True)
+            ]
+            result = _StubEvaluation(
+                {name: child.value for name, child in zip(structured.names, children, strict=True)},
+                _unique(
+                    tuple(
+                        instance
+                        for child in children
+                        for instance in child.dependency_instance_keys
+                    )
+                ),
+            )
         elif expression.kind == "when":
             condition = await self._visit(
                 expression.dependencies[0],
@@ -901,6 +949,16 @@ class _StubGraphExecutor:
             raise ReplayContractError(f"unsupported replay expression {expression.kind!r}")
         self.cache[id(value)] = result
         return result
+
+    @staticmethod
+    def _field_root(value: RuntimeValue[Any]) -> tuple[RuntimeValue[Any], tuple[str, ...]]:
+        path: tuple[str, ...] = ()
+        current = value
+        while current._expression.kind == "field":
+            binding = cast(_FieldBinding, current._expression.payload)
+            path = (*binding.path, *path)
+            current = current._expression.dependencies[0]
+        return current, path
 
     def _inject(
         self,
@@ -995,14 +1053,29 @@ def build_module_registry(
             nested = binding.workflow
             visit(binding.output, f"{path}.nested[{nested.workflow_id}]", nested)
             return
-        for index, dependency in enumerate(expression.dependencies):
-            visit(dependency, f"{path}.dep{index}", owner)
+        if expression.kind in {"input", "literal"}:
+            return
+        if expression.kind == "field":
+            root = value
+            while root._expression.kind == "field":
+                root = root._expression.dependencies[0]
+            visit(root, path, owner)
+            return
+        if expression.kind == "object":
+            structured = cast(_StructuredBinding, expression.payload)
+            for name, dependency in zip(structured.names, expression.dependencies, strict=True):
+                visit(dependency, f"{path}.field[{name}]", owner)
+            return
         if expression.kind == "module":
             module_binding = cast(_ModuleBinding, expression.payload)
+            visit(module_binding.input_value, f"{path}.dep0", owner)
             key = steps[path].replay_key
             if key is not None:
                 found[key] = module_binding.module
-        elif expression.kind == "map":
+            return
+        for index, dependency in enumerate(expression.dependencies):
+            visit(dependency, f"{path}.dep{index}", owner)
+        if expression.kind == "map":
             map_binding = cast(_MapBinding, expression.payload)
             key = steps[path].replay_key
             if key is not None:

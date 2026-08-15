@@ -9,14 +9,15 @@ over symbolic values.
 
 from __future__ import annotations
 
+import dataclasses
 import types
 import typing
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Any, cast
 
-from ._canonical import schema_digest
+from ._canonical import canonical_data, schema_digest, value_matches_type
 from .budget import Budget
 from .models import ExecutionSpec
 
@@ -58,6 +59,20 @@ class _Expression:
     kind: str
     dependencies: tuple[RuntimeValue[Any], ...] = ()
     payload: Any = None
+
+
+@dataclass(frozen=True)
+class _FieldBinding:
+    path: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _StructuredBinding:
+    kind: str
+    names: tuple[str, ...] = ()
+
+
+_MISSING = object()
 
 
 @dataclass(frozen=True)
@@ -116,6 +131,52 @@ class RuntimeValue[OutputT]:
             "RuntimeValue is symbolic; use map_over(...) instead of len(...) or Python iteration"
         )
 
+    def field(self, path: str) -> RuntimeValue[Any]:
+        """Project a typed field from a symbolic object.
+
+        Parameters
+        ----------
+        path
+            Dot-separated field path. Each component must exist in the
+            declared dataclass, typed dictionary, or mapping contract.
+
+        Returns
+        -------
+        RuntimeValue
+            Symbolic reference carrying the projected field's Python type.
+
+        Raises
+        ------
+        ValueError
+            If the path is empty or absent from the declared object contract.
+
+        Examples
+        --------
+        >>> request = RuntimeValue.input(Request)  # doctest: +SKIP
+        >>> email = request.field("customer.email")  # doctest: +SKIP
+        """
+        parts = tuple(part for part in path.split(".") if part)
+        if not parts or ".".join(parts) != path:
+            raise ValueError("field path must contain non-empty dot-separated names")
+        projected = _projected_type(self.value_type, parts)
+        return RuntimeValue(
+            value_type=projected,
+            _expression=_Expression(
+                kind="field",
+                dependencies=(cast(RuntimeValue[Any], self),),
+                payload=_FieldBinding(parts),
+            ),
+        )
+
+    def __getattr__(self, name: str) -> RuntimeValue[Any]:
+        """Provide ``value.name`` sugar for :meth:`field` projections."""
+        if name.startswith("_"):
+            raise AttributeError(name)
+        try:
+            return self.field(name)
+        except ValueError as exc:
+            raise AttributeError(name) from exc
+
 
 class Module[InputT, OutputT](ABC):
     """Typed unit of workflow execution.
@@ -158,13 +219,28 @@ class Module[InputT, OutputT](ABC):
     capabilities: tuple[Any, ...] = ()
     effects: tuple[Any, ...] = ()
 
-    def __call__(self, value: RuntimeValue[InputT]) -> RuntimeValue[OutputT]:
+    @typing.overload
+    def __call__(self, value: RuntimeValue[InputT], /) -> RuntimeValue[OutputT]: ...
+
+    @typing.overload
+    def __call__(self, /, **fields: Any) -> RuntimeValue[OutputT]: ...
+
+    def __call__(
+        self,
+        value: RuntimeValue[InputT] | object = _MISSING,
+        /,
+        **fields: Any,
+    ) -> RuntimeValue[OutputT]:
         """Create a symbolic output connected to this module occurrence.
 
         The handler is not executed. Calling a module inside ``Workflow.build``
         only records a typed dependency in the workflow definition.
         """
-        return self._bind(value=value, logical_step=None, explicit=False)
+        return self._bind(
+            value=_module_input(self.input_type, value, fields),
+            logical_step=None,
+            explicit=False,
+        )
 
     def at(self, logical_step: str) -> BoundModuleCall[InputT, OutputT]:
         """Bind this module occurrence to an explicit logical step.
@@ -205,7 +281,7 @@ class Module[InputT, OutputT](ABC):
             _expression=_Expression(
                 kind="module",
                 dependencies=(cast(RuntimeValue[Any], value),),
-                payload=_ModuleBinding(self, logical_step, explicit),
+                payload=_ModuleBinding(self, logical_step, explicit, value),
             ),
         )
 
@@ -232,6 +308,7 @@ class _ModuleBinding:
     module: Module[Any, Any]
     logical_step: str | None
     explicit: bool
+    input_value: RuntimeValue[Any]
 
 
 @dataclass(frozen=True)
@@ -245,9 +322,24 @@ class BoundModuleCall[InputT, OutputT]:
     module: Module[InputT, OutputT]
     logical_step: str
 
-    def __call__(self, value: RuntimeValue[InputT]) -> RuntimeValue[OutputT]:
+    @typing.overload
+    def __call__(self, value: RuntimeValue[InputT], /) -> RuntimeValue[OutputT]: ...
+
+    @typing.overload
+    def __call__(self, /, **fields: Any) -> RuntimeValue[OutputT]: ...
+
+    def __call__(
+        self,
+        value: RuntimeValue[InputT] | object = _MISSING,
+        /,
+        **fields: Any,
+    ) -> RuntimeValue[OutputT]:
         """Create a symbolic output at the previously bound logical step."""
-        return self.module._bind(value=value, logical_step=self.logical_step, explicit=True)
+        return self.module._bind(
+            value=_module_input(self.module.input_type, value, fields),
+            logical_step=self.logical_step,
+            explicit=True,
+        )
 
 
 @dataclass(frozen=True)
@@ -393,6 +485,42 @@ def parallel(*values: RuntimeValue[Any]) -> RuntimeValue[tuple[Any, ...]]:
     )
 
 
+def literal[ValueT](value: ValueT, value_type: Any | None = None) -> RuntimeValue[ValueT]:
+    """Create a durable symbolic literal for a workflow binding.
+
+    Parameters
+    ----------
+    value
+        JSON-compatible immutable value embedded in the workflow definition.
+    value_type
+        Optional declared Python contract. By default ``type(value)`` is used.
+
+    Returns
+    -------
+    RuntimeValue
+        Symbolic literal that can participate in structured module inputs.
+
+    Raises
+    ------
+    TypeError
+        If the value violates the requested type or is not canonically
+        serializable.
+
+    Notes
+    -----
+    Literals become part of the definition digest. Secrets and credentials
+    must never be embedded; resolve them through a runtime provider instead.
+    """
+    annotation = type(value) if value_type is None else value_type
+    if not value_matches_type(value, annotation):
+        raise TypeError(f"literal value does not match {annotation!r}")
+    encoded = canonical_data(value)
+    return RuntimeValue(
+        value_type=annotation,
+        _expression=_Expression(kind="literal", payload=encoded),
+    )
+
+
 @dataclass(frozen=True)
 class _MapBinding:
     module: Module[Any, Any]
@@ -471,3 +599,96 @@ def _require_type_handoff(source: Any, target: Any, *, boundary: str) -> None:
         return
     if schema_digest(source) != schema_digest(target):
         raise TypeError(f"{boundary} expects {target!r}, received symbolic {source!r}")
+
+
+def _module_input(
+    input_type: Any,
+    value: object,
+    fields_by_name: Mapping[str, Any],
+) -> RuntimeValue[Any]:
+    if value is not _MISSING and fields_by_name:
+        raise TypeError("module calls accept either one symbolic value or keyword bindings")
+    if value is not _MISSING:
+        if not isinstance(value, RuntimeValue):
+            raise TypeError("positional module input must be a RuntimeValue")
+        return value
+    if not fields_by_name:
+        raise TypeError("module call requires a symbolic value or keyword bindings")
+    return _structured_value(input_type, fields_by_name)
+
+
+def _structured_value(input_type: Any, supplied: Mapping[str, Any]) -> RuntimeValue[Any]:
+    hints: Mapping[str, Any]
+    required: set[str]
+    if is_dataclass(input_type):
+        hints = typing.get_type_hints(input_type)
+        declared_fields = {item.name: item for item in fields(input_type)}
+        required = {
+            name
+            for name, item in declared_fields.items()
+            if item.default is dataclasses.MISSING and item.default_factory is dataclasses.MISSING
+        }
+    elif typing.is_typeddict(input_type):
+        hints = typing.get_type_hints(input_type)
+        required = set(getattr(input_type, "__required_keys__", hints))
+    else:
+        origin = typing.get_origin(input_type)
+        arguments = typing.get_args(input_type)
+        if origin not in (dict, Mapping):
+            raise TypeError(
+                "keyword module bindings require a dataclass, TypedDict, or mapping input type"
+            )
+        value_type = arguments[1] if len(arguments) > 1 else Any
+        hints = {name: value_type for name in supplied}
+        required = set(supplied)
+    unknown = set(supplied) - set(hints)
+    if unknown:
+        raise TypeError(f"module keyword bindings contain unknown fields: {sorted(unknown)}")
+    missing = required - set(supplied)
+    if missing:
+        raise TypeError(f"module keyword bindings are missing required fields: {sorted(missing)}")
+    names = tuple(sorted(supplied))
+    dependencies = tuple(
+        _binding_value(supplied[name], hints.get(name, Any), name) for name in names
+    )
+    return RuntimeValue(
+        value_type=input_type,
+        _expression=_Expression(
+            kind="object",
+            dependencies=dependencies,
+            payload=_StructuredBinding("object", names),
+        ),
+    )
+
+
+def _binding_value(value: Any, expected: Any, name: str) -> RuntimeValue[Any]:
+    try:
+        symbolic = value if isinstance(value, RuntimeValue) else literal(value, expected)
+    except TypeError as exc:
+        raise TypeError(f"module keyword binding {name!r} violates {expected!r}") from exc
+    _require_type_handoff(
+        symbolic.value_type,
+        expected,
+        boundary=f"module keyword binding {name!r}",
+    )
+    return symbolic
+
+
+def _projected_type(annotation: Any, path: tuple[str, ...]) -> Any:
+    current = annotation
+    traversed: list[str] = []
+    for part in path:
+        traversed.append(part)
+        if is_dataclass(current) or typing.is_typeddict(current):
+            hints = typing.get_type_hints(current)
+            if part not in hints:
+                raise ValueError(f"{current!r} has no field {'.'.join(traversed)!r}")
+            current = hints[part]
+            continue
+        origin = typing.get_origin(current)
+        arguments = typing.get_args(current)
+        if origin in (dict, Mapping):
+            current = arguments[1] if len(arguments) > 1 else Any
+            continue
+        raise ValueError(f"{current!r} has no field {'.'.join(traversed)!r}")
+    return current

@@ -38,7 +38,7 @@ from .authoring import (
     Workflow,
 )
 from .definitions import BoundWorkflow, bind_workflow
-from .ir import PlanIR, ReplayKey, StepIR, module_digest
+from .ir import BindingIR, PlanIR, ReplayKey, StepIR, module_digest
 from .models import (
     AcceptedAttemptProvenance,
     Attempt,
@@ -987,7 +987,8 @@ class WorkflowScheduler:
                 raise RuntimeContractError(f"unsupported runtime IR step {step.kind!r}")
             if step.input_binding is None:
                 raise RuntimeContractError("module step has no input binding")
-            visit(step.input_binding.source, scope)
+            for source_node in step.input_binding.source_nodes:
+                visit(source_node, scope)
             self.store.enqueue_task(
                 self.run_id,
                 step,
@@ -1026,8 +1027,8 @@ class WorkflowScheduler:
         if step.kind == "module":
             if step.input_binding is None or step.replay_key is None:
                 raise RuntimeContractError("module step has an incomplete definition")
-            source = self._evaluate_node(
-                step.input_binding.source,
+            source = self._resolve_binding(
+                step.input_binding,
                 external=external,
                 scope=scope,
             )
@@ -1039,8 +1040,17 @@ class WorkflowScheduler:
                     source,
                     branch_decisions=(*source.branch_decisions, *inherited),
                 )
+            module = self.definition.modules[step.replay_key]
+            hydrated = _rehydrate(source.value, module.input_type)
+            if not value_matches_type(hydrated, module.input_type):
+                raise RuntimeContractError(
+                    f"resolved input for {step.replay_key.as_string()} violates its contract"
+                )
             return self._module_result(
-                step, self.definition.modules[step.replay_key], source, scope
+                step,
+                module,
+                dataclasses.replace(source, value=hydrated),
+                scope,
             )
         if step.kind == "when":
             condition = self._evaluate_node(
@@ -1144,6 +1154,63 @@ class WorkflowScheduler:
                 (*source.map_decisions, map_decision),
             )
         raise RuntimeContractError(f"unsupported runtime IR step {step.kind!r}")
+
+    def _resolve_binding(
+        self,
+        binding: BindingIR,
+        *,
+        external: _Evaluation,
+        scope: tuple[str, ...],
+    ) -> _Evaluation | None:
+        if binding.kind in {"source", "field"}:
+            if binding.source is None:
+                raise RuntimeContractError("source binding has no node identifier")
+            source = self._evaluate_node(binding.source, external=external, scope=scope)
+            if source is None or binding.kind == "source":
+                return source
+            value = source.value
+            try:
+                for name in binding.path:
+                    value = value[name] if isinstance(value, Mapping) else getattr(value, name)
+            except (AttributeError, KeyError, TypeError) as exc:
+                raise RuntimeContractError(
+                    f"field binding {'.'.join(binding.path)!r} is unavailable"
+                ) from exc
+            return dataclasses.replace(source, value=value)
+        if binding.kind == "literal":
+            return _Evaluation(binding.value)
+        children: tuple[tuple[str | None, BindingIR], ...]
+        if binding.kind == "object":
+            children = tuple((name, child) for name, child in binding.fields)
+        elif binding.kind in {"list", "tuple"}:
+            children = tuple((None, child) for child in binding.items)
+        else:
+            raise RuntimeContractError(f"unsupported input binding {binding.kind!r}")
+        resolved = tuple(
+            self._resolve_binding(child, external=external, scope=scope) for _, child in children
+        )
+        if any(item is None for item in resolved):
+            return None
+        complete = cast(tuple[_Evaluation, ...], resolved)
+        if binding.kind == "object":
+            resolved_value: Any = {
+                cast(str, name): item.value
+                for (name, _), item in zip(children, complete, strict=True)
+            }
+        elif binding.kind == "tuple":
+            resolved_value = tuple(item.value for item in complete)
+        else:
+            resolved_value = [item.value for item in complete]
+        return _Evaluation(
+            value=resolved_value,
+            dependency_instance_keys=_unique(
+                tuple(key for item in complete for key in item.dependency_instance_keys)
+            ),
+            branch_decisions=tuple(
+                decision for item in complete for decision in item.branch_decisions
+            ),
+            map_decisions=tuple(decision for item in complete for decision in item.map_decisions),
+        )
 
     def _map_key_binding(self, step: StepIR) -> str | Callable[[Any], str]:
         bound = self.definition.map_item_keys

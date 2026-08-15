@@ -29,15 +29,18 @@ from .authoring import (
     Module,
     RuntimeValue,
     Workflow,
+    _FieldBinding,
     _MapBinding,
     _ModuleBinding,
+    _StructuredBinding,
     _WorkflowBinding,
 )
 from .budget import Budget
 
-IR_VERSION = "0.3.0"
-SUPPORTED_IR_VERSIONS = frozenset({"0.1.0", "0.2.0", IR_VERSION})
-_ACCESS_IR_VERSIONS = frozenset({"0.2.0", IR_VERSION})
+IR_VERSION = "0.4.0"
+SUPPORTED_IR_VERSIONS = frozenset({"0.1.0", "0.2.0", "0.3.0", IR_VERSION})
+_ACCESS_IR_VERSIONS = frozenset({"0.2.0", "0.3.0", IR_VERSION})
+_BUDGET_IR_VERSIONS = frozenset({"0.3.0", IR_VERSION})
 
 
 class CompileError(ValueError):
@@ -66,18 +69,128 @@ class ReplayKey:
 
 @dataclass(frozen=True)
 class BindingIR:
-    """Typed dependency binding for an executable IR step.
+    """Typed value expression supplying one executable module input.
 
     Attributes
     ----------
-    source
-        Node identifier that supplies the step input.
     schema_digest
-        Digest of the input type contract expected by the step.
+        Digest of the value type produced by this binding.
+    kind
+        ``source``, ``field``, ``literal``, ``object``, ``list``, or ``tuple``.
+    source
+        Node identifier used by source and field bindings.
+    path
+        Stable field path used by a field projection.
+    value
+        Canonical JSON value used by a literal binding.
+    fields, items
+        Recursively typed children for structured bindings.
     """
 
-    source: str
     schema_digest: str
+    kind: str = "source"
+    source: str | None = None
+    path: tuple[str, ...] = ()
+    value: Any = None
+    fields: tuple[tuple[str, BindingIR], ...] = ()
+    items: tuple[BindingIR, ...] = ()
+
+    def to_data(self, *, legacy: bool = False) -> dict[str, Any]:
+        """Return the canonical recursive wire representation."""
+        if legacy:
+            if self.kind != "source" or self.source is None:
+                raise ValueError("legacy Workflow IR supports only source bindings")
+            return {"source": self.source, "schema_digest": self.schema_digest}
+        data: dict[str, Any] = {"kind": self.kind, "schema_digest": self.schema_digest}
+        if self.kind in {"source", "field"}:
+            data["source"] = self.source
+        if self.kind == "field":
+            data["path"] = list(self.path)
+        elif self.kind == "literal":
+            data["value"] = canonical_data(self.value)
+        elif self.kind == "object":
+            data["fields"] = [
+                {"name": name, "binding": binding.to_data()} for name, binding in self.fields
+            ]
+        elif self.kind in {"list", "tuple"}:
+            data["items"] = [binding.to_data() for binding in self.items]
+        elif self.kind != "source":
+            raise ValueError(f"unsupported binding kind {self.kind!r}")
+        return data
+
+    @classmethod
+    def from_data(cls, data: Any, *, legacy: bool = False) -> BindingIR:
+        """Validate and restore a recursive binding from canonical data."""
+        if not isinstance(data, Mapping):
+            raise ValueError("Workflow IR input binding must be an object")
+        if legacy:
+            if set(data) != {"source", "schema_digest"}:
+                raise ValueError("legacy Workflow IR input binding fields are invalid")
+            return cls(source=str(data["source"]), schema_digest=str(data["schema_digest"]))
+        kind = data.get("kind")
+        expected_fields = {
+            "source": {"kind", "schema_digest", "source"},
+            "field": {"kind", "schema_digest", "source", "path"},
+            "literal": {"kind", "schema_digest", "value"},
+            "object": {"kind", "schema_digest", "fields"},
+            "list": {"kind", "schema_digest", "items"},
+            "tuple": {"kind", "schema_digest", "items"},
+        }
+        if not isinstance(kind, str) or kind not in expected_fields:
+            raise ValueError("Workflow IR input binding kind is invalid")
+        if set(data) != expected_fields[kind]:
+            raise ValueError("Workflow IR input binding fields are invalid")
+        schema = data["schema_digest"]
+        if not isinstance(schema, str):
+            raise ValueError("Workflow IR binding schema digest must be a string")
+        if kind in {"source", "field"}:
+            source = data["source"]
+            if not isinstance(source, str) or not source:
+                raise ValueError("Workflow IR binding source must be a node identifier")
+            path: tuple[str, ...] = ()
+            if kind == "field":
+                raw_path = data["path"]
+                if (
+                    not isinstance(raw_path, list)
+                    or not raw_path
+                    or any(not isinstance(item, str) or not item for item in raw_path)
+                ):
+                    raise ValueError("Workflow IR field binding path is invalid")
+                path = tuple(raw_path)
+            return cls(schema_digest=schema, kind=str(kind), source=source, path=path)
+        if kind == "literal":
+            return cls(schema_digest=schema, kind="literal", value=canonical_data(data["value"]))
+        if kind == "object":
+            raw_fields = data["fields"]
+            if not isinstance(raw_fields, list):
+                raise ValueError("Workflow IR object binding fields must be an array")
+            fields: list[tuple[str, BindingIR]] = []
+            for item in raw_fields:
+                if not isinstance(item, Mapping) or set(item) != {"name", "binding"}:
+                    raise ValueError("Workflow IR object binding field is invalid")
+                name = item["name"]
+                if not isinstance(name, str) or not name:
+                    raise ValueError("Workflow IR object binding field name is invalid")
+                fields.append((name, cls.from_data(item["binding"])))
+            if [name for name, _ in fields] != sorted({name for name, _ in fields}):
+                raise ValueError("Workflow IR object binding fields must be canonical")
+            return cls(schema_digest=schema, kind="object", fields=tuple(fields))
+        raw_items = data["items"]
+        if not isinstance(raw_items, list):
+            raise ValueError("Workflow IR sequence binding items must be an array")
+        return cls(
+            schema_digest=schema,
+            kind=str(kind),
+            items=tuple(cls.from_data(item) for item in raw_items),
+        )
+
+    @property
+    def source_nodes(self) -> tuple[str, ...]:
+        """Return ordered unique graph nodes referenced by this binding."""
+        if self.kind in {"source", "field"}:
+            return (self.source,) if self.source is not None else ()
+        children = tuple(binding for _, binding in self.fields) or self.items
+        return tuple(dict.fromkeys(node for child in children for node in child.source_nodes))
 
 
 @dataclass(frozen=True)
@@ -168,6 +281,11 @@ class PlanIR:
     def to_dict(self) -> dict[str, Any]:
         """Return a deterministic JSON-compatible representation of the plan."""
         encoded = cast(dict[str, Any], canonical_data(asdict(self)))
+        for raw_step, step in zip(encoded["steps"], self.steps, strict=True):
+            if step.input_binding is not None:
+                raw_step["input_binding"] = step.input_binding.to_data(
+                    legacy=self.version != IR_VERSION
+                )
         if self.version in {"0.1.0", "0.2.0"}:
             for step in encoded["steps"]:
                 step.pop("budget", None)
@@ -216,10 +334,10 @@ class PlanIR:
                 "capabilities" not in raw or "effects" not in raw
             ):
                 raise ValueError(f"Workflow IR {version} steps require external access fields")
-            if version == IR_VERSION and "budget" not in raw:
+            if version in _BUDGET_IR_VERSIONS and "budget" not in raw:
                 raise ValueError(f"Workflow IR {version} steps require a budget field")
             budget: dict[str, int | float | None] | None = None
-            if version == IR_VERSION:
+            if version in _BUDGET_IR_VERSIONS:
                 raw_budget = raw["budget"]
                 if raw.get("module_id") is None:
                     if raw_budget is not None:
@@ -243,6 +361,13 @@ class PlanIR:
                         raise ValueError(
                             f"Workflow IR node {raw.get('node_id')!r} budget is not canonical"
                         )
+            restored_binding = (
+                BindingIR.from_data(binding, legacy=version != IR_VERSION) if binding else None
+            )
+            if restored_binding is not None and canonical_json(
+                restored_binding.to_data(legacy=version != IR_VERSION)
+            ) != canonical_json(binding):
+                raise ValueError("Workflow IR input binding is not canonical")
             steps.append(
                 StepIR(
                     node_id=raw["node_id"],
@@ -253,7 +378,7 @@ class PlanIR:
                     logical_step=raw.get("logical_step"),
                     module_digest=raw.get("module_digest"),
                     definition_digest=raw.get("definition_digest"),
-                    input_binding=BindingIR(**binding) if binding else None,
+                    input_binding=restored_binding,
                     execution=raw.get("execution"),
                     capabilities=_validated_access_declarations(
                         raw.get("capabilities", ()),
@@ -563,6 +688,7 @@ class _Compiler:
         self.keys: set[ReplayKey] = set()
         self.modules: dict[ReplayKey, Module[Any, Any]] = {}
         self.map_item_keys: dict[str, str | Callable[[Any], str]] = {}
+        self.requires_structured_bindings = False
         self.module_paths_by_workflow: dict[int, dict[int, str]] = {}
 
     def compile(self) -> PlanIR:
@@ -583,9 +709,11 @@ class _Compiler:
             workflow=self.root_workflow,
             external_input="input",
         )
-        version = IR_VERSION
+        version = IR_VERSION if self.requires_structured_bindings else "0.3.0"
         steps = tuple(self.steps)
-        if all(step.budget == Budget().to_data() for step in steps if step.replay_key is not None):
+        if not self.requires_structured_bindings and all(
+            step.budget == Budget().to_data() for step in steps if step.replay_key is not None
+        ):
             version = "0.2.0"
             steps = tuple(
                 replace(step, budget=None) if step.replay_key is not None else step
@@ -644,20 +772,18 @@ class _Compiler:
             )
             self.node_ids[id(value)] = node_id
             return node_id
-        dependencies = tuple(
-            self._visit(
-                dependency,
-                path=f"{path}.dep{index}",
-                workflow=workflow,
-                external_input=external_input,
-            )
-            for index, dependency in enumerate(expression.dependencies)
-        )
         node_id = path
         if expression.kind == "module":
             binding = expression.payload
             if not isinstance(binding, _ModuleBinding):
                 raise CompileError("invalid module expression")
+            input_binding = self._compile_input_binding(
+                binding.input_value,
+                path=f"{path}.dep0",
+                workflow=workflow,
+                external_input=external_input,
+            )
+            dependencies = input_binding.source_nodes
             step = self._module_step(
                 binding.module,
                 binding.logical_step,
@@ -666,6 +792,7 @@ class _Compiler:
                 workflow,
                 dependencies,
                 value,
+                input_binding=input_binding,
                 control=None,
             )
         elif expression.kind == "map":
@@ -678,6 +805,15 @@ class _Compiler:
                 else {"callback": _callback_identity(binding.item_key)}
             )
             self.map_item_keys[path] = binding.item_key
+            dependencies = tuple(
+                self._visit(
+                    dependency,
+                    path=f"{path}.dep{index}",
+                    workflow=workflow,
+                    external_input=external_input,
+                )
+                for index, dependency in enumerate(expression.dependencies)
+            )
             step = self._module_step(
                 binding.module,
                 binding.logical_step,
@@ -686,9 +822,22 @@ class _Compiler:
                 workflow,
                 dependencies,
                 value,
+                input_binding=BindingIR(
+                    source=dependencies[0],
+                    schema_digest=schema_digest(binding.module.input_type),
+                ),
                 control={"region": "map", "item_key": item_key},
             )
         elif expression.kind in {"when", "parallel"}:
+            dependencies = tuple(
+                self._visit(
+                    dependency,
+                    path=f"{path}.dep{index}",
+                    workflow=workflow,
+                    external_input=external_input,
+                )
+                for index, dependency in enumerate(expression.dependencies)
+            )
             step = StepIR(
                 node_id=node_id,
                 kind=expression.kind,
@@ -702,6 +851,76 @@ class _Compiler:
         self.node_ids[id(value)] = node_id
         return node_id
 
+    def _compile_input_binding(
+        self,
+        value: RuntimeValue[Any],
+        *,
+        path: str,
+        workflow: Workflow[Any, Any],
+        external_input: str,
+    ) -> BindingIR:
+        expression = value._expression
+        value_digest = schema_digest(value.value_type)
+        if expression.kind == "literal":
+            self.requires_structured_bindings = True
+            return BindingIR(
+                schema_digest=value_digest,
+                kind="literal",
+                value=canonical_data(expression.payload),
+            )
+        if expression.kind == "field":
+            self.requires_structured_bindings = True
+            root, projected_path = self._field_root(value)
+            source = self._visit(
+                root,
+                path=path,
+                workflow=workflow,
+                external_input=external_input,
+            )
+            return BindingIR(
+                schema_digest=value_digest,
+                kind="field",
+                source=source,
+                path=projected_path,
+            )
+        if expression.kind == "object":
+            self.requires_structured_bindings = True
+            structured = expression.payload
+            if not isinstance(structured, _StructuredBinding) or structured.kind != "object":
+                raise CompileError("invalid structured module input")
+            fields = tuple(
+                (
+                    name,
+                    self._compile_input_binding(
+                        dependency,
+                        path=f"{path}.field[{name}]",
+                        workflow=workflow,
+                        external_input=external_input,
+                    ),
+                )
+                for name, dependency in zip(structured.names, expression.dependencies, strict=True)
+            )
+            return BindingIR(schema_digest=value_digest, kind="object", fields=fields)
+        source = self._visit(
+            value,
+            path=path,
+            workflow=workflow,
+            external_input=external_input,
+        )
+        return BindingIR(source=source, schema_digest=value_digest)
+
+    @staticmethod
+    def _field_root(value: RuntimeValue[Any]) -> tuple[RuntimeValue[Any], tuple[str, ...]]:
+        path: tuple[str, ...] = ()
+        current = value
+        while current._expression.kind == "field":
+            binding = current._expression.payload
+            if not isinstance(binding, _FieldBinding):
+                raise CompileError("invalid field projection")
+            path = (*binding.path, *path)
+            current = current._expression.dependencies[0]
+        return current, path
+
     def _module_step(
         self,
         module: Module[Any, Any],
@@ -711,6 +930,7 @@ class _Compiler:
         workflow: Workflow[Any, Any],
         dependencies: tuple[str, ...],
         value: RuntimeValue[Any],
+        input_binding: BindingIR,
         control: Mapping[str, Any] | None,
     ) -> StepIR:
         self.occurrences[id(module)] += 1
@@ -767,7 +987,7 @@ class _Compiler:
             logical_step=logical_step,
             module_digest=behavior_digest,
             definition_digest=definition_digest,
-            input_binding=BindingIR(source=dependencies[0], schema_digest=input_digest),
+            input_binding=input_binding,
             execution=module.execution.to_data(),
             capabilities=access["capabilities"],
             effects=access["effects"],
@@ -838,12 +1058,16 @@ def _validate_imported_plan(plan: PlanIR) -> None:
                 step.module_digest is None
                 or step.definition_digest is None
                 or step.input_binding is None
-                or (plan.version == IR_VERSION and step.budget is None)
+                or (plan.version in _BUDGET_IR_VERSIONS and step.budget is None)
             ):
                 raise ValueError(
                     f"executable Workflow IR node {step.node_id!r} has an incomplete definition"
                 )
             replay_keys.add(step.replay_key)
+            if set(step.input_binding.source_nodes) != set(step.dependencies):
+                raise ValueError(
+                    f"Workflow IR node {step.node_id!r} dependencies do not match its binding"
+                )
         elif step.capabilities or step.effects or step.budget is not None:
             raise ValueError(
                 f"control Workflow IR node {step.node_id!r} cannot declare module contracts"
