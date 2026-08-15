@@ -23,6 +23,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from ._canonical import digest_data
+from ._schema import value_matches_schema
 from .artifacts import ValueCodec
 from .budget import Budget
 from .ir import PlanIR, StepIR
@@ -1384,6 +1385,16 @@ class PostgresStore:
             raise ValueError("interaction kind must be input, approval, or signal")
         if not str(request.get("request_id", "")).strip():
             raise ValueError("interaction request_id must be non-empty")
+        schema = request.get("schema")
+        schema_digest = request.get("schema_digest")
+        if schema is not None and (
+            not isinstance(schema, Mapping)
+            or not isinstance(schema_digest, str)
+            or digest_data(schema) != schema_digest
+        ):
+            raise ValueError("interaction request schema is invalid")
+        if kind == "signal" and not str(request.get("signal_name", "")).strip():
+            raise ValueError("signal interaction requires a signal_name")
         next_status, event_type = transitions[str(kind)]
         with self.connect() as connection, connection.cursor() as cursor:
             cursor.execute(
@@ -1414,6 +1425,59 @@ class PostgresStore:
                 task_id=claim.task.task_id,
                 attempt_id=claim.attempt.attempt_id,
             )
+
+    def load_interaction_resolution(
+        self,
+        claim: ClaimedTask,
+        *,
+        request_id: str,
+        kind: str,
+    ) -> dict[str, Any] | None:
+        """Load the resolution following the latest exact interaction request."""
+        event_types = {
+            "approval": ("APPROVAL_REQUIRED", "APPROVAL_RESOLVED"),
+            "input": ("INPUT_REQUIRED", "INPUT_RECEIVED"),
+            "signal": ("SIGNAL_REQUIRED", "SIGNAL_RECEIVED"),
+        }
+        try:
+            required_type, resolved_type = event_types[kind]
+        except KeyError as exc:
+            raise ValueError("interaction kind must be approval, input, or signal") from exc
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT event_id FROM workflow_events
+                WHERE run_id = %s AND task_id = %s AND event_type = %s
+                  AND payload->>'request_id' = %s
+                ORDER BY event_id DESC LIMIT 1
+                """,
+                (
+                    claim.task.run_id,
+                    claim.task.task_id,
+                    required_type,
+                    request_id,
+                ),
+            )
+            required = cursor.fetchone()
+            if required is None:
+                return None
+            cursor.execute(
+                """
+                SELECT payload FROM workflow_events
+                WHERE run_id = %s AND task_id = %s AND event_type = %s
+                  AND payload->>'request_id' = %s AND event_id > %s
+                ORDER BY event_id DESC LIMIT 1
+                """,
+                (
+                    claim.task.run_id,
+                    claim.task.task_id,
+                    resolved_type,
+                    request_id,
+                    required["event_id"],
+                ),
+            )
+            resolved = cursor.fetchone()
+            return dict(resolved["payload"]) if resolved is not None else None
 
     def submit_command(
         self,
@@ -1484,7 +1548,7 @@ class PostgresStore:
                 )
                 cursor.execute(
                     """
-                    SELECT e.task_id FROM workflow_events e
+                    SELECT e.task_id, e.payload FROM workflow_events e
                     JOIN workflow_tasks t ON t.task_id = e.task_id
                     WHERE e.run_id = %s AND e.event_type = %s
                       AND e.payload->>'request_id' = %s AND t.status = %s
@@ -1498,6 +1562,14 @@ class PostgresStore:
                         f"interaction request {request_id!r} is not awaiting {command_type}"
                     )
                 target_task_id = str(target["task_id"])
+                if command_type == "input":
+                    schema = target["payload"].get("schema")
+                    if isinstance(schema, Mapping) and not value_matches_schema(
+                        command.get("value"), schema
+                    ):
+                        raise InvalidRunStateError(
+                            "interaction input does not match the requested schema"
+                        )
             elif command_type == "retry":
                 target_task_id = str(command.get("task_id", ""))
                 cursor.execute(
@@ -1517,7 +1589,7 @@ class PostgresStore:
                 if signal_request_id:
                     cursor.execute(
                         """
-                        SELECT e.task_id FROM workflow_events e
+                        SELECT e.task_id, e.payload FROM workflow_events e
                         JOIN workflow_tasks t ON t.task_id = e.task_id
                         WHERE e.run_id = %s AND e.event_type = 'SIGNAL_REQUIRED'
                           AND e.payload->>'request_id' = %s AND t.status = 'WAITING_SIGNAL'
@@ -1531,6 +1603,18 @@ class PostgresStore:
                             f"signal request {signal_request_id!r} is not awaiting a signal"
                         )
                     target_task_id = str(target["task_id"])
+                    request_payload = target["payload"]
+                    if command.get("name") != request_payload.get("signal_name"):
+                        raise InvalidRunStateError(
+                            "signal name does not match the interaction request"
+                        )
+                    schema = request_payload.get("schema")
+                    if isinstance(schema, Mapping) and not value_matches_schema(
+                        command.get("value"), schema
+                    ):
+                        raise InvalidRunStateError(
+                            "signal value does not match the requested schema"
+                        )
 
             cursor.execute(
                 """

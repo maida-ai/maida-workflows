@@ -69,6 +69,7 @@ from .dynamic import (
     PlanValidator,
 )
 from .fixture import ReplayFixture, ReplayFixtureError, ReplayFixtureImporter
+from .interactions import Approval, ApprovalDecision, Input, WaitForSignal
 from .ir import (
     BindingIR,
     CompileError,
@@ -142,6 +143,8 @@ __all__ = [
     "AccessBroker",
     "AccessContractError",
     "AccessPolicy",
+    "Approval",
+    "ApprovalDecision",
     "ApprovalEvidence",
     "ApproveCommand",
     "BindingIR",
@@ -170,6 +173,7 @@ __all__ = [
     "Executor",
     "ExecutorCapabilities",
     "Idempotency",
+    "Input",
     "InputCommand",
     "InteractionKind",
     "InteractionRequest",
@@ -217,6 +221,7 @@ __all__ = [
     "UserplaneASGI",
     "ValidationIssue",
     "VerificationSuite",
+    "WaitForSignal",
     "Workflow",
     "WorkflowBundle",
     "WorkflowBundleError",

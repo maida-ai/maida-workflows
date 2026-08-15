@@ -21,6 +21,7 @@ PUBLIC_MODULES = (
     "maida.workflows.dynamic",
     "maida.workflows.fixture",
     "maida.workflows.ir",
+    "maida.workflows.interactions",
     "maida.workflows.models",
     "maida.workflows.persistence",
     "maida.workflows.replay",

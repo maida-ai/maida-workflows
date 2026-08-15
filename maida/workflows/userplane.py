@@ -16,7 +16,7 @@ from enum import StrEnum
 from typing import Any, ClassVar, Protocol
 from uuid import uuid4
 
-from ._canonical import canonical_data
+from ._canonical import canonical_data, digest_data
 from .authoring import Workflow
 from .models import Event, ExecutionMode, RunStatus
 from .runtime import DurableRuntimeStore, WorkflowScheduler
@@ -47,9 +47,9 @@ class InteractionKind(StrEnum):
 class InteractionRequest:
     """Transport-neutral request that parks a running task.
 
-    This object is runtime infrastructure rather than a workflow-authoring
-    primitive. A future ``Approval`` or ``Input`` module can emit the same
-    contract without changing persistence or frontend integrations.
+    This object is runtime infrastructure shared by the public ``Approval``,
+    ``Input``, and ``WaitForSignal`` modules. Applications may also use it when
+    implementing a transport-neutral interaction frontend.
 
     Parameters
     ----------
@@ -61,6 +61,9 @@ class InteractionRequest:
         Human-readable application prompt.
     schema_digest
         Optional declared input schema digest.
+    schema
+        Optional canonical JSON Schema used to validate a command before the
+        parked task becomes claimable. A digest must accompany it.
     signal_name
         Optional named signal required by a signal wait.
     metadata
@@ -71,6 +74,7 @@ class InteractionRequest:
     kind: InteractionKind
     prompt: str
     schema_digest: str | None = None
+    schema: dict[str, Any] | None = None
     signal_name: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -82,6 +86,10 @@ class InteractionRequest:
             raise ValueError("interaction prompt must be non-empty")
         if self.kind is InteractionKind.SIGNAL and not (self.signal_name or "").strip():
             raise ValueError("signal_name is required for a signal interaction")
+        if self.schema is not None and (
+            self.schema_digest is None or digest_data(self.schema) != self.schema_digest
+        ):
+            raise ValueError("schema_digest must identify the declared interaction schema")
 
     def to_data(self) -> dict[str, Any]:
         """Return a canonical request event payload."""

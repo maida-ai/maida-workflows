@@ -21,6 +21,7 @@ from ._schema import schema_at_path, schemas_compatible, value_matches_schema
 from .authoring import Module
 from .budget import Budget
 from .definitions import BoundWorkflow
+from .interactions import Approval, Input, WaitForSignal, _SchemaAnnotation
 from .ir import (
     BindingIR,
     PlanIR,
@@ -235,13 +236,32 @@ class NodeSpec:
     then: str | None = None
     otherwise: str | None = None
     workflow: WorkflowSpec | None = None
+    prompt: str | None = None
+    response_schema: Mapping[str, Any] | None = None
+    signal_name: str | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Validate stable identity and canonicalize configuration/topology."""
         _require_key("node key", self.key)
-        if self.kind not in {"module", "map", "branch", "nested"}:
+        if self.kind not in {
+            "module",
+            "map",
+            "branch",
+            "nested",
+            "approval",
+            "input",
+            "signal",
+        }:
             raise ValueError(f"unsupported node kind {self.kind!r}")
         object.__setattr__(self, "config", MappingProxyType(canonical_data(dict(self.config))))
+        object.__setattr__(self, "metadata", MappingProxyType(canonical_data(dict(self.metadata))))
+        if self.response_schema is not None:
+            object.__setattr__(
+                self,
+                "response_schema",
+                MappingProxyType(canonical_data(self.response_schema)),
+            )
         for dependency in self.after:
             _require_key("order-only dependency", dependency)
         object.__setattr__(self, "after", tuple(sorted(set(self.after))))
@@ -261,6 +281,14 @@ class NodeSpec:
                 raise ValueError("ordinary module node cannot declare item_key")
             if self.workflow is not None:
                 raise ValueError(f"{self.kind} node cannot declare a nested workflow")
+            if (
+                any(
+                    value is not None
+                    for value in (self.prompt, self.response_schema, self.signal_name)
+                )
+                or self.metadata
+            ):
+                raise ValueError(f"{self.kind} node cannot declare interaction fields")
         elif self.kind == "branch":
             if any(value is not None for value in (self.module, self.input, self.item_key)):
                 raise ValueError("branch node cannot declare module fields")
@@ -274,7 +302,15 @@ class NodeSpec:
                 _require_key(f"branch {label}", value)
             if self.workflow is not None:
                 raise ValueError("branch node cannot declare a nested workflow")
-        else:
+            if (
+                any(
+                    value is not None
+                    for value in (self.prompt, self.response_schema, self.signal_name)
+                )
+                or self.metadata
+            ):
+                raise ValueError("branch node cannot declare interaction fields")
+        elif self.kind == "nested":
             if not isinstance(self.workflow, WorkflowSpec):
                 raise ValueError("nested node requires a WorkflowSpec")
             if not isinstance(self.input, BindingSpec):
@@ -294,6 +330,44 @@ class NodeSpec:
                 raise ValueError("nested node cannot declare module or branch fields")
             if self.config:
                 raise ValueError("nested node cannot declare module config")
+            if (
+                any(
+                    value is not None
+                    for value in (self.prompt, self.response_schema, self.signal_name)
+                )
+                or self.metadata
+            ):
+                raise ValueError("nested node cannot declare interaction fields")
+        else:
+            if not isinstance(self.input, BindingSpec):
+                raise ValueError(f"{self.kind} node requires an input binding")
+            if not isinstance(self.prompt, str) or not self.prompt.strip():
+                raise ValueError(f"{self.kind} node requires a non-empty prompt")
+            if (
+                any(
+                    value is not None
+                    for value in (
+                        self.module,
+                        self.item_key,
+                        self.condition,
+                        self.then,
+                        self.otherwise,
+                        self.workflow,
+                    )
+                )
+                or self.config
+            ):
+                raise ValueError(f"{self.kind} node cannot declare module or control fields")
+            if self.kind == "approval":
+                if self.response_schema is not None or self.signal_name is not None:
+                    raise ValueError("approval node has a fixed decision schema")
+            elif not isinstance(self.response_schema, Mapping):
+                raise ValueError(f"{self.kind} node requires a response schema")
+            if self.kind == "signal":
+                if not isinstance(self.signal_name, str) or not self.signal_name.strip():
+                    raise ValueError("signal node requires a non-empty signal name")
+            elif self.signal_name is not None:
+                raise ValueError(f"{self.kind} node cannot declare a signal name")
 
     @classmethod
     def task(
@@ -374,6 +448,84 @@ class NodeSpec:
             workflow=workflow,
         )
 
+    @classmethod
+    def approval(
+        cls,
+        key: str,
+        input: BindingSpec,
+        *,
+        prompt: str,
+        metadata: Mapping[str, Any] | None = None,
+        after: Sequence[str] = (),
+        module_id: str | None = None,
+        logical_step: str | None = None,
+    ) -> NodeSpec:
+        """Create a durable approval boundary with an explicit graph result."""
+        return cls(
+            key,
+            "approval",
+            input=input,
+            prompt=prompt,
+            metadata=metadata or {},
+            after=tuple(after),
+            module_id=module_id,
+            logical_step=logical_step,
+        )
+
+    @classmethod
+    def request_input(
+        cls,
+        key: str,
+        input: BindingSpec,
+        *,
+        response_schema: Mapping[str, Any],
+        prompt: str,
+        metadata: Mapping[str, Any] | None = None,
+        after: Sequence[str] = (),
+        module_id: str | None = None,
+        logical_step: str | None = None,
+    ) -> NodeSpec:
+        """Create a durable schema-validated application input boundary."""
+        return cls(
+            key,
+            "input",
+            input=input,
+            prompt=prompt,
+            response_schema=response_schema,
+            metadata=metadata or {},
+            after=tuple(after),
+            module_id=module_id,
+            logical_step=logical_step,
+        )
+
+    @classmethod
+    def wait_for_signal(
+        cls,
+        key: str,
+        input: BindingSpec,
+        *,
+        payload_schema: Mapping[str, Any],
+        name: str,
+        prompt: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        after: Sequence[str] = (),
+        module_id: str | None = None,
+        logical_step: str | None = None,
+    ) -> NodeSpec:
+        """Create a durable named external-signal boundary."""
+        return cls(
+            key,
+            "signal",
+            input=input,
+            prompt=prompt or f"Wait for signal {name}",
+            response_schema=payload_schema,
+            signal_name=name,
+            metadata=metadata or {},
+            after=tuple(after),
+            module_id=module_id,
+            logical_step=logical_step,
+        )
+
     @property
     def dependencies(self) -> tuple[str, ...]:
         """Return canonical data and order dependencies by authoring key."""
@@ -399,6 +551,12 @@ class NodeSpec:
             "then": self.then,
             "otherwise": self.otherwise,
             "workflow": self.workflow.to_dict() if self.workflow is not None else None,
+            "prompt": self.prompt,
+            "response_schema": (
+                canonical_data(self.response_schema) if self.response_schema is not None else None
+            ),
+            "signal_name": self.signal_name,
+            "metadata": canonical_data(self.metadata),
         }
 
     @classmethod
@@ -418,6 +576,10 @@ class NodeSpec:
             "then",
             "otherwise",
             "workflow",
+            "prompt",
+            "response_schema",
+            "signal_name",
+            "metadata",
         }
         if not isinstance(data, Mapping) or set(data) != expected:
             raise ValueError("workflow node fields are invalid")
@@ -425,6 +587,8 @@ class NodeSpec:
         raw_after = data["after"]
         raw_config = data["config"]
         raw_workflow = data["workflow"]
+        raw_response_schema = data["response_schema"]
+        raw_metadata = data["metadata"]
         if raw_input is not None and not isinstance(raw_input, Mapping):
             raise ValueError("workflow node input must be an object or null")
         if not isinstance(raw_after, list) or any(not isinstance(item, str) for item in raw_after):
@@ -433,6 +597,10 @@ class NodeSpec:
             raise ValueError("workflow node config must be an object")
         if raw_workflow is not None and not isinstance(raw_workflow, Mapping):
             raise ValueError("nested workflow must be an object or null")
+        if raw_response_schema is not None and not isinstance(raw_response_schema, Mapping):
+            raise ValueError("interaction response schema must be an object or null")
+        if not isinstance(raw_metadata, Mapping):
+            raise ValueError("interaction metadata must be an object")
         result = cls(
             key=str(data["key"]),
             kind=str(data["kind"]),
@@ -447,6 +615,10 @@ class NodeSpec:
             then=data["then"],
             otherwise=data["otherwise"],
             workflow=(WorkflowSpec.from_dict(raw_workflow) if raw_workflow is not None else None),
+            prompt=data["prompt"],
+            response_schema=raw_response_schema,
+            signal_name=data["signal_name"],
+            metadata=raw_metadata,
         )
         if canonical_json(result.to_dict()) != canonical_json(data):
             raise ValueError("workflow node is not canonical")
@@ -803,8 +975,10 @@ class _SpecCompiler:
 
     def _resolve_modules(self) -> None:
         for node in self.spec.nodes:
-            if _contains_sensitive_key(node.config) or (
-                node.input is not None and _binding_contains_sensitive_literal(node.input)
+            if (
+                _contains_sensitive_key(node.config)
+                or _contains_sensitive_key(node.metadata)
+                or (node.input is not None and _binding_contains_sensitive_literal(node.input))
             ):
                 self._issue(
                     "SECRET_LITERAL",
@@ -812,7 +986,7 @@ class _SpecCompiler:
                     "credentials and secrets must be resolved by runtime providers",
                 )
                 continue
-            if node.kind in {"branch", "nested"}:
+            if node.kind in {"branch", "nested", "approval", "input", "signal"}:
                 self.resolved[node.key] = _ResolvedNode(node)
                 continue
             try:
@@ -898,7 +1072,10 @@ class _SpecCompiler:
             self._compile_nested(node)
             return
         module = resolved.module
-        if module is None or node.input is None or resolved.requirement is None:
+        requirement = resolved.requirement
+        if node.kind in {"approval", "input", "signal"}:
+            module, requirement = self._interaction_module(node)
+        if module is None or node.input is None or requirement is None:
             return
         input_schema = type_schema(module.input_type)
         if node.kind == "map":
@@ -954,9 +1131,13 @@ class _SpecCompiler:
         access = _access_contract(module)
         budget = module.budget.to_data()
         behavior_digest = module_digest(module)
-        control = (
-            {"region": "map", "item_key": {"field": node.item_key}} if node.kind == "map" else None
-        )
+        control: dict[str, Any] | None = None
+        if node.kind == "map":
+            control = {"region": "map", "item_key": {"field": node.item_key}}
+        elif node.kind in {"approval", "input", "signal"}:
+            control = {"interaction": node.kind}
+            if node.signal_name is not None:
+                control["signal_name"] = node.signal_name
         definition_contract: dict[str, Any] = {
             "module_id": module_id,
             "logical_step": logical_step,
@@ -990,9 +1171,54 @@ class _SpecCompiler:
         self.node_ids[node.key] = step.node_id
         self.modules[key] = module
         self.schemas[node.key] = output_schema
-        requirement = dict(resolved.requirement)
-        requirement.update({"node": node.key, "module_id": module_id, "logical_step": logical_step})
-        self.requirements.append(requirement)
+        bound_requirement = dict(requirement)
+        bound_requirement.update(
+            {"node": node.key, "module_id": module_id, "logical_step": logical_step}
+        )
+        self.requirements.append(bound_requirement)
+
+    def _interaction_module(self, node: NodeSpec) -> tuple[Module[Any, Any], dict[str, Any]]:
+        if node.input is None or node.prompt is None:
+            raise ValueError("interaction node is incomplete")
+        input_annotation = cast(type[Any], _SchemaAnnotation(self._binding_schema(node.input)))
+        if node.kind == "approval":
+            module: Module[Any, Any] = Approval(
+                input_annotation,
+                prompt=node.prompt,
+                metadata=node.metadata,
+                module_id=node.module_id,
+            )
+        else:
+            output_annotation = cast(
+                type[Any], _SchemaAnnotation(cast(Mapping[str, Any], node.response_schema))
+            )
+            if node.kind == "input":
+                module = Input(
+                    input_annotation,
+                    output_annotation,
+                    prompt=node.prompt,
+                    metadata=node.metadata,
+                    module_id=node.module_id,
+                )
+            else:
+                module = WaitForSignal(
+                    input_annotation,
+                    output_annotation,
+                    name=cast(str, node.signal_name),
+                    prompt=node.prompt,
+                    metadata=node.metadata,
+                    module_id=node.module_id,
+                )
+        return module, {
+            "kind": "builtin",
+            "builtin": node.kind,
+            "configuration": {
+                "prompt": node.prompt,
+                "response_schema": node.response_schema,
+                "signal_name": node.signal_name,
+                "metadata": node.metadata,
+            },
+        }
 
     def _compile_branch(self, node: NodeSpec) -> None:
         condition = cast(str, node.condition)

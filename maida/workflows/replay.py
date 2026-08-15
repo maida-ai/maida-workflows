@@ -33,6 +33,7 @@ from .authoring import (
     _WorkflowBinding,
 )
 from .fixture import ReplayFixture, _validate_loaded_integrity
+from .interactions import _InteractionModule
 from .ir import PlanIR, ReplayKey, _compile_workflow_graph
 from .models import EffectKind, EffectRecord, Usage
 from .runtime import _coerce_trajectory, _rehydrate, _stable_instance_id
@@ -575,13 +576,13 @@ class ReplayEngine:
             if key not in selected:
                 continue
             module = modules[key]
-            if module.effectful:
+            if module.effectful or isinstance(module, _InteractionModule):
                 comparisons.append(
                     StepComparison(
                         key,
                         boundary.step_instance_id,
                         False,
-                        True,
+                        module.effectful,
                         boundary.output_value.digest,
                         boundary.output_value.digest,
                         False,

@@ -38,6 +38,7 @@ from .authoring import (
     Workflow,
 )
 from .definitions import BoundWorkflow, bind_workflow
+from .interactions import _InteractionModule
 from .ir import BindingIR, PlanIR, ReplayKey, StepIR, module_digest
 from .models import (
     AcceptedAttemptProvenance,
@@ -199,6 +200,16 @@ class DurableRuntimeStore(Protocol):
 
     def park_task(self, claim: ClaimedTask, request: dict[str, Any]) -> None:
         """Relinquish a running attempt while awaiting a durable command."""
+        ...
+
+    def load_interaction_resolution(
+        self,
+        claim: ClaimedTask,
+        *,
+        request_id: str,
+        kind: str,
+    ) -> dict[str, Any] | None:
+        """Return the accepted resolution for the latest exact request cycle."""
         ...
 
     def complete_run(self, run_id: str, root_output: StoredValue) -> None:
@@ -633,7 +644,7 @@ class TaskWorker:
         *,
         branch_decisions: tuple[dict[str, Any], ...] = (),
         map_decisions: tuple[dict[str, Any], ...] = (),
-    ) -> BoundaryRecord:
+    ) -> BoundaryRecord | None:
         key = key_for(claim)
         envelope = TaskEnvelope.from_claim(claim)
         if claim.task.input_value is None:
@@ -650,6 +661,21 @@ class TaskWorker:
             diagnostic = {"reason": "persisted task input violates the module input contract"}
             self.fail(envelope, diagnostic, retry=False)
             raise RuntimeContractError(diagnostic["reason"])
+        interaction_resolution: dict[str, Any] | None = None
+        if isinstance(module, _InteractionModule):
+            request = module._request_data(
+                run_id=claim.task.run_id,
+                task_id=claim.task.task_id,
+                step_instance_id=claim.task.step_instance_id,
+            )
+            interaction_resolution = self.store.load_interaction_resolution(
+                claim,
+                request_id=cast(str, request["request_id"]),
+                kind=module.interaction_kind,
+            )
+            if interaction_resolution is None:
+                self.store.park_task(claim, request)
+                return None
         metadata: dict[str, Any] = {}
         try:
             broker = AccessBroker(
@@ -693,7 +719,11 @@ class TaskWorker:
         )
         started = time.perf_counter()
         try:
-            output = await module.execute(input_data, context)
+            output = (
+                module._resolve_data(interaction_resolution)
+                if isinstance(module, _InteractionModule) and interaction_resolution is not None
+                else await module.execute(input_data, context)
+            )
             if not value_matches_type(output, module.output_type):
                 raise RuntimeContractError(
                     f"module {key_for(claim).as_string()} returned a value outside "
