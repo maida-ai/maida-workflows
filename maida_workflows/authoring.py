@@ -36,6 +36,7 @@ class RuntimeValue[OutputT]:
 
 class Module[InputT, OutputT](ABC):
     module_id: str | None = None
+    _maida_definition_digest: str | None = None
     input_type: type[InputT]
     output_type: type[OutputT]
     effectful: bool = False

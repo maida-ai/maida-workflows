@@ -8,6 +8,7 @@ from .authoring import (
     parallel,
     when,
 )
+from .fixture import ReplayFixture, ReplayFixtureError, ReplayFixtureImporter
 from .ir import CompileError, PlanIR, ReplayKey, StepIR, compile_workflow
 from .models import (
     BoundaryRecord,
@@ -16,7 +17,14 @@ from .models import (
     RunStatus,
     StoredValue,
 )
+from .replay import (
+    ReplayCase,
+    ReplayDivergence,
+    ReplayMode,
+    ReplayResult,
+)
 from .runtime import RunResult, TaskWorker, WorkflowRunner
+from .verification import VerificationSuite
 
 __all__ = [
     "BoundModuleCall",
@@ -26,7 +34,14 @@ __all__ = [
     "ExecutionMode",
     "Module",
     "PlanIR",
+    "ReplayCase",
+    "ReplayDivergence",
+    "ReplayFixture",
+    "ReplayFixtureError",
+    "ReplayFixtureImporter",
     "ReplayKey",
+    "ReplayMode",
+    "ReplayResult",
     "RunHistory",
     "RunResult",
     "RunStatus",
@@ -34,6 +49,7 @@ __all__ = [
     "StepIR",
     "StoredValue",
     "TaskWorker",
+    "VerificationSuite",
     "Workflow",
     "WorkflowRunner",
     "compile_workflow",

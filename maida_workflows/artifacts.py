@@ -26,10 +26,11 @@ class UnavailableValueError(ArtifactError):
 
 
 class ArtifactStore:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, create: bool = True) -> None:
         self.root = root
-        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(self.root, 0o700)
+        if create:
+            self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chmod(self.root, 0o700)
 
     def relative_path(self, digest: str) -> Path:
         if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):

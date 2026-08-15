@@ -4,6 +4,7 @@ import inspect
 import marshal
 from collections import Counter
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import asdict, dataclass
 from typing import Any, cast
 
@@ -78,6 +79,34 @@ class PlanIR:
     def to_dict(self) -> dict[str, Any]:
         return cast(dict[str, Any], canonical_data(asdict(self)))
 
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PlanIR:
+        steps = []
+        for raw in data["steps"]:
+            binding = raw.get("input_binding")
+            steps.append(
+                StepIR(
+                    node_id=raw["node_id"],
+                    kind=raw["kind"],
+                    dependencies=tuple(raw["dependencies"]),
+                    output_schema_digest=raw["output_schema_digest"],
+                    module_id=raw.get("module_id"),
+                    logical_step=raw.get("logical_step"),
+                    module_digest=raw.get("module_digest"),
+                    definition_digest=raw.get("definition_digest"),
+                    input_binding=BindingIR(**binding) if binding else None,
+                    control=raw.get("control"),
+                )
+            )
+        return cls(
+            version=str(data["version"]),
+            workflow_id=str(data["workflow_id"]),
+            input_schema=cast(Mapping[str, Any], data["input_schema"]),
+            output_schema=cast(Mapping[str, Any], data["output_schema"]),
+            steps=tuple(steps),
+            output_node=str(data["output_node"]),
+        )
+
     def canonical_json(self) -> str:
         return canonical_json(self.to_dict())
 
@@ -102,6 +131,9 @@ def _behavior_bytes(module: Module[Any, Any]) -> bytes:
 
 
 def module_digest(module: Module[Any, Any]) -> str:
+    cached = getattr(module, "_maida_definition_digest", None)
+    if isinstance(cached, str):
+        return cached
     config = {
         key: value
         for key, value in vars(module).items()
@@ -117,7 +149,10 @@ def module_digest(module: Module[Any, Any]) -> str:
             str(module.effectful).encode(),
         )
     )
-    return digest_bytes(payload)
+    digest = digest_bytes(payload)
+    with suppress(AttributeError, TypeError):
+        module._maida_definition_digest = digest
+    return digest
 
 
 def _callback_identity(callback: Callable[[Any], str]) -> str:

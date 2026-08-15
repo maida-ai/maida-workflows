@@ -8,6 +8,7 @@ license = "Apache-2.0"
 authors = [{ name = "Maida.AI" }]
 dependencies = [
     "maida-ai",
+    "opentelemetry-api>=1.42",
     "psycopg[binary]>=3.2,<4",
     "typer>=0.26,<0.27",
 ]
@@ -38,12 +39,16 @@ pattern = "default-unprefixed"
 fallback-version = "0.0.0"
 
 [tool.hatch.build.targets.wheel]
-packages = ["maida_workflows", "maida/workflows"]
+packages = ["maida_workflows"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"maida/workflows/__init__.py" = "maida/workflows/__init__.py"
 
 [tool.hatch.build.targets.sdist]
 include = [
     "/maida_workflows",
     "/maida/workflows",
+    "/examples",
     "/tests",
     "/README.md",
     "/LICENSE",
@@ -70,6 +75,9 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"maida_workflows/cli.py" = ["B008"]
 
 [tool.mypy]
 python_version = "3.12"

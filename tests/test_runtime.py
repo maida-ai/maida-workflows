@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import pytest
 
@@ -14,9 +15,13 @@ from maida_workflows import (
     when,
 )
 from maida_workflows._canonical import schema_digest
-from maida_workflows.models import AttemptStatus, RunHistory, RunStatus
+from maida_workflows.models import AttemptStatus, EffectKind, RunHistory, RunStatus
 from maida_workflows.persistence import PostgresStore
-from maida_workflows.runtime import TaskWorker, WorkflowRunner
+from maida_workflows.runtime import (
+    RuntimeContractError,
+    TaskWorker,
+    WorkflowRunner,
+)
 
 
 class FlakyIncrement(Module[int, int]):
@@ -198,3 +203,111 @@ async def test_recovery_worker_uses_persisted_input_without_replay_resolution(
     assert boundary is not None
     assert postgres_store.values.decode(boundary.output_value) == 11
     postgres_store.complete_run(run.run_id, boundary.output_value)
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_negative_branch_nested_parallel_and_effect_boundaries_execute(
+    postgres_store: PostgresStore,
+) -> None:
+    from examples.adversarial_workflows import AdversarialNestedEffectWorkflow
+
+    branch = BranchWorkflow()
+    positive_before = branch.positive.calls
+    negative_before = branch.negative.calls
+    negative = await WorkflowRunner(postgres_store).run(branch, -2)
+    assert negative.output == -12
+    assert branch.positive.calls == positive_before
+    assert branch.negative.calls == negative_before + 1
+
+    nested = await WorkflowRunner(postgres_store).run(AdversarialNestedEffectWorkflow(), "case")
+    assert nested.output == ("reviewed:case", "reviewed:case")
+    history = postgres_store.load_run_history(nested.run_id, tenant_id="local")
+    assert len(history.accepted_boundaries) == 2
+    assert {boundary.logical_step for boundary in history.accepted_boundaries} == {
+        "review",
+        "audit-effect",
+    }
+    effect = next(
+        boundary
+        for boundary in history.accepted_boundaries
+        if boundary.logical_step == "audit-effect"
+    )
+    assert [record.kind for record in effect.effects] == [
+        EffectKind.ATTEMPTED,
+        EffectKind.COMMITTED,
+    ]
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_runtime_rejects_duplicate_map_keys_and_invalid_root_input(
+    postgres_store: PostgresStore,
+) -> None:
+    with pytest.raises(RuntimeContractError, match="unique"):
+        await WorkflowRunner(postgres_store).run(
+            MappedWorkflow(), [Item("duplicate", 1), Item("duplicate", 2)]
+        )
+    with pytest.raises(RuntimeContractError, match="root input"):
+        invalid_root: Any = "not a list"
+        await WorkflowRunner(postgres_store).run(MappedWorkflow(), invalid_root)
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_worker_fails_closed_for_missing_modules_and_invalid_persisted_values(
+    postgres_store: PostgresStore,
+) -> None:
+    plan = compile_workflow(BranchWorkflow())
+    step = next(
+        item for item in plan.executable_steps if item.module_id == "branch-runtime.positive"
+    )
+    valid = postgres_store.values.encode(1, schema_digest=schema_digest(int))
+    run = postgres_store.create_run(plan, tenant_id="local", root_input=valid)
+    missing_task = postgres_store.enqueue_task(
+        run.run_id,
+        step,
+        step_instance_id="missing-module",
+        input_value=valid,
+    )
+    worker = TaskWorker(
+        postgres_store,
+        workflow_id=plan.workflow_id,
+        definition_digest=plan.digest,
+        modules={},
+        worker_id="strict-worker",
+    )
+    with pytest.raises(RuntimeContractError, match="no module"):
+        await worker.run_once(task_id=missing_task.task_id)
+
+    invalid = postgres_store.values.encode("wrong", schema_digest=schema_digest(str))
+    invalid_task = postgres_store.enqueue_task(
+        run.run_id,
+        step,
+        step_instance_id="invalid-input",
+        input_value=invalid,
+    )
+    assert step.replay_key is not None
+    worker = TaskWorker(
+        postgres_store,
+        workflow_id=plan.workflow_id,
+        definition_digest=plan.digest,
+        modules={step.replay_key: BranchWorkflow().positive},
+        worker_id="strict-worker",
+    )
+    with pytest.raises(RuntimeContractError, match="input contract"):
+        await worker.run_once(task_id=invalid_task.task_id)
+
+
+def test_worker_configuration_requires_positive_attempt_budget(
+    postgres_store: PostgresStore,
+) -> None:
+    with pytest.raises(ValueError, match="positive"):
+        TaskWorker(
+            postgres_store,
+            workflow_id="workflow",
+            definition_digest="definition",
+            modules={},
+            worker_id="worker",
+            max_attempts=0,
+        )

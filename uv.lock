@@ -326,6 +326,7 @@ name = "maida-workflows"
 source = { editable = "." }
 dependencies = [
     { name = "maida-ai" },
+    { name = "opentelemetry-api" },
     { name = "psycopg", extra = ["binary"] },
     { name = "typer" },
 ]
@@ -342,6 +343,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "maida-ai" },
+    { name = "opentelemetry-api", specifier = ">=1.42" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<4" },
     { name = "typer", specifier = ">=0.26,<0.27" },
 ]

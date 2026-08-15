@@ -223,6 +223,25 @@ class TaskWorker:
         )
         usage_data = dict(metadata.get("usage", {}))
         usage_data.setdefault("latency_ms", elapsed_ms)
+        effects = [_coerce_effect(item) for item in metadata.get("effects", [])]
+        if module.effectful:
+            effects.extend(
+                (
+                    EffectRecord(
+                        EffectKind.ATTEMPTED,
+                        claim.task.module_id,
+                        "execute",
+                        claim.task.input_value.digest,
+                    ),
+                    EffectRecord(
+                        EffectKind.COMMITTED,
+                        claim.task.module_id,
+                        "execute",
+                        claim.task.input_value.digest,
+                        output_value.digest,
+                    ),
+                )
+            )
         now = datetime.now(UTC).isoformat()
         boundary = BoundaryRecord(
             workflow_id=self.workflow_id,
@@ -249,7 +268,7 @@ class TaskWorker:
             usage=Usage(**usage_data),
             branch_decisions=branch_decisions,
             map_decisions=map_decisions,
-            effects=tuple(_coerce_effect(item) for item in metadata.get("effects", [])),
+            effects=tuple(effects),
         )
         self.store.complete_task(claim, boundary)
         return boundary
@@ -338,7 +357,8 @@ class _WorkflowEvaluator:
         self.max_attempts = max_attempts
         self.broker = broker
         self.steps = {step.node_id: step for step in plan.steps}
-        self.cache: dict[tuple[int, tuple[str, ...]], _Evaluation] = {}
+        self.cache: dict[int, _Evaluation] = {}
+        self.cache_locks: dict[int, asyncio.Lock] = {}
         self.branch_context: dict[tuple[str, ...], tuple[dict[str, Any], ...]] = {}
 
     async def evaluate(self, output: RuntimeValue[Any], root_input: Any) -> _Evaluation:
@@ -359,12 +379,35 @@ class _WorkflowEvaluator:
         external: _Evaluation,
         scope: tuple[str, ...],
     ) -> _Evaluation:
+        if value._expression.kind == "input":
+            return external
+        cache_key = id(value)
+        lock = self.cache_locks.setdefault(cache_key, asyncio.Lock())
+        async with lock:
+            if cache_key in self.cache:
+                return self.cache[cache_key]
+            result = await self._visit_uncached(
+                value,
+                path=path,
+                workflow=workflow,
+                external=external,
+                scope=scope,
+            )
+            self.cache[cache_key] = result
+            return result
+
+    async def _visit_uncached(
+        self,
+        value: RuntimeValue[Any],
+        *,
+        path: str,
+        workflow: Workflow[Any, Any],
+        external: _Evaluation,
+        scope: tuple[str, ...],
+    ) -> _Evaluation:
         expression = value._expression
         if expression.kind == "input":
             return external
-        cache_key = (id(value), scope)
-        if cache_key in self.cache:
-            return self.cache[cache_key]
         if expression.kind == "workflow":
             source = await self._visit(
                 expression.dependencies[0],
@@ -382,7 +425,6 @@ class _WorkflowEvaluator:
                 external=source,
                 scope=(*scope, f"workflow:{nested.workflow_id}"),
             )
-            self.cache[cache_key] = result
             return result
         if expression.kind == "module":
             source = await self._visit(
@@ -496,7 +538,6 @@ class _WorkflowEvaluator:
             result = _Evaluation(mapped, tuple(boundaries))
         else:  # pragma: no cover - the compiler rejects this first
             raise RuntimeContractError(f"unsupported runtime expression {expression.kind!r}")
-        self.cache[cache_key] = result
         return result
 
     async def _execute_module(

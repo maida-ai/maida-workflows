@@ -220,3 +220,13 @@ def test_invalid_control_and_workflow_contracts_fail_early() -> None:
 
     with pytest.raises(CompileError, match="declares output"):
         compile_workflow(WrongOutput())
+
+
+def test_all_adversarial_workflows_compile_to_replay_addressable_ir() -> None:
+    from examples.adversarial_workflows import ADVERSARIAL_WORKFLOWS
+
+    plans = [compile_workflow(workflow) for workflow in ADVERSARIAL_WORKFLOWS]
+    assert all(plan.executable_steps for plan in plans)
+    assert all(step.replay_key is not None for plan in plans for step in plan.executable_steps)
+    assert any(step.kind == "map_module" for step in plans[1].steps)
+    assert plans[2].executable_steps[-1].logical_step == "audit-effect"
