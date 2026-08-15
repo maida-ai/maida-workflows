@@ -869,7 +869,10 @@ class WorkflowScheduler:
         executors may live in unrelated processes or machines.
         """
         definition = workflow if isinstance(workflow, BoundWorkflow) else bind_workflow(workflow)
-        if not value_matches_type(value, definition.input_type):
+        if not definition.accepts_input(value) or (
+            definition.input_type is not Any
+            and not value_matches_type(value, definition.input_type)
+        ):
             raise RuntimeContractError("root input violates the workflow input contract")
         root_input = store.values.encode(value, schema_digest=schema_digest(definition.input_type))
         run = store.create_run(
@@ -954,6 +957,8 @@ class WorkflowScheduler:
             raise
 
         if result is not None:
+            if not self.definition.accepts_output(result.value):
+                raise RuntimeContractError("root output violates the workflow output contract")
             root_output = self.store.values.encode(
                 result.value, schema_digest=schema_digest(self.definition.output_type)
             )
@@ -987,8 +992,8 @@ class WorkflowScheduler:
                 raise RuntimeContractError(f"unsupported runtime IR step {step.kind!r}")
             if step.input_binding is None:
                 raise RuntimeContractError("module step has no input binding")
-            for source_node in step.input_binding.source_nodes:
-                visit(source_node, scope)
+            for dependency in step.dependencies:
+                visit(dependency, scope)
             self.store.enqueue_task(
                 self.run_id,
                 step,
@@ -1032,6 +1037,9 @@ class WorkflowScheduler:
                 external=external,
                 scope=scope,
             )
+            if source is None:
+                return None
+            source = self._include_order_dependencies(step, source, external=external, scope=scope)
             if source is None:
                 return None
             inherited = self._inherited_branches(scope)
@@ -1115,6 +1123,12 @@ class WorkflowScheduler:
             )
             if source is None:
                 return None
+            order_source = self._include_order_dependencies(
+                step, source, external=external, scope=scope
+            )
+            if order_source is None:
+                return None
+            source = order_source
             if not isinstance(source.value, (list, tuple)):
                 raise RuntimeContractError("map_over input must evaluate to a sequence")
             key_binding = self._map_key_binding(step)
@@ -1154,6 +1168,41 @@ class WorkflowScheduler:
                 (*source.map_decisions, map_decision),
             )
         raise RuntimeContractError(f"unsupported runtime IR step {step.kind!r}")
+
+    def _include_order_dependencies(
+        self,
+        step: StepIR,
+        source: _Evaluation,
+        *,
+        external: _Evaluation,
+        scope: tuple[str, ...],
+    ) -> _Evaluation | None:
+        data_nodes = set(step.input_binding.source_nodes if step.input_binding else ())
+        ordered = tuple(
+            self._evaluate_node(node, external=external, scope=scope)
+            for node in step.dependencies
+            if node not in data_nodes
+        )
+        if any(item is None for item in ordered):
+            return None
+        complete = cast(tuple[_Evaluation, ...], ordered)
+        return dataclasses.replace(
+            source,
+            dependency_instance_keys=_unique(
+                (
+                    *source.dependency_instance_keys,
+                    *(key for item in complete for key in item.dependency_instance_keys),
+                )
+            ),
+            branch_decisions=(
+                *source.branch_decisions,
+                *(decision for item in complete for decision in item.branch_decisions),
+            ),
+            map_decisions=(
+                *source.map_decisions,
+                *(decision for item in complete for decision in item.map_decisions),
+            ),
+        )
 
     def _resolve_binding(
         self,

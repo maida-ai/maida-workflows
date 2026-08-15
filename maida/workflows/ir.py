@@ -1064,10 +1064,8 @@ def _validate_imported_plan(plan: PlanIR) -> None:
                     f"executable Workflow IR node {step.node_id!r} has an incomplete definition"
                 )
             replay_keys.add(step.replay_key)
-            if set(step.input_binding.source_nodes) != set(step.dependencies):
-                raise ValueError(
-                    f"Workflow IR node {step.node_id!r} dependencies do not match its binding"
-                )
+            if not set(step.input_binding.source_nodes).issubset(step.dependencies):
+                raise ValueError(f"Workflow IR node {step.node_id!r} omits a binding dependency")
         elif step.capabilities or step.effects or step.budget is not None:
             raise ValueError(
                 f"control Workflow IR node {step.node_id!r} cannot declare module contracts"

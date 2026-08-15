@@ -14,7 +14,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
 
-from ._canonical import schema_digest
+from ._canonical import canonical_data, schema_digest, value_matches_type
+from ._schema import value_matches_schema
 from .authoring import Module, RuntimeValue, Workflow
 from .ir import PlanIR, ReplayKey, _compile_workflow_graph, module_digest
 
@@ -66,9 +67,13 @@ class BoundWorkflow:
 
     def __post_init__(self) -> None:
         """Validate every executable contract and freeze the module mapping."""
-        if schema_digest(self.input_type) != _schema_data_digest(self.plan.input_schema):
+        if self.input_type is not Any and schema_digest(self.input_type) != _schema_data_digest(
+            self.plan.input_schema
+        ):
             raise ValueError("bound input type does not match the workflow input schema")
-        if schema_digest(self.output_type) != _schema_data_digest(self.plan.output_schema):
+        if self.output_type is not Any and schema_digest(self.output_type) != _schema_data_digest(
+            self.plan.output_schema
+        ):
             raise ValueError("bound output type does not match the workflow output schema")
 
         supplied = dict(self.modules)
@@ -101,6 +106,18 @@ class BoundWorkflow:
         if not set(map_item_keys).issubset(expected_maps):
             raise ValueError("map item-key bindings contain nodes absent from the plan")
         object.__setattr__(self, "map_item_keys", MappingProxyType(map_item_keys))
+
+    def accepts_input(self, value: Any) -> bool:
+        """Return whether a root value satisfies the compiled input schema."""
+        if self.input_type is not Any:
+            return value_matches_type(value, self.input_type)
+        return value_matches_schema(canonical_data(value), self.plan.input_schema)
+
+    def accepts_output(self, value: Any) -> bool:
+        """Return whether a terminal value satisfies the compiled output schema."""
+        if self.output_type is not Any:
+            return value_matches_type(value, self.output_type)
+        return value_matches_schema(canonical_data(value), self.plan.output_schema)
 
     @classmethod
     def from_workflow(cls, workflow: Workflow[Any, Any]) -> BoundWorkflow:
