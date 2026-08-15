@@ -57,7 +57,7 @@ def test_default_identity_and_canonical_ir_are_stable() -> None:
     first = compile_workflow(Simple())
     second = compile_workflow(Simple())
 
-    assert first.version == "0.1.0"
+    assert first.version == "0.2.0"
     assert first.canonical_json() == second.canonical_json()
     assert first.digest == second.digest
     step = first.executable_steps[0]

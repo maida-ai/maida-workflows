@@ -33,7 +33,8 @@ from .authoring import (
     _WorkflowBinding,
 )
 
-IR_VERSION = "0.1.0"
+IR_VERSION = "0.2.0"
+SUPPORTED_IR_VERSIONS = frozenset({"0.1.0", IR_VERSION})
 
 
 class CompileError(ValueError):
@@ -100,6 +101,8 @@ class StepIR:
         Typed source binding for an executable node.
     execution
         Immutable executor requirements for executable nodes.
+    capabilities, effects
+        Canonical external read and write declarations.
     control
         Canonical control-region metadata when applicable.
     """
@@ -114,6 +117,8 @@ class StepIR:
     definition_digest: str | None = None
     input_binding: BindingIR | None = None
     execution: Mapping[str, Any] | None = None
+    capabilities: tuple[Mapping[str, Any], ...] = ()
+    effects: tuple[Mapping[str, Any], ...] = ()
     control: Mapping[str, Any] | None = None
 
     @property
@@ -177,9 +182,10 @@ class PlanIR:
             If the version, replay identities, topology, or output node is
             invalid.
         """
-        if data.get("version") != IR_VERSION:
+        if data.get("version") not in SUPPORTED_IR_VERSIONS:
             raise ValueError(
-                f"unsupported Workflow IR version {data.get('version')!r}; expected {IR_VERSION}"
+                f"unsupported Workflow IR version {data.get('version')!r}; "
+                f"expected one of {sorted(SUPPORTED_IR_VERSIONS)}"
             )
         steps = []
         for raw in data["steps"]:
@@ -196,6 +202,8 @@ class PlanIR:
                     definition_digest=raw.get("definition_digest"),
                     input_binding=BindingIR(**binding) if binding else None,
                     execution=raw.get("execution"),
+                    capabilities=tuple(raw.get("capabilities", ())),
+                    effects=tuple(raw.get("effects", ())),
                     control=raw.get("control"),
                 )
             )
@@ -253,7 +261,9 @@ def _behavior_bytes(module: Module[Any, Any]) -> bytes:
 
 
 _MODULE_CONTRACT_FIELDS = {
+    "capabilities",
     "effectful",
+    "effects",
     "execution",
     "input_type",
     "module_id",
@@ -278,9 +288,28 @@ def _module_configuration(module: Module[Any, Any]) -> dict[str, Any]:
     configured = {
         name: value
         for name, value in sorted(vars(module).items())
-        if name != "module_id" and not name.startswith("_")
+        if name not in _MODULE_CONTRACT_FIELDS and not name.startswith("_")
     }
     return {"class": declared, "instance": configured}
+
+
+def _access_contract(module: Module[Any, Any]) -> dict[str, tuple[dict[str, Any], ...]]:
+    def declarations(attribute: str) -> tuple[dict[str, Any], ...]:
+        encoded: list[dict[str, Any]] = []
+        for declaration in getattr(module, attribute, ()):
+            to_data = getattr(declaration, "to_data", None)
+            if not callable(to_data):
+                raise CompileError(f"module {attribute} declarations must provide to_data()")
+            data = to_data()
+            if not isinstance(data, dict):
+                raise CompileError(f"module {attribute} declaration must encode as an object")
+            encoded.append(cast(dict[str, Any], canonical_data(data)))
+        return tuple(sorted(encoded, key=canonical_json))
+
+    return {
+        "capabilities": declarations("capabilities"),
+        "effects": declarations("effects"),
+    }
 
 
 def module_digest(module: Module[Any, Any]) -> str:
@@ -309,6 +338,7 @@ def module_digest(module: Module[Any, Any]) -> str:
             schema_digest(module.output_type).encode(),
             str(module.effectful).encode(),
             canonical_json(module.execution.to_data()).encode(),
+            canonical_json(_access_contract(module)).encode(),
         )
     )
     return digest_bytes(payload)
@@ -514,6 +544,7 @@ class _Compiler:
             raise CompileError(f"duplicate replay key {key.as_string()}")
         self.keys.add(key)
         behavior_digest = module_digest(module)
+        access = _access_contract(module)
         input_digest = schema_digest(module.input_type)
         output_digest = schema_digest(module.output_type)
         definition_digest = digest_data(
@@ -524,6 +555,8 @@ class _Compiler:
                 "input_schema_digest": input_digest,
                 "output_schema_digest": output_digest,
                 "execution": module.execution.to_data(),
+                "capabilities": access["capabilities"],
+                "effects": access["effects"],
                 "control": control,
             }
         )
@@ -538,6 +571,8 @@ class _Compiler:
             definition_digest=definition_digest,
             input_binding=BindingIR(source=dependencies[0], schema_digest=input_digest),
             execution=module.execution.to_data(),
+            capabilities=access["capabilities"],
+            effects=access["effects"],
             control=control,
         )
 

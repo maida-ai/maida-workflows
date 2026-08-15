@@ -22,6 +22,14 @@ Examples
 ...         return self.upper(value)
 """
 
+from .access import (
+    AccessContractError,
+    Capability,
+    Connector,
+    Effect,
+    EffectSpec,
+    Idempotency,
+)
 from .asgi import UserplaneASGI, create_userplane_app
 from .authoring import (
     BoundModuleCall,
@@ -87,20 +95,26 @@ from .userplane import (
 from .verification import VerificationSuite
 
 __all__ = [
+    "AccessContractError",
     "ApproveCommand",
     "BoundModuleCall",
     "BoundaryRecord",
     "CancelCommand",
+    "Capability",
     "CommandReceipt",
     "CommandType",
     "CompileError",
+    "Connector",
     "CoordinatorProgress",
+    "Effect",
+    "EffectSpec",
     "EventPage",
     "ExecutionContext",
     "ExecutionMode",
     "ExecutionSpec",
     "Executor",
     "ExecutorCapabilities",
+    "Idempotency",
     "InputCommand",
     "InteractionKind",
     "InteractionRequest",

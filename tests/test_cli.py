@@ -45,7 +45,7 @@ def test_cli_help_and_compile_surface() -> None:
         ],
     )
     assert compiled.exit_code == 0
-    assert json.loads(compiled.stdout)["version"] == "0.1.0"
+    assert json.loads(compiled.stdout)["version"] == "0.2.0"
 
 
 def test_cli_rejects_non_workflow_objects() -> None:

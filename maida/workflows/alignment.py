@@ -18,6 +18,10 @@ class DiffKind(StrEnum):
     """Classification of a structural or behavior-bearing graph change."""
 
     MODULE_DIGEST_CHANGED = "MODULE_DIGEST_CHANGED"
+    CAPABILITY_CHANGED = "CAPABILITY_CHANGED"
+    EFFECT_CHANGED = "EFFECT_CHANGED"
+    CONNECTOR_CHANGED = "CONNECTOR_CHANGED"
+    POLICY_CHANGED = "POLICY_CHANGED"
     SCHEMA_CHANGED = "SCHEMA_CHANGED"
     INSERTION = "INSERTION"
     DELETION = "DELETION"
@@ -196,6 +200,50 @@ class GraphAligner:
                         True,
                     )
                 )
+            if old.capabilities != new.capabilities:
+                changes.append(
+                    GraphChange(
+                        DiffKind.CAPABILITY_CHANGED,
+                        f"steps[{index}].capabilities",
+                        key,
+                        old.capabilities,
+                        new.capabilities,
+                        True,
+                    )
+                )
+            if old.effects != new.effects:
+                changes.append(
+                    GraphChange(
+                        DiffKind.EFFECT_CHANGED,
+                        f"steps[{index}].effects",
+                        key,
+                        old.effects,
+                        new.effects,
+                        True,
+                    )
+                )
+            if _connector_signature(old) != _connector_signature(new):
+                changes.append(
+                    GraphChange(
+                        DiffKind.CONNECTOR_CHANGED,
+                        f"steps[{index}].connectors",
+                        key,
+                        _connector_signature(old),
+                        _connector_signature(new),
+                        True,
+                    )
+                )
+            if _policy_signature(old) != _policy_signature(new):
+                changes.append(
+                    GraphChange(
+                        DiffKind.POLICY_CHANGED,
+                        f"steps[{index}].policies",
+                        key,
+                        _policy_signature(old),
+                        _policy_signature(new),
+                        True,
+                    )
+                )
             old_schemas = (
                 old.input_binding.schema_digest if old.input_binding else None,
                 old.output_schema_digest,
@@ -303,3 +351,26 @@ def _dependency_keys(plan: PlanIR, step: StepIR) -> tuple[ReplayKey, ...]:
     for dependency in step.dependencies:
         visit(dependency)
     return tuple(found)
+
+
+def _connector_signature(step: StepIR) -> tuple[tuple[Any, ...], ...]:
+    return tuple(
+        (
+            declaration.get("name"),
+            declaration.get("connector"),
+            declaration.get("operation"),
+            declaration.get("connector_version"),
+        )
+        for declaration in (*step.capabilities, *step.effects)
+    )
+
+
+def _policy_signature(step: StepIR) -> tuple[tuple[Any, ...], ...]:
+    return tuple(
+        (
+            declaration.get("name"),
+            tuple(declaration.get("policy_tags", ())),
+            declaration.get("approval_required"),
+        )
+        for declaration in (*step.capabilities, *step.effects)
+    )

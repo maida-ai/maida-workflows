@@ -9,6 +9,7 @@ import maida.workflows as workflows
 
 PUBLIC_MODULES = (
     "maida.workflows",
+    "maida.workflows.access",
     "maida.workflows.alignment",
     "maida.workflows.asgi",
     "maida.workflows.artifacts",

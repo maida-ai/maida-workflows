@@ -138,6 +138,10 @@ class Module[InputT, OutputT](ABC):
     execution
         Immutable environment requirements used to match durable tasks to
         capable executors.
+    capabilities, effects
+        Typed external access declarations compiled into the module boundary.
+        Explicit :class:`~maida.workflows.Connector` and
+        :class:`~maida.workflows.Effect` modules provide the easiest path.
     """
 
     module_id: str | None = None
@@ -145,6 +149,8 @@ class Module[InputT, OutputT](ABC):
     output_type: type[OutputT]
     effectful: bool = False
     execution: ExecutionSpec = ExecutionSpec()
+    capabilities: tuple[Any, ...] = ()
+    effects: tuple[Any, ...] = ()
 
     def __call__(self, value: RuntimeValue[InputT]) -> RuntimeValue[OutputT]:
         """Create a symbolic output connected to this module occurrence.
