@@ -92,6 +92,13 @@ def _decode_budget_declaration(data: Any) -> Budget:
         raise PersistenceError(f"persisted task budget declaration is invalid: {exc}") from exc
 
 
+def _decode_capability_grant(data: Any) -> CapabilityGrant:
+    try:
+        return CapabilityGrant.from_data(data)
+    except ValueError as exc:
+        raise PersistenceError(f"persisted task capability grant is invalid: {exc}") from exc
+
+
 @dataclass(frozen=True)
 class ClaimedTask:
     """Durable task and attempt leased to one worker until a deadline."""
@@ -383,6 +390,7 @@ class PostgresStore:
                     StoredValue.from_data(row["task_input"]) if row["task_input"] else None
                 )
                 recorded_budget = _decode_budget_declaration(row["budget_declaration"])
+                recorded_grant = _decode_capability_grant(row.get("capability_grant"))
                 if (
                     input_value is not None
                     and recorded_input is not None
@@ -392,6 +400,10 @@ class PostgresStore:
                 if recorded_budget != budget:
                     raise InvalidRunStateError(
                         "task identity was reused with a different budget declaration"
+                    )
+                if recorded_grant != grant:
+                    raise InvalidRunStateError(
+                        "task identity was reused with a different capability grant"
                     )
             else:
                 self._append_event(
@@ -1930,7 +1942,7 @@ class PostgresStore:
             input_value=StoredValue.from_data(row["task_input"]) if row["task_input"] else None,
             execution=ExecutionSpec.from_data(dict(row.get("execution_requirements") or {})),
             budget=_decode_budget_declaration(row.get("budget_declaration")),
-            capability_grant=CapabilityGrant.from_data(row.get("capability_grant")),
+            capability_grant=_decode_capability_grant(row.get("capability_grant")),
             branch_decisions=tuple(row.get("branch_decisions", ())),
             map_decisions=tuple(row.get("map_decisions", ())),
             status=TaskStatus(row["status"]),

@@ -172,14 +172,22 @@ class CapabilityGrant:
 
         Older task rows stored executor eligibility labels as a JSON sequence.
         Those labels are deliberately treated as no access instead of being
-        promoted into connector permissions.
+        promoted into connector permissions. Current mappings must use the
+        exact canonical wire form produced by :meth:`to_data`.
         """
         if not isinstance(data, Mapping):
             return cls()
-        capabilities = data.get("capabilities", [])
-        effects = data.get("effects", [])
+        if set(data) != {"capabilities", "effects"}:
+            raise ValueError("capability grant fields must exactly match the wire contract")
+        capabilities = data["capabilities"]
+        effects = data["effects"]
         if not isinstance(capabilities, list) or not isinstance(effects, list):
             raise ValueError("capability grant fields must be lists")
+        for values in (capabilities, effects):
+            if any(not isinstance(value, str) for value in values):
+                raise ValueError("capability grant entries must be stable names")
+            if values != sorted(set(values)):
+                raise ValueError("capability grant fields must be canonical sorted unique lists")
         return cls(tuple(capabilities), tuple(effects))
 
 

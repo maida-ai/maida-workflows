@@ -125,6 +125,22 @@ def test_capability_grants_are_canonical_narrowable_and_fail_closed() -> None:
     }
     assert CapabilityGrant.from_data(grant.to_data()) == grant
     assert CapabilityGrant.from_data(["legacy.executor.label"]) == CapabilityGrant()
+    with pytest.raises(ValueError, match="exactly match"):
+        CapabilityGrant.from_data({**grant.to_data(), "unexpected": []})
+    with pytest.raises(ValueError, match="canonical"):
+        CapabilityGrant.from_data(
+            {
+                "capabilities": ["web.search", "crm.customer.read"],
+                "effects": ["email.send"],
+            }
+        )
+    with pytest.raises(ValueError, match="canonical"):
+        CapabilityGrant.from_data(
+            {
+                "capabilities": ["crm.customer.read", "crm.customer.read"],
+                "effects": ["email.send"],
+            }
+        )
     assert grant.narrow(capabilities=("crm.customer.read",)).to_data() == {
         "capabilities": ["crm.customer.read"],
         "effects": ["email.send"],

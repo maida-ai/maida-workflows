@@ -8,7 +8,12 @@ import pytest
 
 from maida.workflows import (
     Budget,
+    Capability,
+    CapabilityGrant,
+    EffectSpec,
     ExecutionContext,
+    ExecutionSpec,
+    ExecutorCapabilities,
     Module,
     RunStatus,
     RuntimeValue,
@@ -63,6 +68,47 @@ class UnbudgetedWorkflow(Workflow[int, int]):
     input_type = int
     output_type = int
     identity = UnbudgetedIdentity()
+
+    def build(self, value: RuntimeValue[int]) -> RuntimeValue[int]:
+        return self.identity(value)
+
+
+RESOURCE_READ = Capability(
+    "resource.customer.read",
+    connector="resource",
+    operation="read_customer",
+    input_type=int,
+    output_type=int,
+    connector_version="v1",
+)
+RESOURCE_EFFECT = EffectSpec(
+    "resource.note.write",
+    connector="resource",
+    operation="write_note",
+    input_type=int,
+    output_type=int,
+    connector_version="v1",
+)
+
+
+class ResourceBoundIdentity(Module[int, int]):
+    input_type = int
+    output_type = int
+    effectful = True
+    budget = Budget(model_tokens=2_000, tool_calls=3, cost_usd=0.25)
+    execution = ExecutionSpec(capabilities=("executor.accelerated",))
+    capabilities = (RESOURCE_READ,)
+    effects = (RESOURCE_EFFECT,)
+
+    async def execute(self, value: int, ctx: ExecutionContext) -> int:
+        return value
+
+
+class ResourceBoundWorkflow(Workflow[int, int]):
+    workflow_id = "resource-bound-workflow"
+    input_type = int
+    output_type = int
+    identity = ResourceBoundIdentity()
 
     def build(self, value: RuntimeValue[int]) -> RuntimeValue[int]:
         return self.identity(value)
@@ -349,6 +395,67 @@ def test_task_and_worker_envelope_preserve_the_budget_declaration(
     assert TaskEnvelope.from_claim(claim).to_data()["budget"] == budget.to_data()
     history = postgres_store.load_run_history(run.run_id, tenant_id="tenant-a")
     assert history.tasks[0].budget == budget
+
+
+@pytest.mark.postgres
+def test_task_transport_keeps_resource_and_access_envelopes_separate(
+    postgres_store: PostgresStore,
+) -> None:
+    plan = compile_workflow(ResourceBoundWorkflow())
+    step = plan.executable_steps[0]
+    value = postgres_store.values.encode(1, schema_digest=schema_digest(int))
+    run = postgres_store.create_run(plan, tenant_id="tenant-a", root_input=value)
+    narrowed = CapabilityGrant(capabilities=(RESOURCE_READ.name,))
+    task = postgres_store.enqueue_task(
+        run.run_id,
+        step,
+        step_instance_id="singleton",
+        input_value=value,
+        capability_grant=narrowed,
+    )
+
+    with pytest.raises(InvalidRunStateError, match="different capability grant"):
+        postgres_store.enqueue_task(
+            run.run_id,
+            step,
+            step_instance_id="singleton",
+            input_value=value,
+            capability_grant=CapabilityGrant(
+                capabilities=(RESOURCE_READ.name,),
+                effects=(RESOURCE_EFFECT.name,),
+            ),
+        )
+
+    claim = postgres_store.claim_task(
+        worker_id="worker-a",
+        task_id=task.task_id,
+        capabilities=ExecutorCapabilities(
+            isolations=frozenset({"process"}),
+            capabilities=frozenset({"executor.accelerated"}),
+        ),
+    )
+    assert claim is not None
+    envelope = TaskEnvelope.from_claim(claim).to_data()
+    assert task.budget == ResourceBoundIdentity.budget
+    assert claim.task.budget == ResourceBoundIdentity.budget
+    assert task.capability_grant == narrowed
+    assert claim.task.capability_grant == narrowed
+    assert envelope["budget"] == ResourceBoundIdentity.budget.to_data()
+    assert envelope["capability_grant"] == narrowed.to_data()
+    assert envelope["execution_requirements"]["capabilities"] == ["executor.accelerated"]
+    assert "executor.accelerated" not in envelope["capability_grant"]["capabilities"]
+
+    with postgres_store.connect() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE workflow_tasks
+            SET capability_grant = capability_grant || '{"unexpected": []}'::jsonb
+            WHERE task_id = %s
+            """,
+            (task.task_id,),
+        )
+    with pytest.raises(PersistenceError, match="capability grant"):
+        postgres_store.load_run_history(run.run_id, tenant_id="tenant-a")
 
     with postgres_store.connect() as connection, connection.cursor() as cursor:
         cursor.execute(
