@@ -16,6 +16,7 @@ from maida.workflows import (
     Workflow,
     compile_workflow,
 )
+from maida.workflows._canonical import digest_data
 from maida.workflows.alignment import DiffKind, GraphAligner
 from maida.workflows.ir import PlanIR
 
@@ -113,6 +114,13 @@ def test_compiled_ir_exposes_access_contracts_and_loads_legacy_ir() -> None:
     loaded = PlanIR.from_dict(legacy)
     assert loaded.version == "0.1.0"
     assert all(step.capabilities == () and step.effects == () for step in loaded.steps)
+    assert loaded.to_dict() == legacy
+    assert loaded.digest == digest_data(legacy)
+
+    invalid_legacy = compile_workflow(SupportWorkflow()).to_dict()
+    invalid_legacy["version"] = "0.1.0"
+    with pytest.raises(ValueError, match="does not define external access"):
+        PlanIR.from_dict(invalid_legacy)
 
 
 def test_access_changes_keep_replay_identity_and_receive_specific_diff_kinds() -> None:

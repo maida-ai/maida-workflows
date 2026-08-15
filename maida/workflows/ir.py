@@ -160,7 +160,12 @@ class PlanIR:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a deterministic JSON-compatible representation of the plan."""
-        return cast(dict[str, Any], canonical_data(asdict(self)))
+        encoded = cast(dict[str, Any], canonical_data(asdict(self)))
+        if self.version == "0.1.0":
+            for step in encoded["steps"]:
+                step.pop("capabilities", None)
+                step.pop("effects", None)
+        return encoded
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> PlanIR:
@@ -187,6 +192,10 @@ class PlanIR:
                 f"unsupported Workflow IR version {data.get('version')!r}; "
                 f"expected one of {sorted(SUPPORTED_IR_VERSIONS)}"
             )
+        if data.get("version") == "0.1.0" and any(
+            "capabilities" in step or "effects" in step for step in data["steps"]
+        ):
+            raise ValueError("Workflow IR 0.1.0 does not define external access fields")
         steps = []
         for raw in data["steps"]:
             binding = raw.get("input_binding")
