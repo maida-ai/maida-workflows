@@ -209,8 +209,14 @@ def test_invalid_control_and_workflow_contracts_fail_early() -> None:
     with pytest.raises(ValueError, match="at least one"):
         parallel()
 
-    class WrongOutput(Simple):
+    class WrongOutput(Workflow[int, str]):
+        workflow_id = "wrong-output"
+        input_type = int
         output_type = str
+        add = AddOne()
+
+        def build(self, value: RuntimeValue[int]) -> RuntimeValue[str]:
+            return self.add(value)  # type: ignore[return-value]
 
     with pytest.raises(CompileError, match="declares output"):
         compile_workflow(WrongOutput())

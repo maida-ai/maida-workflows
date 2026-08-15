@@ -22,12 +22,14 @@ widens its own compatibility range.
 ```python
 from maida_workflows import ExecutionContext, Module, Workflow, compile_workflow
 
+
 class Upper(Module[str, str]):
     input_type = str
     output_type = str
 
     async def execute(self, value: str, ctx: ExecutionContext) -> str:
         return value.upper()
+
 
 class Greeting(Workflow[str, str]):
     workflow_id = "greeting"
@@ -37,6 +39,7 @@ class Greeting(Workflow[str, str]):
 
     def build(self, value):
         return self.upper(value)
+
 
 plan = compile_workflow(Greeting())
 print(plan.canonical_json())
