@@ -18,6 +18,7 @@ PUBLIC_MODULES = (
     "maida.workflows.budget",
     "maida.workflows.cli",
     "maida.workflows.coordination",
+    "maida.workflows.dynamic",
     "maida.workflows.fixture",
     "maida.workflows.ir",
     "maida.workflows.models",

@@ -52,6 +52,15 @@ from .authoring import (
 )
 from .budget import Budget
 from .coordination import CoordinatorProgress, WorkflowCatalog, WorkflowCoordinator
+from .dynamic import (
+    ModuleCatalog,
+    PlanFragmentIR,
+    PlanLimits,
+    PlanNode,
+    PlanSignature,
+    PlanValidationError,
+    PlanValidator,
+)
 from .fixture import ReplayFixture, ReplayFixtureError, ReplayFixtureImporter
 from .ir import CompileError, PlanIR, ReplayKey, StepIR, compile_workflow
 from .models import (
@@ -137,9 +146,16 @@ __all__ = [
     "InteractionRequest",
     "LocalExecutor",
     "Module",
+    "ModuleCatalog",
     "PauseCommand",
+    "PlanFragmentIR",
     "PlanIR",
     "PolicyDecision",
+    "PlanLimits",
+    "PlanNode",
+    "PlanSignature",
+    "PlanValidationError",
+    "PlanValidator",
     "RejectCommand",
     "ReplayCase",
     "ReplayDivergence",
