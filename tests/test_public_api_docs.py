@@ -20,6 +20,7 @@ PUBLIC_MODULES = (
     "maida.workflows.persistence",
     "maida.workflows.replay",
     "maida.workflows.runtime",
+    "maida.workflows.userplane",
     "maida.workflows.verification",
     "examples",
     "examples.adversarial_workflows",

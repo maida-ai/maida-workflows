@@ -910,6 +910,58 @@ class PostgresStore:
         )
         return RunHistory(definition, run, tasks, attempts, events)
 
+    def list_events(
+        self,
+        run_id: str,
+        *,
+        tenant_id: str,
+        after: int = 0,
+        limit: int = 100,
+    ) -> tuple[Event, ...]:
+        """Read tenant-scoped events after a monotonic sequence cursor.
+
+        Parameters
+        ----------
+        run_id
+            Durable run whose canonical event log should be projected.
+        tenant_id
+            Tenant scope required to access the run.
+        after
+            Exclusive event sequence cursor.
+        limit
+            Maximum rows to return.
+
+        Raises
+        ------
+        PersistenceError
+            If the run does not exist.
+        TenantAccessError
+            If the run belongs to another tenant.
+        ValueError
+            If the cursor or limit is invalid.
+        """
+        if after < 0:
+            raise ValueError("after cursor must be non-negative")
+        if limit < 1 or limit > 1001:
+            raise ValueError("limit must be between 1 and 1001")
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT tenant_id FROM workflow_runs WHERE run_id = %s", (run_id,))
+            run_row = cursor.fetchone()
+            if run_row is None:
+                raise PersistenceError(f"run {run_id} was not found")
+            if run_row["tenant_id"] != tenant_id:
+                raise TenantAccessError("run is not accessible to this tenant")
+            cursor.execute(
+                """
+                SELECT * FROM workflow_events
+                WHERE run_id = %s AND event_id > %s
+                ORDER BY event_id
+                LIMIT %s
+                """,
+                (run_id, after, limit),
+            )
+            return tuple(self._event_from_row(row) for row in cursor.fetchall())
+
     @staticmethod
     def _task_from_row(row: dict[str, Any]) -> Task:
         boundary = row.get("accepted_boundary")
