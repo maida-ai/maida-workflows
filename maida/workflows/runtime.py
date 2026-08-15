@@ -20,6 +20,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, cast
 
 from ._canonical import digest_data, schema_digest, value_matches_type
+from .access import AccessBroker, AccessPolicy, Capability, ConnectorRegistry
 from .authoring import (
     ExecutionContext,
     Module,
@@ -34,6 +35,7 @@ from .models import (
     AcceptedAttemptProvenance,
     Attempt,
     BoundaryRecord,
+    CapabilityGrant,
     EffectKind,
     EffectRecord,
     ExecutionMode,
@@ -82,7 +84,7 @@ class DurableRuntimeStore(Protocol):
         input_value: StoredValue | None,
         dependency_instance_keys: tuple[str, ...] = (),
         dependency_node_ids: tuple[str, ...] | None = None,
-        capability_grant: tuple[str, ...] | None = None,
+        capability_grant: CapabilityGrant | None = None,
         branch_decisions: tuple[dict[str, Any], ...] = (),
         map_decisions: tuple[dict[str, Any], ...] = (),
         task_id: str | None = None,
@@ -251,7 +253,7 @@ class TaskEnvelope:
             "module_digest": self.task.module_digest,
             "input_ref": self.input_ref.to_data(),
             "execution_requirements": self.task.execution.to_data(),
-            "capability_grant": list(self.task.capability_grant),
+            "capability_grant": self.task.capability_grant.to_data(),
             "attempt_id": self.attempt_id,
             "attempt_number": self.attempt.attempt_number,
             "lease_token": self.lease_token,
@@ -324,9 +326,12 @@ class TaskWorker:
     max_attempts
         Maximum attempts allowed for a logical task.
     capabilities
-        Isolation modes, images, resources, and grants this worker can satisfy.
-    broker
-        Optional runtime-managed external access broker.
+        Isolation modes, images, resources, and executor labels this worker can
+        satisfy for placement. These are never connector access grants.
+    connectors
+        Provider-neutral read adapters available in this worker deployment.
+    access_policy
+        Optional policy that may narrow each task's compiled access grant.
     """
 
     def __init__(
@@ -339,7 +344,8 @@ class TaskWorker:
         worker_id: str,
         max_attempts: int = 3,
         capabilities: ExecutorCapabilities | None = None,
-        broker: Any = None,
+        connectors: ConnectorRegistry | None = None,
+        access_policy: AccessPolicy | None = None,
     ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts must be positive")
@@ -351,7 +357,8 @@ class TaskWorker:
         self.worker_id = worker_id
         self.max_attempts = max_attempts
         self.capabilities = capabilities or ExecutorCapabilities.local_process()
-        self.broker = broker
+        self.connectors = connectors or ConnectorRegistry()
+        self.access_policy = access_policy
 
     def claim(
         self,
@@ -484,7 +491,6 @@ class TaskWorker:
                 input_data,
                 branch_decisions=claim.task.branch_decisions,
                 map_decisions=claim.task.map_decisions,
-                broker=self.broker,
             )
         finally:
             heartbeat.cancel()
@@ -539,7 +545,6 @@ class TaskWorker:
         *,
         branch_decisions: tuple[dict[str, Any], ...] = (),
         map_decisions: tuple[dict[str, Any], ...] = (),
-        broker: Any = None,
     ) -> BoundaryRecord:
         key = key_for(claim)
         envelope = TaskEnvelope.from_claim(claim)
@@ -558,11 +563,41 @@ class TaskWorker:
             self.fail(envelope, diagnostic, retry=False)
             raise RuntimeContractError(diagnostic["reason"])
         metadata: dict[str, Any] = {}
+        try:
+            broker = AccessBroker(
+                self.connectors,
+                declarations=cast(tuple[Capability[Any, Any], ...], module.capabilities),
+                grant=claim.task.capability_grant,
+                run_id=claim.task.run_id,
+                task_id=claim.task.task_id,
+                attempt_id=str(claim.attempt.attempt_id),
+                module_id=claim.task.module_id,
+                logical_step=claim.task.logical_step,
+                policy=self.access_policy,
+                audit=lambda event_type, payload: self.store.append_event(
+                    claim.task.run_id,
+                    event_type,
+                    payload,
+                    task_id=claim.task.task_id,
+                    attempt_id=str(claim.attempt.attempt_id),
+                ),
+                metadata=metadata,
+            )
+        except Exception as exc:
+            self.fail(
+                envelope,
+                {
+                    "reason": "task access contract could not be bound",
+                    "exception_type": type(exc).__qualname__,
+                },
+                retry=False,
+            )
+            raise RuntimeContractError("task access contract could not be bound") from exc
         context = ExecutionContext(
             run_id=claim.task.run_id,
             task_id=claim.task.task_id,
             step_instance_id=claim.task.step_instance_id,
-            broker=self.broker if broker is None else broker,
+            broker=broker,
             metadata=metadata,
         )
         started = time.perf_counter()
@@ -1159,6 +1194,28 @@ class WorkflowRunner:
     Production deployments should run :class:`WorkflowScheduler` and workers in
     separate processes. This facade preserves the same queue, lease, and task
     envelope semantics while hosting both roles in one process for local use.
+
+    Parameters
+    ----------
+    store
+        Durable runtime store used by both the scheduler and local worker.
+    worker_id
+        Diagnostic worker identity recorded on physical attempts.
+    max_attempts
+        Maximum physical attempts allowed for each logical task result.
+    connectors
+        Provider-neutral read-adapter registry. The runner creates a fresh
+        :class:`~maida.workflows.access.AccessBroker` for every task attempt;
+        adapters and their credentials are never added to task envelopes.
+    access_policy
+        Optional policy that may narrow, but cannot expand, the capability
+        grant compiled and persisted for each task.
+
+    Notes
+    -----
+    ``ExecutionSpec.capabilities`` controls which executor may claim a task. It
+    is intentionally separate from connector authorization, which is derived
+    exclusively from the module's compiled capability declarations.
     """
 
     def __init__(
@@ -1167,12 +1224,14 @@ class WorkflowRunner:
         *,
         worker_id: str = "local-worker",
         max_attempts: int = 3,
-        broker: Any = None,
+        connectors: ConnectorRegistry | None = None,
+        access_policy: AccessPolicy | None = None,
     ) -> None:
         self.store = store
         self.worker_id = worker_id
         self.max_attempts = max_attempts
-        self.broker = broker
+        self.connectors = connectors or ConnectorRegistry()
+        self.access_policy = access_policy
 
     async def run[InputT, OutputT](
         self,
@@ -1200,7 +1259,8 @@ class WorkflowRunner:
                 worker_id=self.worker_id,
                 max_attempts=self.max_attempts,
                 capabilities=ExecutorCapabilities.local_process(),
-                broker=self.broker,
+                connectors=self.connectors,
+                access_policy=self.access_policy,
             )
         )
         last_error: Exception | None = None

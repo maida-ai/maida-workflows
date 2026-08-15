@@ -75,7 +75,14 @@ class FakeBroker:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, Any]] = []
 
-    async def read(self, connector: str, operation: str, request: Any) -> Any:
+    async def read(
+        self,
+        connector: str,
+        operation: str,
+        request: Any,
+        *,
+        connector_version: str | None = None,
+    ) -> Any:
         self.calls.append((connector, operation, request))
         return {"email": "ada@example.test"}
 

@@ -260,6 +260,7 @@ class ReplayBroker:
         operation: str,
         request: Any,
         *,
+        connector_version: str | None = None,
         allow_live: bool = False,
     ) -> Any:
         """Return a recorded read or an explicitly approved live-read response.

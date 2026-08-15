@@ -23,12 +23,18 @@ Examples
 """
 
 from .access import (
+    AccessBroker,
     AccessContractError,
+    AccessPolicy,
     Capability,
+    CapabilityGrant,
     Connector,
+    ConnectorAdapter,
+    ConnectorRegistry,
     Effect,
     EffectSpec,
     Idempotency,
+    PolicyDecision,
 )
 from .asgi import UserplaneASGI, create_userplane_app
 from .authoring import (
@@ -95,16 +101,21 @@ from .userplane import (
 from .verification import VerificationSuite
 
 __all__ = [
+    "AccessBroker",
     "AccessContractError",
+    "AccessPolicy",
     "ApproveCommand",
     "BoundModuleCall",
     "BoundaryRecord",
     "CancelCommand",
     "Capability",
+    "CapabilityGrant",
     "CommandReceipt",
     "CommandType",
     "CompileError",
     "Connector",
+    "ConnectorAdapter",
+    "ConnectorRegistry",
     "CoordinatorProgress",
     "Effect",
     "EffectSpec",
@@ -122,6 +133,7 @@ __all__ = [
     "Module",
     "PauseCommand",
     "PlanIR",
+    "PolicyDecision",
     "RejectCommand",
     "ReplayCase",
     "ReplayDivergence",

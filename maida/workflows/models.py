@@ -8,6 +8,7 @@ large payload bytes remain in the configured artifact store.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -85,6 +86,100 @@ _MEMORY_MULTIPLIERS = {
     "GiB": 1024**3,
     "TiB": 1024**4,
 }
+_ACCESS_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
+
+
+@dataclass(frozen=True)
+class CapabilityGrant:
+    """Immutable task authorization derived from compiled access declarations.
+
+    Capability names authorize read-only connector operations; effect names are
+    reserved for the durable effect broker. Executor resource labels are not
+    access permissions and therefore never appear in this object.
+
+    Parameters
+    ----------
+    capabilities
+        Stable names of read-only capabilities available to the task.
+    effects
+        Stable names of consequential effects available to the task.
+    """
+
+    capabilities: tuple[str, ...] = ()
+    effects: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Validate and canonicalize the grant's stable authorization names."""
+        for name in (*self.capabilities, *self.effects):
+            if not isinstance(name, str) or _ACCESS_NAME_PATTERN.fullmatch(name) is None:
+                raise ValueError("grant entries must be non-empty stable names")
+        object.__setattr__(self, "capabilities", tuple(sorted(set(self.capabilities))))
+        object.__setattr__(self, "effects", tuple(sorted(set(self.effects))))
+
+    def allows_capability(self, name: str) -> bool:
+        """Return whether this task may invoke the named read capability."""
+        return name in self.capabilities
+
+    def allows_effect(self, name: str) -> bool:
+        """Return whether this task may propose the named consequential effect."""
+        return name in self.effects
+
+    def narrow(
+        self,
+        *,
+        capabilities: Iterable[str] | None = None,
+        effects: Iterable[str] | None = None,
+    ) -> CapabilityGrant:
+        """Return a subset grant and reject any attempted permission widening.
+
+        Parameters
+        ----------
+        capabilities, effects
+            Replacement names for either grant category. ``None`` preserves the
+            current category; an empty iterable removes every permission.
+
+        Returns
+        -------
+        CapabilityGrant
+            Canonical grant containing only permissions from this grant.
+
+        Raises
+        ------
+        ValueError
+            If either replacement contains a permission absent from this grant.
+        """
+        narrowed = CapabilityGrant(
+            capabilities=self.capabilities if capabilities is None else tuple(capabilities),
+            effects=self.effects if effects is None else tuple(effects),
+        )
+        if not set(narrowed.capabilities).issubset(self.capabilities) or not set(
+            narrowed.effects
+        ).issubset(self.effects):
+            raise ValueError("a capability grant cannot widen compiled permissions")
+        return narrowed
+
+    def to_data(self) -> dict[str, Any]:
+        """Return the canonical credential-free mapping persisted with a task."""
+        return {
+            "capabilities": list(self.capabilities),
+            "effects": list(self.effects),
+        }
+
+    @classmethod
+    def from_data(cls, data: Any) -> CapabilityGrant:
+        """Load a persisted grant while failing closed for legacy sequences.
+
+        Older task rows stored executor eligibility labels as a JSON sequence.
+        Those labels are deliberately treated as no access instead of being
+        promoted into connector permissions.
+        """
+        if not isinstance(data, Mapping):
+            return cls()
+        capabilities = data.get("capabilities", [])
+        effects = data.get("effects", [])
+        if not isinstance(capabilities, list) or not isinstance(effects, list):
+            raise ValueError("capability grant fields must be lists")
+        return cls(tuple(capabilities), tuple(effects))
 
 
 @dataclass(frozen=True)
@@ -452,7 +547,7 @@ class Task:
     dependency_node_ids: tuple[str, ...]
     input_value: StoredValue | None
     execution: ExecutionSpec
-    capability_grant: tuple[str, ...]
+    capability_grant: CapabilityGrant
     branch_decisions: tuple[dict[str, Any], ...]
     map_decisions: tuple[dict[str, Any], ...]
     status: TaskStatus

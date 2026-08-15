@@ -30,6 +30,7 @@ from .models import (
     Attempt,
     AttemptStatus,
     BoundaryRecord,
+    CapabilityGrant,
     Definition,
     Event,
     ExecutionMode,
@@ -257,7 +258,7 @@ class PostgresStore:
         input_value: StoredValue | None,
         dependency_instance_keys: tuple[str, ...] = (),
         dependency_node_ids: tuple[str, ...] | None = None,
-        capability_grant: tuple[str, ...] | None = None,
+        capability_grant: CapabilityGrant | None = None,
         branch_decisions: tuple[dict[str, Any], ...] = (),
         map_decisions: tuple[dict[str, Any], ...] = (),
         task_id: str | None = None,
@@ -273,7 +274,15 @@ class PostgresStore:
             raise ValueError("only executable module steps can be enqueued")
         identifier = task_id or str(uuid4())
         execution = ExecutionSpec.from_data(dict(step.execution or {}))
-        grant = execution.capabilities if capability_grant is None else capability_grant
+        compiled_grant = CapabilityGrant(
+            capabilities=tuple(str(item["name"]) for item in step.capabilities),
+            effects=tuple(str(item["name"]) for item in step.effects),
+        )
+        grant = compiled_grant if capability_grant is None else capability_grant
+        if not set(grant.capabilities).issubset(compiled_grant.capabilities) or not set(
+            grant.effects
+        ).issubset(compiled_grant.effects):
+            raise ValueError("task capability grant cannot widen compiled step access")
         initial_status = TaskStatus.READY if input_value is not None else TaskStatus.BLOCKED
         dependencies = dependency_node_ids if dependency_node_ids is not None else step.dependencies
         with self.connect() as connection, connection.cursor() as cursor:
@@ -321,7 +330,7 @@ class PostgresStore:
                     execution.cpu,
                     execution.memory_bytes,
                     Jsonb(list(execution.capabilities)),
-                    Jsonb(list(grant)),
+                    Jsonb(grant.to_data()),
                     Jsonb(list(branch_decisions)),
                     Jsonb(list(map_decisions)),
                     initial_status.value,
@@ -1324,7 +1333,7 @@ class PostgresStore:
             dependency_node_ids=tuple(row.get("dependency_node_ids", ())),
             input_value=StoredValue.from_data(row["task_input"]) if row["task_input"] else None,
             execution=ExecutionSpec.from_data(dict(row.get("execution_requirements") or {})),
-            capability_grant=tuple(row.get("capability_grant", ())),
+            capability_grant=CapabilityGrant.from_data(row.get("capability_grant")),
             branch_decisions=tuple(row.get("branch_decisions", ())),
             map_decisions=tuple(row.get("map_decisions", ())),
             status=TaskStatus(row["status"]),
