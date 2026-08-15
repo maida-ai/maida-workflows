@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from maida_workflows import ExecutionContext, Module, RuntimeValue, Workflow, when
+from maida.workflows import ExecutionContext, Module, RuntimeValue, Workflow, when
 
 
 class IsUrgent(Module[dict[str, str], bool]):

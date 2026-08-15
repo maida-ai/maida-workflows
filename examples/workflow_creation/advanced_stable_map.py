@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from maida_workflows import ExecutionContext, Module, RuntimeValue, Workflow, map_over
+from maida.workflows import ExecutionContext, Module, RuntimeValue, Workflow, map_over
 
 
 class NormalizeDocument(Module[dict[str, str], str]):

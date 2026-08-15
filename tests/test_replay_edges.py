@@ -7,11 +7,11 @@ from typing import Any
 
 import pytest
 
-from maida_workflows import ExecutionContext, Module, ReplayKey, RuntimeValue, Workflow
-from maida_workflows.fixture import ReplayFixture, ReplayFixtureExporter
-from maida_workflows.models import EffectKind, EffectRecord
-from maida_workflows.persistence import PostgresStore
-from maida_workflows.replay import (
+from maida.workflows import ExecutionContext, Module, ReplayKey, RuntimeValue, Workflow
+from maida.workflows.fixture import ReplayFixture, ReplayFixtureExporter
+from maida.workflows.models import EffectKind, EffectRecord
+from maida.workflows.persistence import PostgresStore
+from maida.workflows.replay import (
     MaidaTraceBridge,
     ReplayBroker,
     ReplayCase,
@@ -25,8 +25,8 @@ from maida_workflows.replay import (
     ReplayWorkerPolicy,
     assert_replay_worker_environment,
 )
-from maida_workflows.runtime import WorkflowRunner
-from maida_workflows.verification import VerificationSuite, VerificationVerdict, verify_workflow
+from maida.workflows.runtime import WorkflowRunner
+from maida.workflows.verification import VerificationSuite, VerificationVerdict, verify_workflow
 
 
 class NoTraceBridge:
@@ -98,7 +98,7 @@ async def captured(postgres_store: PostgresStore) -> ReplayFixture:
 async def test_each_compile_run_or_replay_operation_builds_the_symbolic_graph_once(
     postgres_store: PostgresStore,
 ) -> None:
-    from maida_workflows import compile_workflow
+    from maida.workflows import compile_workflow
 
     compiled = CountingBuildWorkflow()
     compile_workflow(compiled)
@@ -299,7 +299,7 @@ async def test_full_stub_reconstructs_recorded_control_and_composition_paths(
 @pytest.mark.asyncio
 async def test_replay_broker_reads_effects_and_worker_policy_are_fail_closed() -> None:
     request = {"ticket": 1}
-    from maida_workflows._canonical import digest_data
+    from maida.workflows._canonical import digest_data
 
     read_key = ("inventory", digest_data({"operation": "get", "request": request}))
     broker = ReplayBroker(recorded_reads={read_key: {"stock": 2}})
@@ -326,7 +326,7 @@ async def test_replay_broker_reads_effects_and_worker_policy_are_fail_closed() -
 
 
 def test_replay_effect_adapter_compares_without_invoking_a_connector() -> None:
-    from maida_workflows._canonical import digest_data
+    from maida.workflows._canonical import digest_data
 
     request = {"message": "hello"}
     recorded = EffectRecord(

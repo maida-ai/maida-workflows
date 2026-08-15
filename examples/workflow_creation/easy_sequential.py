@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from maida_workflows import ExecutionContext, Module, RuntimeValue, Workflow
+from maida.workflows import ExecutionContext, Module, RuntimeValue, Workflow
 
 
 class NormalizeName(Module[str, str]):

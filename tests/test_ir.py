@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from maida_workflows import (
+from maida.workflows import (
     CompileError,
     ExecutionContext,
     Module,
@@ -16,7 +16,7 @@ from maida_workflows import (
     parallel,
     when,
 )
-from maida_workflows.alignment import DiffKind, GraphAligner
+from maida.workflows.alignment import DiffKind, GraphAligner
 
 
 class AddOne(Module[int, int]):

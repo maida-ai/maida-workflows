@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from maida_workflows import (
+from maida.workflows import (
     ExecutionContext,
     Module,
     ReplayKey,
@@ -15,12 +15,12 @@ from maida_workflows import (
     Workflow,
     compile_workflow,
 )
-from maida_workflows.alignment import GraphAligner
-from maida_workflows.artifacts import ArtifactStore, ValueCodec
-from maida_workflows.fixture import ReplayFixtureExporter
-from maida_workflows.persistence import PostgresStore
-from maida_workflows.replay import ReplayCase, ReplayEngine, ReplayMode, TraceBridge
-from maida_workflows.runtime import WorkflowRunner
+from maida.workflows.alignment import GraphAligner
+from maida.workflows.artifacts import ArtifactStore, ValueCodec
+from maida.workflows.fixture import ReplayFixtureExporter
+from maida.workflows.persistence import PostgresStore
+from maida.workflows.replay import ReplayCase, ReplayEngine, ReplayMode, TraceBridge
+from maida.workflows.runtime import WorkflowRunner
 
 
 @dataclass(frozen=True)

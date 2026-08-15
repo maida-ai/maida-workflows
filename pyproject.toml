@@ -7,14 +7,14 @@ requires-python = ">=3.12,<3.14"
 license = "Apache-2.0"
 authors = [{ name = "Maida.AI" }]
 dependencies = [
-    "maida-ai",
+    "maida-ai>=0.5.1",
     "opentelemetry-api>=1.42",
     "psycopg[binary]>=3.2,<4",
     "typer>=0.26,<0.27",
 ]
 
 [project.scripts]
-maida-workflows = "maida_workflows.cli:app"
+maida-workflows = "maida.workflows.cli:app"
 
 [dependency-groups]
 dev = [
@@ -38,15 +38,13 @@ vcs = "git"
 pattern = "default-unprefixed"
 fallback-version = "0.0.0"
 
+# Install only maida/workflows — do not ship maida/__init__.py.
+# Core maida-ai owns maida/__init__.py (with pkgutil.extend_path).
 [tool.hatch.build.targets.wheel]
-packages = ["maida_workflows"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"maida/workflows/__init__.py" = "maida/workflows/__init__.py"
+only-include = ["maida/workflows"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "/maida_workflows",
     "/maida/workflows",
     "/examples",
     "/tests",
@@ -62,7 +60,7 @@ markers = ["postgres: requires a PostgreSQL server"]
 
 [tool.coverage.run]
 branch = true
-source = ["maida_workflows"]
+source = ["maida.workflows"]
 
 [tool.coverage.report]
 fail_under = 90
@@ -77,9 +75,9 @@ target-version = "py312"
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
-"maida_workflows/cli.py" = ["B008"]
+"maida/workflows/cli.py" = ["B008"]
 
 [tool.mypy]
 python_version = "3.12"
 strict = true
-packages = ["maida_workflows"]
+packages = ["maida.workflows"]

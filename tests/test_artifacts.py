@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from maida_workflows._canonical import digest_bytes
-from maida_workflows.artifacts import (
+from maida.workflows._canonical import digest_bytes
+from maida.workflows.artifacts import (
     ArtifactStore,
     CorruptArtifactError,
     MissingArtifactError,

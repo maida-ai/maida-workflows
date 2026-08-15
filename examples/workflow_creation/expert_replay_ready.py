@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from maida_workflows import (
+from maida.workflows import (
     ExecutionContext,
     Module,
     RuntimeValue,

@@ -11,14 +11,14 @@ The package supports:
 - durable PostgreSQL runs, tasks, attempts, events, definitions, and leases;
 - content-addressed artifacts and replay-complete accepted boundary records;
 - structural diff, zero-live-call full-stub replay, and isolated selective replay;
-- a canonical `maida_workflows` package and `maida.workflows` wheel shim.
+- install as the `maida.workflows` namespace subpackage (`from maida import workflows`).
 
 Python 3.12 and 3.13 are supported.
 
 ## Quick start
 
 ```python
-from maida_workflows import ExecutionContext, Module, Workflow, compile_workflow
+from maida.workflows import ExecutionContext, Module, Workflow, compile_workflow
 
 
 class Upper(Module[str, str]):
@@ -140,8 +140,9 @@ Replay workers prevent runtime-managed effect paths from reaching registered
 production adapters. They do not sandbox arbitrary Python syscalls, so untrusted
 selective modules still require appropriate process or container isolation.
 
-`maida_workflows` is canonical. Built wheels also install `maida.workflows` as a
-compatibility shim; editable installs should import the canonical package.
+Import the package as `maida.workflows` (or `from maida import workflows`). It
+requires a `maida-ai` release that enables the `maida` namespace via
+`pkgutil.extend_path`.
 
 ## Development
 

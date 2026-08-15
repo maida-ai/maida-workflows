@@ -8,11 +8,11 @@ import pytest
 from typer.testing import CliRunner
 
 from examples.adversarial_workflows import AdversarialBranchWorkflow
-from maida_workflows import compile_workflow
-from maida_workflows._canonical import schema_digest
-from maida_workflows.cli import app
-from maida_workflows.persistence import PostgresStore
-from maida_workflows.runtime import WorkflowRunner
+from maida.workflows import compile_workflow
+from maida.workflows._canonical import schema_digest
+from maida.workflows.cli import app
+from maida.workflows.persistence import PostgresStore
+from maida.workflows.runtime import WorkflowRunner
 
 runner = CliRunner()
 

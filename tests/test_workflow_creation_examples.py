@@ -16,9 +16,9 @@ from examples.workflow_creation import (
     intermediate_branching,
     intermediate_parallel,
 )
-from maida_workflows import Workflow, compile_workflow
-from maida_workflows.persistence import PostgresStore
-from maida_workflows.runtime import WorkflowRunner
+from maida.workflows import Workflow, compile_workflow
+from maida.workflows.persistence import PostgresStore
+from maida.workflows.runtime import WorkflowRunner
 
 
 @dataclass(frozen=True)

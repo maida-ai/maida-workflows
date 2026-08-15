@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from maida_workflows import (
+from maida.workflows import (
     ExecutionContext,
     Module,
     RuntimeValue,
@@ -14,10 +14,10 @@ from maida_workflows import (
     map_over,
     when,
 )
-from maida_workflows._canonical import schema_digest
-from maida_workflows.models import AttemptStatus, EffectKind, RunHistory, RunStatus
-from maida_workflows.persistence import PostgresStore
-from maida_workflows.runtime import (
+from maida.workflows._canonical import schema_digest
+from maida.workflows.models import AttemptStatus, EffectKind, RunHistory, RunStatus
+from maida.workflows.persistence import PostgresStore
+from maida.workflows.runtime import (
     RuntimeContractError,
     TaskWorker,
     WorkflowRunner,

@@ -10,8 +10,8 @@ import pytest
 from psycopg import sql
 from psycopg.conninfo import make_conninfo
 
-from maida_workflows.artifacts import ArtifactStore, ValueCodec
-from maida_workflows.persistence import PostgresStore
+from maida.workflows.artifacts import ArtifactStore, ValueCodec
+from maida.workflows.persistence import PostgresStore
 
 
 @pytest.fixture

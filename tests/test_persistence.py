@@ -7,10 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from maida_workflows import ExecutionContext, Module, RuntimeValue, Workflow, compile_workflow
-from maida_workflows._canonical import schema_digest
-from maida_workflows.models import AttemptStatus, RunStatus, TaskStatus
-from maida_workflows.persistence import (
+from maida.workflows import ExecutionContext, Module, RuntimeValue, Workflow, compile_workflow
+from maida.workflows._canonical import schema_digest
+from maida.workflows.models import AttemptStatus, RunStatus, TaskStatus
+from maida.workflows.persistence import (
     MigrationChecksumError,
     MigrationRunner,
     PostgresStore,
@@ -43,7 +43,7 @@ def test_migrations_are_idempotent_and_checksummed(
     postgres_store: PostgresStore, tmp_path: Path
 ) -> None:
     postgres_store.upgrade()
-    source = Path(__file__).parents[1] / "maida_workflows" / "migrations"
+    source = Path(__file__).parents[1] / "maida" / "workflows" / "migrations"
     copied = tmp_path / "migrations"
     shutil.copytree(source, copied)
     migration = copied / "0001_initial.sql"
@@ -133,7 +133,7 @@ def test_run_cannot_complete_with_unfinished_tasks(postgres_store: PostgresStore
         input_value=value,
     )
 
-    from maida_workflows.persistence import InvalidRunStateError
+    from maida.workflows.persistence import InvalidRunStateError
 
     with pytest.raises(InvalidRunStateError, match="incomplete"):
         postgres_store.complete_run(run.run_id, value)

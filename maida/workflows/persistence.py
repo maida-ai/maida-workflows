@@ -66,7 +66,7 @@ class ClaimedTask:
 def _migration_files(directory: Path | None = None) -> tuple[Path, ...]:
     if directory is not None:
         return tuple(sorted(directory.glob("*.sql")))
-    resource = importlib.resources.files("maida_workflows").joinpath("migrations")
+    resource = importlib.resources.files("maida.workflows").joinpath("migrations")
     with importlib.resources.as_file(resource) as path:
         return tuple(sorted(path.glob("*.sql")))
 

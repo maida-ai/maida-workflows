@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from maida_workflows import (
+from maida.workflows import (
     ExecutionContext,
     Module,
     ReplayKey,
@@ -18,18 +18,18 @@ from maida_workflows import (
     compile_workflow,
     when,
 )
-from maida_workflows.alignment import DiffKind, GraphAligner
-from maida_workflows.baseline import create_baseline
-from maida_workflows.fixture import (
+from maida.workflows.alignment import DiffKind, GraphAligner
+from maida.workflows.baseline import create_baseline
+from maida.workflows.fixture import (
     FixtureErrorCode,
     ReplayFixture,
     ReplayFixtureError,
     ReplayFixtureExporter,
     load_fixture,
 )
-from maida_workflows.models import RunStatus
-from maida_workflows.persistence import PostgresStore
-from maida_workflows.replay import (
+from maida.workflows.models import RunStatus
+from maida.workflows.persistence import PostgresStore
+from maida.workflows.replay import (
     ReplayBudget,
     ReplayCase,
     ReplayContractError,
@@ -41,8 +41,8 @@ from maida_workflows.replay import (
     ReplayWorkerPolicy,
     resolve_selectors,
 )
-from maida_workflows.runtime import WorkflowRunner
-from maida_workflows.verification import (
+from maida.workflows.runtime import WorkflowRunner
+from maida.workflows.verification import (
     VerificationPolicy,
     VerificationSuite,
     VerificationVerdict,

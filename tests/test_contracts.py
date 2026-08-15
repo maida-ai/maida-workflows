@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from maida_workflows import (
+from maida.workflows import (
     ExecutionContext,
     Module,
     RuntimeValue,
@@ -15,7 +15,7 @@ from maida_workflows import (
     compile_workflow,
     parallel,
 )
-from maida_workflows._canonical import (
+from maida.workflows._canonical import (
     CanonicalValueError,
     canonical_data,
     canonical_json,
@@ -23,7 +23,7 @@ from maida_workflows._canonical import (
     type_schema,
     value_matches_type,
 )
-from maida_workflows.alignment import DiffKind, GraphAligner
+from maida.workflows.alignment import DiffKind, GraphAligner
 
 
 class Color(Enum):

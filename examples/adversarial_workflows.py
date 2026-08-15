@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from maida_workflows import (
+from maida.workflows import (
     ExecutionContext,
     Module,
     RuntimeValue,
