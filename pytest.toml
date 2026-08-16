@@ -1,0 +1,10 @@
+[pytest]
+addopts = ["-ra", "--strict-markers", "--strict-config", "-n", "auto"]
+strict_markers = true
+testpaths = ["tests"]
+markers = [
+  "slow: slower tests (excluded from fast CI)",
+  "long: long-running tests (excluded from fast CI)",
+  "longrunning: very long-running tests (excluded from fast CI)",
+  "postgres: requires a PostgreSQL server"
+]
