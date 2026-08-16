@@ -72,6 +72,24 @@ def test_spec_bundle_is_deterministic_private_and_exactly_rebindable(tmp_path: P
     assert loaded.portability.value == "reconstructable"
 
 
+def test_multistep_bundle_rebind_ignores_requirement_storage_order() -> None:
+    spec = WorkflowSpec(
+        workflow_id="bundle-multistep",
+        input_schema=type_schema(str),
+        output_schema=type_schema(str),
+        nodes=(
+            NodeSpec.task("first", "text.upper", BindingSpec.root()),
+            NodeSpec.task("second", "text.upper", BindingSpec.node("first")),
+        ),
+        output=BindingSpec.node("second"),
+    )
+    bundle = WorkflowBundle.from_spec(spec, registry())
+
+    rebound = bundle.bind(module_registry=registry())
+
+    assert rebound.plan.digest == bundle.plan.digest
+
+
 def test_loading_rejects_tampering_unknown_fields_duplicates_and_noncanonical_data(
     tmp_path: Path,
 ) -> None:

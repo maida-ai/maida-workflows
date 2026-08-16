@@ -336,8 +336,11 @@ class WorkflowBundle:
             compilation = compile_workflow_spec(self.spec, module_registry)
             if not compilation.ok or compilation.bound is None or compilation.plan is None:
                 raise WorkflowBundleError("workflow bundle cannot rebind through this registry")
+            current_requirements = tuple(
+                sorted(compilation.binding_requirements, key=canonical_json)
+            )
             if compilation.plan.canonical_json() != self.plan.canonical_json() or canonical_json(
-                compilation.binding_requirements
+                current_requirements
             ) != canonical_json(self.binding_requirements):
                 raise WorkflowBundleError("workflow bundle rebind changed its exact definition")
             return compilation.bound
