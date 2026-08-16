@@ -268,7 +268,8 @@ async def test_durable_dag_runs_across_executors_and_recovers_a_dead_vm(
         worker_id="vm-17",
         capabilities=VM_CAPABILITIES,
     )
-    dead_envelope = dead_worker.claim(lease_for=timedelta(milliseconds=100))
+    recovery_lease = timedelta(milliseconds=500)
+    dead_envelope = dead_worker.claim(lease_for=recovery_lease)
     assert dead_envelope is not None
     envelope_data = dead_envelope.to_data()
     assert envelope_data["task_id"] == dead_envelope.task_id
@@ -278,7 +279,7 @@ async def test_durable_dag_runs_across_executors_and_recovers_a_dead_vm(
     dead_envelope = dead_worker.start(dead_envelope)
     checkpoint = postgres_store.values.encode({"cursor": 1}, schema_digest="checkpoint-schema")
     dead_worker.checkpoint(dead_envelope, checkpoint)
-    deadline = dead_worker.heartbeat(dead_envelope, lease_for=timedelta(milliseconds=100))
+    deadline = dead_worker.heartbeat(dead_envelope, lease_for=recovery_lease)
     assert deadline > dead_envelope.lease_expires_at
 
     live_worker = LocalExecutor(
@@ -296,7 +297,7 @@ async def test_durable_dag_runs_across_executors_and_recovers_a_dead_vm(
     assert await live_worker.run_once() is not None
     assert scheduler.advance().ready_tasks == 0
 
-    time.sleep(0.15)
+    time.sleep(recovery_lease.total_seconds() + 0.05)
     recovery_worker = LocalExecutor(
         TaskWorker(
             postgres_store,

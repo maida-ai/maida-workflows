@@ -48,7 +48,6 @@ EXAMPLES = (
     ExampleCase(advanced_stable_map, frozenset({"module", "map_module"})),
     ExampleCase(advanced_nested, frozenset({"module", "parallel"})),
     ExampleCase(advanced_portable_workflow, frozenset({"module"})),
-    ExampleCase(expert_generated_workflow, frozenset({"module"})),
     ExampleCase(
         expert_replay_ready,
         frozenset({"module", "map_module", "parallel", "when"}),
@@ -130,10 +129,25 @@ def test_interactive_and_external_examples_compile_honest_boundaries() -> None:
     assert external.executable_steps[0].effects[0]["approval_required"] is True
 
 
-def test_generated_example_validates_and_portable_bundle_round_trips(tmp_path: Path) -> None:
-    expert_generated_workflow.validate_fragment()
+def test_portable_bundle_example_round_trips(tmp_path: Path) -> None:
     path = tmp_path / "onboarding.maida-workflow"
     restored = advanced_portable_workflow.save_and_restore(path)
 
     assert restored.digest == advanced_portable_workflow.bundle.digest
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_generated_example_runs_the_input_dependent_root_plan(
+    postgres_store: PostgresStore,
+) -> None:
+    result = await expert_generated_workflow.run_example(postgres_store)
+    history = postgres_store.load_run_history(result.run_id, tenant_id="local")
+    materialized = next(
+        event for event in history.events if event.event_type == "PLAN_MATERIALIZED"
+    )
+
+    assert result.output == expert_generated_workflow.EXPECTED_OUTPUT
+    assert history.definition.workflow_id == "dynamic:request-plan"
+    assert materialized.payload["signature"]["node_count"] == 5

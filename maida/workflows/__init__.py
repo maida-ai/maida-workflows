@@ -60,6 +60,7 @@ from .bundle import (
 from .coordination import CoordinatorProgress, WorkflowCatalog, WorkflowCoordinator
 from .definitions import BoundWorkflow, bind_workflow
 from .dynamic import (
+    PlanBoundary,
     PlanFragmentIR,
     PlanLimits,
     PlanNode,
@@ -196,6 +197,7 @@ __all__ = [
     "ModuleTemplate",
     "NodeSpec",
     "PauseCommand",
+    "PlanBoundary",
     "PlanFragmentIR",
     "PlanIR",
     "PlanLimits",

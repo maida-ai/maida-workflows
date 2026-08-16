@@ -33,10 +33,16 @@ from .authoring import (
     _WorkflowBinding,
 )
 from .budget import BudgetExceededError, BudgetUsage
-from .dynamic import PlanFragmentIR, PlanSignature, PlanValidationError, PlanValidator
+from .dynamic import (
+    PlanFragmentIR,
+    PlanSignature,
+    PlanValidationError,
+    PlanValidator,
+    _plan_from_signature,
+)
 from .fixture import ReplayFixture, _validate_loaded_integrity
 from .interactions import _InteractionModule
-from .ir import BindingIR, PlanIR, ReplayKey, StepIR, _compile_workflow_graph, module_digest
+from .ir import PlanIR, ReplayKey, _compile_workflow_graph, module_digest
 from .model import ModelAdapterRegistry, ModelBroker, ModelSpec
 from .models import BoundaryRecord, EffectKind, EffectRecord, Usage
 from .runtime import _coerce_trajectory, _rehydrate, _stable_instance_id
@@ -573,8 +579,8 @@ class ReplayEngine:
                     f"generated region {record.region_id!r} no longer satisfies policy: {exc.code}"
                 ) from exc
             alignment = self.aligner.align(
-                _signature_plan(record.signature),
-                _signature_plan(signature),
+                _plan_from_signature(record.signature),
+                _plan_from_signature(signature),
             )
             if alignment.diff.first_divergence is not None:
                 change = alignment.diff.first_divergence
@@ -912,7 +918,9 @@ class ReplayEngine:
                     f"selective planner output failed generated policy: {exc.code}"
                 ) from exc
             current = current_signatures[record.region_instance_id]
-            alignment = self.aligner.align(_signature_plan(current), _signature_plan(proposed))
+            alignment = self.aligner.align(
+                _plan_from_signature(current), _plan_from_signature(proposed)
+            )
             if alignment.diff.first_divergence is not None:
                 return ReplayDivergence(alignment.diff.first_divergence, alignment.diff)
         return None
@@ -942,71 +950,6 @@ def _decode_fragment(fixture: ReplayFixture, boundary: BoundaryRecord) -> PlanFr
         raise ReplayContractError(
             f"recorded planner boundary {boundary.instance_key} is not a canonical fragment"
         ) from exc
-
-
-def _signature_plan(signature: PlanSignature) -> PlanIR:
-    """Project one resolved generated signature into the shared graph model."""
-    steps: list[StepIR] = []
-    for descriptor in signature.resolved_nodes:
-        node_key = cast(str, descriptor["key"])
-        dependencies = tuple(
-            "input" if dependency == "$input" else f"nodes/{dependency}"
-            for dependency in cast(tuple[str, ...], descriptor["dependencies"])
-        )
-        input_schemas = tuple(cast(tuple[str, ...], descriptor["input_schema_digests"]))
-        input_schema = (
-            input_schemas[0]
-            if len(input_schemas) == 1
-            else digest_data({"ordered_input_schemas": input_schemas})
-        )
-        binding = BindingIR(
-            schema_digest=input_schema,
-            kind="source",
-            source=dependencies[0] if dependencies else "input",
-        )
-        steps.append(
-            StepIR(
-                node_id=f"nodes/{node_key}",
-                kind="module",
-                dependencies=dependencies,
-                output_schema_digest=cast(str, descriptor["output_schema_digest"]),
-                module_id=cast(str, descriptor["module_id"]),
-                logical_step=f"dynamic/{signature.region_id}/nodes/{node_key}",
-                module_digest=cast(str, descriptor["module_digest"]),
-                definition_digest=digest_data(
-                    {
-                        "module_id": descriptor["module_id"],
-                        "module_digest": descriptor["module_digest"],
-                        "logical_step": f"dynamic/{signature.region_id}/nodes/{node_key}",
-                    }
-                ),
-                input_binding=binding,
-                execution=cast(Mapping[str, Any], descriptor["execution"]),
-                capabilities=tuple(cast(tuple[Mapping[str, Any], ...], descriptor["capabilities"])),
-                effects=tuple(cast(tuple[Mapping[str, Any], ...], descriptor["effects"])),
-                budget=cast(Mapping[str, int | float | None], descriptor["budget"]),
-            )
-        )
-    output_dependencies = tuple(f"nodes/{key}" for key in signature.outputs)
-    steps.append(
-        StepIR(
-            node_id="output",
-            kind="parallel",
-            dependencies=output_dependencies,
-            output_schema_digest=digest_data(
-                {"ordered_output_schemas": signature.output_schema_digests}
-            ),
-            control={"region": "generated_output", "outputs": signature.outputs},
-        )
-    )
-    return PlanIR(
-        version="0.4.0",
-        workflow_id=f"dynamic:{signature.region_id}",
-        input_schema={"digest": signature.region_input_schema_digest},
-        output_schema={"digests": list(signature.output_schema_digests)},
-        steps=tuple(steps),
-        output_node="output",
-    )
 
 
 class _StubGraphExecutor:

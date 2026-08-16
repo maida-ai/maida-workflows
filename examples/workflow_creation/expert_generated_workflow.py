@@ -1,10 +1,9 @@
-"""Return an allowlisted generated DAG for durable child materialization.
+"""Generate and execute an input-dependent root plan with no network access.
 
-The planner returns graph choices only: stable node keys, allowlist aliases,
-dependencies, and outputs. Trusted code supplies module digests, schemas,
-execution environments, grants, and budgets. The control plane validates and
-materializes the entire graph after the planner boundary commits; the planner
-worker never invokes or manages child workers.
+The planner emits only node keys, allowlisted aliases, dependencies, and one
+output. A trusted ``PlanBoundary`` supplies every module identity, schema,
+execution requirement, grant, and budget before ``WorkflowRunner`` inserts any
+child task. The local adapter simulates reads and effects deterministically.
 """
 
 from __future__ import annotations
@@ -14,18 +13,24 @@ from typing import Any
 
 from maida.workflows import (
     Budget,
+    Capability,
     CapabilityGrant,
+    Connector,
+    ConnectorRegistry,
+    Effect,
+    EffectSpec,
     ExecutionContext,
+    Idempotency,
     Module,
     ModuleRegistry,
+    PlanBoundary,
     PlanFragmentIR,
     PlanLimits,
     PlanNode,
-    PlanValidator,
-    RuntimeValue,
-    Workflow,
+    RunResult,
+    WorkflowRunner,
 )
-from maida.workflows._canonical import schema_digest
+from maida.workflows.persistence import PostgresStore
 
 NODE_BUDGET = Budget(
     wall_time=timedelta(seconds=1),
@@ -33,103 +38,160 @@ NODE_BUDGET = Budget(
     tool_calls=0,
     cost_usd=0.0,
 )
-
-fragment = PlanFragmentIR(
-    fragment_id="generated-math",
-    nodes=(
-        PlanNode("increment", "math.increment", ("$input",)),
-        PlanNode("double", "math.double", ("$input",)),
-        PlanNode("join", "math.join", ("increment", "double")),
-    ),
-    outputs=("join",),
+TOOL_BUDGET = Budget(
+    wall_time=timedelta(seconds=1),
+    model_tokens=0,
+    tool_calls=1,
+    cost_usd=0.0,
+)
+CONTEXT = Capability(
+    "records.context.read",
+    "demo-records",
+    "context",
+    str,
+    str,
+    connector_version="1",
+)
+DELIVER = EffectSpec(
+    "messages.deliver",
+    "demo-records",
+    "deliver",
+    str,
+    str,
+    connector_version="1",
+    idempotency=Idempotency.REQUIRED,
 )
 
 
-class _Planner(Module[int, dict[str, Any]]):
-    input_type = int
-    output_type = dict[str, Any]
-
-    def __init__(self, plan: PlanFragmentIR) -> None:
-        self.plan = plan.to_dict()
-
-    async def execute(self, value: int, ctx: ExecutionContext) -> dict[str, Any]:
-        del value, ctx
-        return self.plan
-
-
-class _Offset(Module[int, int]):
-    input_type = int
-    output_type = int
+class _Normalize(Module[str, str]):
+    module_id = "demo.normalize"
+    input_type = str
+    output_type = str
     budget = NODE_BUDGET
 
-    def __init__(self, module_id: str, amount: int) -> None:
-        self.module_id = module_id
-        self.amount = amount
-
-    async def execute(self, value: int, ctx: ExecutionContext) -> int:
-        return value + self.amount
+    async def execute(self, value: str, ctx: ExecutionContext) -> str:
+        return value.upper()
 
 
-class _Join(Module[tuple[int, int], int]):
-    module_id = "math.join"
-    input_type = tuple[int, int]
-    output_type = int
+class _Draft(Module[str, str]):
+    module_id = "demo.draft"
+    input_type = str
+    output_type = str
     budget = NODE_BUDGET
 
-    async def execute(self, value: tuple[int, int], ctx: ExecutionContext) -> int:
-        return value[0] + value[1]
+    async def execute(self, value: str, ctx: ExecutionContext) -> str:
+        return f"draft:{value}"
 
 
-class GeneratedMath(Workflow[int, dict[str, Any]]):
-    """Commit a small generated fan-out/fan-in plan as typed data."""
+class _Audit(Module[tuple[str, str], str]):
+    module_id = "demo.audit"
+    input_type = tuple[str, str]
+    output_type = str
+    budget = NODE_BUDGET
 
-    workflow_id = "onboarding-generated"
-    input_type = int
-    output_type = dict[str, Any]
-    planner = _Planner(fragment)
-
-    def build(self, value: RuntimeValue[int]) -> RuntimeValue[dict[str, Any]]:
-        """Construct the durable planner boundary."""
-        return self.planner(value)
+    async def execute(self, value: tuple[str, str], ctx: ExecutionContext) -> str:
+        return " | ".join(value)
 
 
-increment = _Offset("math.increment", 1)
-double = _Offset("math.double", 2)
-join = _Join()
+def _context_module() -> Module[Any, Any]:
+    module = Connector(CONTEXT, module_id="demo.context")
+    module.budget = TOOL_BUDGET
+    return module
+
+
+def _deliver_module() -> Module[Any, Any]:
+    module = Effect(DELIVER, module_id="demo.deliver")
+    module.budget = TOOL_BUDGET
+    return module
+
+
 registry = ModuleRegistry(
     modules={
-        "math.increment": lambda: increment,
-        "math.double": lambda: double,
-        "math.join": lambda: join,
+        "messages.deliver": _deliver_module,
+        "records.context": _context_module,
+        "text.audit": _Audit,
+        "text.draft": _Draft,
+        "text.normalize": _Normalize,
     }
 )
-
-validator = PlanValidator(
+boundary = PlanBoundary(
     registry,
     PlanLimits(
         max_nodes=8,
-        max_depth=4,
-        max_fanout=4,
+        max_depth=5,
+        max_fanout=3,
         budget=Budget(
-            wall_time=timedelta(seconds=3),
+            wall_time=timedelta(seconds=5),
             model_tokens=0,
-            tool_calls=0,
+            tool_calls=2,
             cost_usd=0.0,
         ),
     ),
-    region_id="math-region",
-    region_grant=CapabilityGrant(),
+    region_id="request-plan",
+    output_type=str,
+    region_grant=CapabilityGrant(
+        capabilities=(CONTEXT.name,),
+        effects=(DELIVER.name,),
+    ),
 )
 
-workflow = GeneratedMath()
-EXAMPLE_INPUT = 3
-EXPECTED_OUTPUT = fragment.to_dict()
 
-
-def validate_fragment() -> None:
-    """Authenticate the generated choices against current trusted contracts."""
-    validator.validate(
-        fragment,
-        region_input_schema_digest=schema_digest(int),
-        expected_output_schema_digests=(schema_digest(int),),
+def _brief_plan() -> PlanFragmentIR:
+    return PlanFragmentIR(
+        "brief-plan",
+        (
+            PlanNode("normalize", "text.normalize", ("$input",)),
+            PlanNode("draft", "text.draft", ("normalize",)),
+        ),
+        ("draft",),
     )
+
+
+def _thorough_plan() -> PlanFragmentIR:
+    return PlanFragmentIR(
+        "thorough-plan",
+        (
+            PlanNode("normalize", "text.normalize", ("$input",)),
+            PlanNode("context", "records.context", ("$input",)),
+            PlanNode("draft", "text.draft", ("normalize",)),
+            PlanNode("audit", "text.audit", ("draft", "context")),
+            PlanNode("deliver", "messages.deliver", ("audit",)),
+        ),
+        ("deliver",),
+    )
+
+
+class _Planner(Module[str, dict[str, Any]]):
+    module_id = "demo.planner"
+    input_type = str
+    output_type = dict[str, Any]
+    plan_boundary = boundary
+
+    async def execute(self, value: str, ctx: ExecutionContext) -> dict[str, Any]:
+        selected = _thorough_plan() if "thorough" in value else _brief_plan()
+        return selected.to_dict()
+
+
+class _LocalAdapter:
+    connector = "demo-records"
+    connector_version = "1"
+    operations = frozenset({"context"})
+    effect_operations = frozenset({"deliver"})
+    idempotent_effects = frozenset({"deliver"})
+
+    async def read(self, operation: str, request: Any) -> Any:
+        return f"context:{request}"
+
+    async def effect(self, operation: str, request: Any, *, idempotency_key: str) -> Any:
+        return f"delivered:{request}"
+
+
+planner = _Planner()
+connectors = ConnectorRegistry((_LocalAdapter(),))
+EXAMPLE_INPUT = "thorough request"
+EXPECTED_OUTPUT = "delivered:draft:THOROUGH REQUEST | context:thorough request"
+
+
+async def run_example(store: PostgresStore, value: str = EXAMPLE_INPUT) -> RunResult:
+    """Run the real generated-plan loop through its one-call entrypoint."""
+    return await WorkflowRunner(store, connectors=connectors).run_generated(planner, value)

@@ -370,6 +370,76 @@ class PostgresStore:
                 )
         return self._run_from_row(row)
 
+    def adopt_run_definition(
+        self,
+        run_id: str,
+        plan: PlanIR,
+        *,
+        expected_definition_digest: str,
+        source_task_id: str,
+    ) -> Definition:
+        """Replace a bootstrap definition with its validated generated root plan.
+
+        The transition is allowed only while the run is active, from the exact
+        bootstrap definition supplied by the caller, and after the planner task
+        in that run has one accepted boundary. Repeating the exact transition is
+        idempotent; adopting a different definition fails closed.
+        """
+        definition = self.register_definition(plan)
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT status, definition_digest FROM workflow_runs
+                WHERE run_id = %s FOR UPDATE
+                """,
+                (run_id,),
+            )
+            run = cursor.fetchone()
+            if run is None:
+                raise PersistenceError(f"run {run_id} was not found")
+            if run["status"] != RunStatus.RUNNING.value:
+                raise InvalidRunStateError("run must be running to adopt a generated definition")
+            cursor.execute(
+                """
+                SELECT status, accepted_boundary FROM workflow_tasks
+                WHERE task_id = %s AND run_id = %s FOR SHARE
+                """,
+                (source_task_id, run_id),
+            )
+            source = cursor.fetchone()
+            if (
+                source is None
+                or source["status"] != TaskStatus.SUCCEEDED.value
+                or not isinstance(source["accepted_boundary"], Mapping)
+            ):
+                raise InvalidRunStateError(
+                    "generated definition requires an accepted bootstrap planner boundary"
+                )
+            current = str(run["definition_digest"])
+            if current == plan.digest:
+                return definition
+            if current != expected_definition_digest:
+                raise InvalidRunStateError("run definition changed before generated plan adoption")
+            cursor.execute(
+                """
+                UPDATE workflow_runs SET definition_digest = %s
+                WHERE run_id = %s
+                """,
+                (plan.digest, run_id),
+            )
+            self._append_event(
+                cursor,
+                run_id,
+                "RUN_DEFINITION_ADOPTED",
+                {
+                    "bootstrap_definition_digest": expected_definition_digest,
+                    "definition_digest": plan.digest,
+                    "source_task_id": source_task_id,
+                },
+                task_id=source_task_id,
+            )
+        return definition
+
     def enqueue_task(
         self,
         run_id: str,

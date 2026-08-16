@@ -40,7 +40,7 @@ stable item identity, but does not promise concurrent item execution.
 | Expert | `expert_generated_workflow.py` | Allowlisted generated fan-out/fan-in plans |
 | Expert | `expert_external_workflow.py` | An honest typed boundary around an external flow |
 
-Deterministic runnable examples export these names:
+Deterministic static examples export these names:
 
 ```python
 workflow  # importable workflow instance
@@ -50,6 +50,10 @@ EXPECTED_OUTPUT  # exact expected result
 
 All handlers are offline and deterministic. They need no model, network call,
 credential, or production connector.
+
+The generated example instead exports `planner`, `connectors`, and
+`run_example()`, because its graph does not exist until the planner sees a
+runtime input.
 
 The interactive example is compilable offline and pauses only when executed.
 The external example is compilable offline and requires a deployment adapter
@@ -127,11 +131,22 @@ The interaction's accepted value becomes an ordinary replayable boundary.
 ## Generated graphs
 
 The generated example keeps planner authority narrow. `PlanFragmentIR` contains
-only stable node keys, allowlisted aliases, dependencies, and outputs.
-`PlanValidator` resolves every module identity, schema, environment,
-grant, effect, approval rule, and budget from trusted application data before
-`PlanMaterializer` inserts all child tasks atomically. Child work is claimed by
-ordinary workers; the planner never calls another module or manages executors.
+only stable node keys, allowlisted aliases, dependencies, and outputs. The
+planner branches on its input: a brief request produces two nodes, while a
+thorough request produces a five-node graph with fan-out, depth, a read grant,
+and an effect boundary.
+
+`PlanBoundary` is the trusted application-code marker that supplies the
+registry, output contract, limits, and maximum grant. `WorkflowRunner` closes
+the entire loop without manual digest or materialization calls:
+
+```python
+result = await WorkflowRunner(store, connectors=connectors).run_generated(planner, request)
+```
+
+The generated plan becomes the run definition. The durable bootstrap planner
+task remains only as the parent provenance for its generated children; it is
+not a static workflow shell and does not provide the run result.
 
 ## External systems
 

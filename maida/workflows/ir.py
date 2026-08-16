@@ -482,6 +482,7 @@ _MODULE_CONTRACT_FIELDS = {
     "module_id",
     "models",
     "output_type",
+    "plan_boundary",
 }
 
 
@@ -511,6 +512,7 @@ def _module_configuration(module: Module[Any, Any]) -> dict[str, Any]:
             "module_id",
             "models",
             "output_type",
+            "plan_boundary",
         }
         and not name.startswith("_")
     }
@@ -635,6 +637,19 @@ def _budget_contract(module: Module[Any, Any]) -> dict[str, int | float | None]:
     return budget.to_data()
 
 
+def _plan_boundary_contract(module: Module[Any, Any]) -> dict[str, Any] | None:
+    marker = getattr(module, "plan_boundary", None)
+    if marker is None:
+        return None
+    to_data = getattr(marker, "to_data", None)
+    if not callable(to_data):
+        raise CompileError("module plan_boundary declarations must provide to_data()")
+    data = to_data()
+    if not isinstance(data, dict):
+        raise CompileError("module plan_boundary declaration must encode as an object")
+    return cast(dict[str, Any], canonical_data(data))
+
+
 def module_digest(module: Module[Any, Any]) -> str:
     """Compute the behavior-bearing content digest for a module definition.
 
@@ -669,6 +684,9 @@ def module_digest(module: Module[Any, Any]) -> str:
     models = _model_contract(module)
     if models:
         parts.append(canonical_json({"models": models}).encode())
+    plan_boundary = _plan_boundary_contract(module)
+    if plan_boundary is not None:
+        parts.append(canonical_json({"plan_boundary": plan_boundary}).encode())
     if budget != Budget().to_data():
         parts.append(canonical_json({"budget": budget}).encode())
     payload = b"\0".join(parts)

@@ -1,10 +1,11 @@
 # Maida Workflows
 
-Maida Workflows is a Python runtime for statically composed, durable,
-distributed, replayable AI workflows. It compiles workflow definitions into a
-canonical replay-addressable IR, schedules module attempts through durable task
-envelopes, records accepted module-boundary history in PostgreSQL, and projects
-successful native runs into portable replay fixtures.
+Maida Workflows turns runtime planner output into a canonical, trusted plan
+before it executes. It validates generated topology against application-owned
+module contracts, schedules accepted module attempts through durable task
+envelopes, records what actually ran in PostgreSQL, and projects successful
+runs into portable replay fixtures. Static workflow authoring remains a
+convenience path onto the same durable module machinery.
 
 The package supports:
 
@@ -163,13 +164,21 @@ release their worker lease. Typed idempotent commands later resume the task on
 any compatible worker. API and trigger callers can also supply a tenant-scoped
 start idempotency key; exact retries reuse one run and task graph.
 
-Generated planners return a minimal `PlanFragmentIR`. One trusted
-`ModuleRegistry` supplies both validation and executable module resolution;
-`PlanValidator` resolves aliases to exact immutable contracts and enforces graph,
-grant, approval, and budget limits before `PlanMaterializer` atomically inserts
-the complete child DAG. Ordinary workers claim those tasks independently, and
-generated histories use the same graph aligner for full-stub and selective
-replay.
+Generated planners return a minimal `PlanFragmentIR`. A planner module declares
+a trusted `PlanBoundary` containing its `ModuleRegistry`, structural limits,
+root output contract, and maximum child grant. The common path is one call:
+
+```python
+result = await WorkflowRunner(store, connectors=connectors).run_generated(planner, request)
+```
+
+The runtime executes the planner as a durable bootstrap, validates its accepted
+output, adopts the resolved generated plan as the run definition, atomically
+inserts the child DAG, and completes the run from the generated outputs. One
+`ModuleRegistry` supplies both validation and exact executable resolution; the
+caller never computes schema, module, or execution digests. Ordinary workers
+claim child tasks independently, and generated histories retain the bootstrap
+boundary as provenance without treating the static shell as the result.
 
 `ExternalWorkflow` represents a whole external flow at one typed
 capability/effect boundary. Deployment-owned adapters hold provider sessions

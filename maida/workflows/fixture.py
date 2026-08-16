@@ -19,7 +19,7 @@ from typing import Any, Never, cast
 from ._canonical import canonical_data, canonical_json, digest_data
 from .alignment import project_execution_path
 from .artifacts import ArtifactError, ArtifactStore, ValueCodec
-from .dynamic import PlanFragmentIR, PlanSignature
+from .dynamic import PlanFragmentIR, PlanSignature, _plan_from_signature
 from .ir import PlanIR
 from .models import (
     BoundaryRecord,
@@ -417,6 +417,7 @@ class ReplayFixtureExporter:
                 FixtureErrorCode.HISTORY_INCOMPLETE,
                 "every executed task requires one accepted boundary record",
             )
+        generated = self._generated_records(history)
         controls = tuple(
             {"event_type": event.event_type, "payload": event.payload}
             for event in history.events
@@ -464,15 +465,40 @@ class ReplayFixtureExporter:
             for task in history.tasks
             if task.plan_provenance is not None and task.accepted_boundary is not None
         }
-        actual = Counter(
-            (boundary.module_id, boundary.logical_step)
-            for boundary in history.accepted_boundaries
-            if boundary.instance_key not in generated_instances
+        root_records = tuple(
+            record
+            for record in generated
+            if _plan_from_signature(record.signature).digest == history.definition.digest
         )
+        if len(root_records) > 1:
+            self._history_incomplete("multiple generated plans claim the run definition")
+        if root_records:
+            if len(generated) != 1:
+                self._history_incomplete(
+                    "a generated root history must have one materialized root plan"
+                )
+            root = root_records[0]
+            root_instances = {instance for _key, instance in root.node_instances}
+            actual = Counter(
+                (boundary.module_id, boundary.logical_step)
+                for boundary in history.accepted_boundaries
+                if boundary.instance_key in root_instances
+            )
+            accounted = root_instances | {root.source_instance_key}
+            if any(
+                boundary.instance_key not in accounted for boundary in history.accepted_boundaries
+            ):
+                self._history_incomplete(
+                    "generated root history contains boundaries outside its plan and bootstrap"
+                )
+        else:
+            actual = Counter(
+                (boundary.module_id, boundary.logical_step)
+                for boundary in history.accepted_boundaries
+                if boundary.instance_key not in generated_instances
+            )
         if actual != expected:
             self._history_incomplete("accepted boundaries do not cover the recorded execution path")
-
-        self._generated_records(history)
 
     def _generated_records(self, history: RunHistory) -> tuple[GeneratedPlanRecord, ...]:
         boundaries_by_task = {
