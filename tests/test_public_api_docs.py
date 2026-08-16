@@ -44,7 +44,11 @@ PUBLIC_MODULES = (
     "examples.workflow_creation.intermediate_parallel",
     "examples.workflow_creation.advanced_stable_map",
     "examples.workflow_creation.advanced_nested",
+    "examples.workflow_creation.advanced_portable_workflow",
+    "examples.workflow_creation.advanced_interactive",
     "examples.workflow_creation.expert_replay_ready",
+    "examples.workflow_creation.expert_generated_workflow",
+    "examples.workflow_creation.expert_external_workflow",
 )
 
 

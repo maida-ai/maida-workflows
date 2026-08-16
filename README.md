@@ -9,10 +9,14 @@ successful native runs into portable replay fixtures.
 The package supports:
 
 - typed modules, branches, stable-key maps, parallel joins, and nested workflows;
+- portable data-authored specs, explainable diagnostics, and safe workflow bundles;
+- durable approval, typed input, and external-signal boundaries;
 - durable PostgreSQL scheduling, tasks, attempts, events, definitions, and leases;
 - process, container, VM, and microVM execution requirements with executor matching;
 - content-addressed artifacts and replay-complete accepted boundary records;
 - structural diff, zero-live-call full-stub replay, and isolated selective replay;
+- allowlisted generated DAG materialization and replay;
+- provider-neutral external-flow, connector, trigger, and import contracts;
 - install as the `maida.workflows` namespace subpackage (`from maida import workflows`).
 
 Python 3.12 and 3.13 are supported.
@@ -46,7 +50,8 @@ print(plan.canonical_json())
 ```
 
 For a PyTorch-style progression from one module through sequential, branching,
-parallel, keyed-map, nested, and expert replay-ready composition, see the
+parallel, keyed-map, nested, data-authored, serialized, interactive, generated,
+external, and replay-ready composition styles, see the
 [workflow creation examples](examples/workflow_creation/README.md).
 
 Use `maida-workflows --help` for compile, database, fixture, diff, replay, and
@@ -114,15 +119,64 @@ class Research(Module[str, str]):
 ```
 
 `Budget` is a behavior-bearing declaration, not a usage counter. Runtime and
-provider integrations must meter actual consumption and enforce the envelope;
-measured usage remains separate from the compiled definition and task
-declaration.
+provider brokers enforce wall-time limits and durably reserve and commit model,
+tool, token, and cost usage across retries. Measured usage remains separate from
+the compiled definition and task declaration, and a task cannot commit with an
+uncommitted reservation.
 
-The `ReplayFixture 0.1.0` format is a projection of a successful native run: a
+Replay fixtures are projections of successful native runs: a
 canonical manifest plus SHA-256-addressed blobs. Failed, cancelled, paused,
 incomplete, redacted, truncated, missing, or corrupt histories fail closed.
 Ordinary Maida/OTel/Langfuse/export traces are not accepted because their spans
-do not prove replay-complete module boundaries.
+do not prove replay-complete module boundaries. Static histories retain the
+original fixture contract; generated histories use the next compatible bundle
+version to include authenticated plan lineage and concrete generated instances.
+
+## Explainable authoring and serialization
+
+Native `Workflow.build()` remains the shortest authoring path for Python
+applications. `WorkflowSpec` provides the same reliability surface as canonical
+data for humans, authoring agents, visual builders, and import adapters. A
+trusted `ModuleRegistry` publishes aliases and configuration schemas; generated
+specs may select those aliases but cannot supply code, imports, credentials,
+grants, or execution providers.
+
+```python
+compilation = compile_workflow_spec(spec, registry)
+print(compilation.issues)
+print(compilation.explanation)
+workflow = compilation.raise_for_errors()
+```
+
+`WorkflowBundle` saves specs and compiled contracts as canonical
+`.maida-workflow` data with integrity digests and restrictive permissions.
+Loading parses no executable code. Rebinding through the trusted registry or an
+exact factory catalog recomputes all module, schema, execution, access, model,
+and budget identities before the definition can run. Pickle, bytecode, SDK
+clients, credentials, runtime values, and execution history are never stored in
+a workflow bundle.
+
+## Interactions, generated graphs, and integrations
+
+`Approval`, `Input`, and `WaitForSignal` park logical tasks in PostgreSQL and
+release their worker lease. Typed idempotent commands later resume the task on
+any compatible worker. API and trigger callers can also supply a tenant-scoped
+start idempotency key; exact retries reuse one run and task graph.
+
+Generated planners return a minimal `PlanFragmentIR`. Trusted catalogs and
+`PlanValidator` resolve aliases to exact immutable contracts and enforce graph,
+grant, approval, and budget limits before `PlanMaterializer` atomically inserts
+the complete child DAG. Ordinary workers claim those tasks independently, and
+generated histories use the same graph aligner for full-stub and selective
+replay.
+
+`WorkflowInterop` reports one of three honest verification surfaces: typed
+opaque boundary, trace-aware canonical boundaries, or importable Workflow IR.
+`ExternalWorkflow` routes whole external flows through the ordinary
+capability/effect broker. Concrete provider adapters live under
+`maida.workflows.providers`; they hold SDK sessions and credentials only in
+deployment callbacks. Changing providers does not add runtime state or bypass
+effect replay denial.
 
 ## Durable runtime
 

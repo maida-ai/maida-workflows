@@ -2,21 +2,26 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from types import ModuleType
 from typing import Any, cast
 
 import pytest
 
 from examples.workflow_creation import (
+    advanced_interactive,
     advanced_nested,
+    advanced_portable_workflow,
     advanced_stable_map,
     easy_first_workflow,
     easy_sequential,
+    expert_external_workflow,
+    expert_generated_workflow,
     expert_replay_ready,
     intermediate_branching,
     intermediate_parallel,
 )
-from maida.workflows import Workflow, compile_workflow
+from maida.workflows import BoundWorkflow, Workflow, compile_workflow
 from maida.workflows.persistence import PostgresStore
 from maida.workflows.runtime import WorkflowRunner
 
@@ -31,8 +36,8 @@ class ExampleCase:
         return self.module.__name__.rsplit(".", maxsplit=1)[-1]
 
     @property
-    def workflow(self) -> Workflow[Any, Any]:
-        return cast(Workflow[Any, Any], self.module.workflow)
+    def workflow(self) -> Workflow[Any, Any] | BoundWorkflow:
+        return cast(Workflow[Any, Any] | BoundWorkflow, self.module.workflow)
 
 
 EXAMPLES = (
@@ -42,6 +47,8 @@ EXAMPLES = (
     ExampleCase(intermediate_parallel, frozenset({"module", "parallel"})),
     ExampleCase(advanced_stable_map, frozenset({"module", "map_module"})),
     ExampleCase(advanced_nested, frozenset({"module", "parallel"})),
+    ExampleCase(advanced_portable_workflow, frozenset({"module"})),
+    ExampleCase(expert_generated_workflow, frozenset({"module"})),
     ExampleCase(
         expert_replay_ready,
         frozenset({"module", "map_module", "parallel", "when"}),
@@ -51,8 +58,16 @@ EXAMPLES = (
 
 @pytest.mark.parametrize("case", EXAMPLES, ids=lambda case: case.id)
 def test_workflow_creation_examples_compile_canonically(case: ExampleCase) -> None:
-    first = compile_workflow(case.workflow)
-    second = compile_workflow(case.workflow)
+    first = (
+        case.workflow.plan
+        if isinstance(case.workflow, BoundWorkflow)
+        else compile_workflow(case.workflow)
+    )
+    second = (
+        case.workflow.plan
+        if isinstance(case.workflow, BoundWorkflow)
+        else compile_workflow(case.workflow)
+    )
 
     assert first.canonical_json() == second.canonical_json()
     assert first.digest == second.digest
@@ -104,3 +119,21 @@ async def test_stable_map_uses_item_keys_instead_of_list_positions(
     assert first.output == "beta | alpha"
     assert second.output == "alpha | beta"
     assert instances_by_document(first.run_id) == instances_by_document(second.run_id)
+
+
+def test_interactive_and_external_examples_compile_honest_boundaries() -> None:
+    interactive = compile_workflow(advanced_interactive.workflow)
+    external = compile_workflow(expert_external_workflow.workflow)
+
+    assert {step.kind for step in interactive.steps} == {"module", "when"}
+    assert any(step.effects for step in external.executable_steps)
+    assert external.executable_steps[0].effects[0]["approval_required"] is True
+
+
+def test_generated_example_validates_and_portable_bundle_round_trips(tmp_path: Path) -> None:
+    expert_generated_workflow.validate_fragment()
+    path = tmp_path / "onboarding.maida-workflow"
+    restored = advanced_portable_workflow.save_and_restore(path)
+
+    assert restored.digest == advanced_portable_workflow.bundle.digest
+    assert path.stat().st_mode & 0o777 == 0o600
