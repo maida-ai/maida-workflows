@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
@@ -29,6 +30,7 @@ from maida.workflows import (
     module_digest,
 )
 from maida.workflows._canonical import schema_digest
+from maida.workflows.materialization import _verify_descriptor
 from maida.workflows.persistence import PostgresStore
 
 RESOURCE_BOUND = Budget(
@@ -117,6 +119,54 @@ def generated_contracts() -> tuple[ModuleCatalog, ModuleResolverRegistry]:
     for module in (increment, double, join):
         resolver.register(str(module.module_id), module)
     return catalog, resolver
+
+
+def test_generated_module_resolver_requires_exact_trusted_identity() -> None:
+    module = Add(1, "math.increment")
+    resolver = ModuleResolverRegistry()
+
+    with pytest.raises(TypeError, match="Module instances"):
+        resolver.register("math.increment", object())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="module_id"):
+        resolver.register("", module)
+    with pytest.raises(ValueError, match="definition_digest"):
+        resolver.register("math.increment", module, definition_digest="")
+
+    resolver.register("math.increment", module, definition_digest="definition")
+    assert resolver.resolve("definition", "math.increment", module_digest(module)) is module
+    with pytest.raises(ValueError, match="already registered"):
+        resolver.register("math.increment", module, definition_digest="definition")
+    with pytest.raises(LookupError, match="exact trusted"):
+        resolver.resolve("other", "math.increment", module_digest(module))
+
+    shared = ModuleResolverRegistry()
+    shared.register("math.increment", module)
+    assert shared.resolve("any-definition", "math.increment", module_digest(module)) is module
+    module.amount = 2
+    with pytest.raises(LookupError, match="exact trusted"):
+        shared.resolve("any-definition", "math.increment", module_digest(Add(1, "math.increment")))
+
+
+def test_generated_module_descriptor_is_recomputed_before_materialization() -> None:
+    module = Add(1, "math.increment")
+    catalog, _ = generated_contracts()
+    descriptor = catalog.resolve("math.increment")
+    _verify_descriptor(module, descriptor)
+
+    mutations: tuple[tuple[str, Any, str], ...] = (
+        ("module_digest", "0" * 64, "digest"),
+        ("output_schema_digest", "0" * 64, "output schema"),
+        ("input_schema_digests", ["0" * 64], "input schema"),
+        ("execution", {**descriptor["execution"], "isolation": "vm"}, "environment"),
+        ("budget", Budget().to_data(), "budget"),
+        ("capabilities", [{"name": "unexpected"}], "capabilities"),
+        ("effects", [{"name": "unexpected"}], "effects"),
+    )
+    for field, value, message in mutations:
+        changed = deepcopy(descriptor)
+        changed[field] = value
+        with pytest.raises(ValueError, match=message):
+            _verify_descriptor(module, changed)
 
 
 @pytest.mark.postgres

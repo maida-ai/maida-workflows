@@ -129,6 +129,52 @@ def test_typed_input_and_signal_spec_nodes_validate_their_schemas() -> None:
     ]
 
 
+def test_interaction_modules_validate_configuration_and_resolution_data() -> None:
+    with pytest.raises(ValueError, match="approval prompt"):
+        Approval(str, prompt=" ")
+    with pytest.raises(ValueError, match="input prompt"):
+        Input(str, Form, prompt=" ")
+    with pytest.raises(ValueError, match="signal name"):
+        WaitForSignal(str, int, name=" ")
+
+    approval = Approval(str, prompt="Review", metadata={"screen": "release"})
+    request = approval._request_data(run_id="run", task_id="task", step_instance_id="step")
+    repeated = approval._request_data(run_id="run", task_id="task", step_instance_id="step")
+    assert request == repeated
+    assert request["kind"] == "approval"
+    assert request["metadata"] == {"screen": "release"}
+    assert approval._resolve_data(
+        {"decision": "approve", "comment": "looks good", "command_id": "command"}
+    ) == ApprovalDecision(True, "looks good", None, "command")
+    assert approval._resolve_data(
+        {"decision": "reject", "reason": "unsafe", "command_id": "command"}
+    ) == ApprovalDecision(False, None, "unsafe", "command")
+    with pytest.raises(ValueError, match="valid decision"):
+        approval._resolve_data({"decision": "maybe"})
+
+    form = Input(str, Form, prompt="Answer")
+    assert form._resolve_data({"value": {"answer": "yes"}}) == Form("yes")
+    with pytest.raises(ValueError, match="output contract"):
+        form._resolve_data({"value": {"answer": 3}})
+
+    signal = WaitForSignal(str, int, name="payment.settled")
+    signal_request = signal._request_data(run_id="run", task_id="task", step_instance_id="signal")
+    assert signal_request["signal_name"] == "payment.settled"
+    assert signal._resolve_data({"name": "payment.settled", "value": 3}) == 3
+    with pytest.raises(ValueError, match="name does not match"):
+        signal._resolve_data({"name": "wrong", "value": 3})
+    with pytest.raises(ValueError, match="output contract"):
+        signal._resolve_data({"name": "payment.settled", "value": "wrong"})
+
+
+@pytest.mark.asyncio
+async def test_interaction_handler_cannot_bypass_durable_worker_protocol() -> None:
+    approval = Approval(str, prompt="Review")
+
+    with pytest.raises(RuntimeError, match="TaskWorker"):
+        await approval.execute("change", None)  # type: ignore[arg-type]
+
+
 @pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_spec_authored_approval_uses_the_same_durable_protocol(

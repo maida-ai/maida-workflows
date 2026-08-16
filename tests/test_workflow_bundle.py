@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import stat
+from dataclasses import replace
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -17,10 +19,12 @@ from maida.workflows import (
     WorkflowBundle,
     WorkflowBundleError,
     WorkflowCatalog,
+    WorkflowPortability,
     WorkflowRunner,
     WorkflowSpec,
 )
-from maida.workflows._canonical import type_schema
+from maida.workflows._canonical import canonical_json, digest_data, type_schema
+from maida.workflows.bundle import _fixed_aliases_by_digest
 from maida.workflows.persistence import PostgresStore
 
 
@@ -54,6 +58,13 @@ def portable_spec() -> WorkflowSpec:
         nodes=(NodeSpec.task("upper", "text.upper", BindingSpec.root()),),
         output=BindingSpec.node("upper"),
     )
+
+
+def write_bundle(path: Path, data: dict[str, Any]) -> None:
+    payload = dict(data)
+    payload.pop("bundle_digest", None)
+    payload["bundle_digest"] = digest_data(payload)
+    path.write_text(canonical_json(payload))
 
 
 def test_spec_bundle_is_deterministic_private_and_exactly_rebindable(tmp_path: Path) -> None:
@@ -129,6 +140,106 @@ def test_loading_enforces_a_size_limit_before_parsing(tmp_path: Path) -> None:
         WorkflowBundle.load(path, max_bytes=32)
 
 
+@pytest.mark.parametrize("limit", (0, True, 1.5))
+def test_loading_rejects_invalid_size_limits(tmp_path: Path, limit: Any) -> None:
+    path = tmp_path / "bundle.maida-workflow"
+    path.write_text("{}")
+
+    with pytest.raises(ValueError, match="positive integer"):
+        WorkflowBundle.load(path, max_bytes=limit)
+
+
+def test_loading_rejects_missing_non_json_and_non_object_files(tmp_path: Path) -> None:
+    with pytest.raises(WorkflowBundleError, match="cannot read"):
+        WorkflowBundle.load(tmp_path / "missing.maida-workflow")
+
+    invalid_utf8 = tmp_path / "invalid-utf8.maida-workflow"
+    invalid_utf8.write_bytes(b"\xff")
+    with pytest.raises(WorkflowBundleError, match="UTF-8 JSON"):
+        WorkflowBundle.load(invalid_utf8)
+
+    root_array = tmp_path / "array.maida-workflow"
+    root_array.write_text("[]")
+    with pytest.raises(WorkflowBundleError, match="root"):
+        WorkflowBundle.load(root_array)
+
+
+def test_bundle_constructor_rejects_incoherent_portability_and_identity() -> None:
+    valid = WorkflowBundle.from_spec(portable_spec(), registry())
+
+    with pytest.raises(WorkflowBundleError, match="version"):
+        replace(valid, version="9.0.0")
+    with pytest.raises(WorkflowBundleError, match="editable spec"):
+        replace(valid, spec=None)
+    with pytest.raises(WorkflowBundleError, match="cannot claim"):
+        replace(valid, portability=WorkflowPortability.FACTORY_BOUND)
+    with pytest.raises(WorkflowBundleError, match="identities"):
+        replace(valid, spec=replace(portable_spec(), workflow_id="different"))
+
+
+def test_from_spec_reports_compilation_diagnostics() -> None:
+    invalid = WorkflowSpec(
+        workflow_id="bundle-invalid",
+        input_schema=type_schema(str),
+        output_schema=type_schema(str),
+        nodes=(NodeSpec.task("missing", "unknown.module", BindingSpec.root()),),
+        output=BindingSpec.node("missing"),
+    )
+
+    with pytest.raises(WorkflowBundleError, match="UNKNOWN_MODULE"):
+        WorkflowBundle.from_spec(invalid, registry())
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("format", "other", "format or version"),
+        ("plan", [], "plan must be an object"),
+        ("spec", [], "spec must be an object"),
+        ("portability", "unknown", "contract is invalid"),
+        ("bindings", {}, "bindings must be an array"),
+        ("bindings", [1], "bindings must be an array"),
+        ("provenance", [], "provenance must be an object"),
+        ("workflow_id", "other", "workflow identity"),
+        ("definition_digest", "0" * 64, "definition digest"),
+        ("spec_digest", "0" * 64, "spec digest"),
+    ),
+)
+def test_loading_rejects_each_authenticated_bundle_contract(
+    tmp_path: Path,
+    field: str,
+    value: Any,
+    message: str,
+) -> None:
+    data = WorkflowBundle.from_spec(portable_spec(), registry()).to_dict()
+    data[field] = value
+    path = tmp_path / f"invalid-{field}.maida-workflow"
+    write_bundle(path, data)
+
+    with pytest.raises(WorkflowBundleError, match=message):
+        WorkflowBundle.load(path)
+
+
+def test_loading_rejects_noncanonical_binding_order(tmp_path: Path) -> None:
+    spec = WorkflowSpec(
+        workflow_id="bundle-order",
+        input_schema=type_schema(str),
+        output_schema=type_schema(str),
+        nodes=(
+            NodeSpec.task("first", "text.upper", BindingSpec.root()),
+            NodeSpec.task("second", "text.upper", BindingSpec.node("first")),
+        ),
+        output=BindingSpec.node("second"),
+    )
+    data = WorkflowBundle.from_spec(spec, registry()).to_dict()
+    data["bindings"] = list(reversed(data["bindings"]))
+    path = tmp_path / "unordered-bindings.maida-workflow"
+    write_bundle(path, data)
+
+    with pytest.raises(WorkflowBundleError, match="canonical contract"):
+        WorkflowBundle.load(path)
+
+
 def test_factory_bound_python_workflow_requires_its_exact_catalog() -> None:
     bundle = WorkflowBundle.from_workflow(UpperWorkflow())
 
@@ -139,6 +250,25 @@ def test_factory_bound_python_workflow_requires_its_exact_catalog() -> None:
 
     rebound = bundle.bind(workflow_catalog=WorkflowCatalog([UpperWorkflow]))
     assert rebound.plan.digest == bundle.plan.digest
+
+    with pytest.raises(WorkflowBundleError, match="cannot rebind"):
+        bundle.bind(workflow_catalog=WorkflowCatalog())
+
+
+def test_factory_bound_bundle_rejects_catalog_definition_drift() -> None:
+    bundle = WorkflowBundle.from_workflow(UpperWorkflow())
+
+    class WrongCatalog:
+        def resolve(self, definition_digest: str) -> Workflow[str, str]:
+            del definition_digest
+
+            class LowerWorkflow(UpperWorkflow):
+                workflow_id = "bundle-lower"
+
+            return LowerWorkflow()
+
+    with pytest.raises(WorkflowBundleError, match="changed the exact definition"):
+        bundle.bind(workflow_catalog=cast(WorkflowCatalog, WrongCatalog()))
 
 
 def test_reconstructable_bundle_rejects_registry_behavior_drift() -> None:
@@ -152,6 +282,39 @@ def test_reconstructable_bundle_rejects_registry_behavior_drift() -> None:
 
     with pytest.raises(WorkflowBundleError, match="rebind"):
         bundle.bind(module_registry=wrong)
+
+    with pytest.raises(WorkflowBundleError, match="trusted module registry"):
+        bundle.bind()
+
+
+def test_factory_bundle_alias_annotations_are_unique_and_optional() -> None:
+    one = registry()
+    aliases = _fixed_aliases_by_digest(one)
+    bundle = WorkflowBundle.from_workflow(UpperWorkflow(), one)
+
+    assert aliases
+    assert bundle.binding_requirements[0]["alias"] == "text.upper"
+
+    ambiguous = ModuleRegistry(modules={"text.upper": Upper, "text.loud": Upper})
+    assert _fixed_aliases_by_digest(ambiguous) == {}
+
+
+def test_atomic_save_removes_temporary_file_after_replace_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = WorkflowBundle.from_spec(portable_spec(), registry())
+    destination = tmp_path / "nested" / "bundle.maida-workflow"
+
+    def fail_replace(source: Path, target: Path) -> None:
+        del source, target
+        raise OSError("replace failed")
+
+    monkeypatch.setattr("maida.workflows.bundle.os.replace", fail_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        bundle.save(destination)
+
+    assert not destination.exists()
+    assert list(destination.parent.iterdir()) == []
 
 
 @pytest.mark.postgres

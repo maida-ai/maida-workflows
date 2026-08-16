@@ -19,13 +19,14 @@ from maida.workflows import (
     WorkflowInterop,
     WorkflowRunner,
     WorkflowSpec,
+    WorkflowStartRequest,
     compile_workflow,
     compile_workflow_spec,
     module_digest,
 )
 from maida.workflows._canonical import type_schema
 from maida.workflows.access import ConnectorRegistry
-from maida.workflows.fixture import ReplayFixtureExporter
+from maida.workflows.fixture import ReplayFixture, ReplayFixtureExporter
 from maida.workflows.interop import InteropUnsupportedError
 from maida.workflows.persistence import PostgresStore
 from maida.workflows.replay import ReplayCase, ReplayEngine, ReplayMode, ReplayStatus
@@ -223,3 +224,140 @@ async def test_external_workflow_without_runtime_broker_fails_closed() -> None:
     )
     with pytest.raises(RuntimeError, match="broker"):
         await module.execute("acct-7", ExecutionContext("run", "task", "step"))
+
+
+def test_start_request_and_external_module_identity_are_strict() -> None:
+    with pytest.raises(ValueError, match="workflow_id"):
+        WorkflowStartRequest("not valid", {}, "event-1")
+    with pytest.raises(ValueError, match="idempotency_key"):
+        WorkflowStartRequest("valid", {}, " ")
+
+    common: dict[str, Any] = {
+        "module_id": "accounts.lookup",
+        "workflow": "lookup-account",
+        "provider": "example-provider",
+        "input_type": str,
+        "output_type": str,
+        "effectful": False,
+    }
+    for field, value, error in (
+        ("module_id", "not valid", ValueError),
+        ("workflow", "not valid", ValueError),
+        ("provider", "not valid", ValueError),
+        ("provider_version", "", ValueError),
+        ("effectful", 1, TypeError),
+        ("idempotency", "required", TypeError),
+    ):
+        values = {**common, field: value}
+        with pytest.raises(error):
+            ExternalWorkflow(**values)
+
+
+@pytest.mark.asyncio
+async def test_connector_adapter_and_modules_reject_unknown_operations() -> None:
+    provider = Provider()
+    interop = WorkflowInterop(provider)
+    adapter = interop.connector_adapter()
+
+    assert adapter.connector == provider.provider
+    assert adapter.connector_version == provider.version
+    assert adapter.idempotent_effects == provider.idempotent_workflows
+    with pytest.raises(LookupError, match="read workflow"):
+        await adapter.read("missing", {})
+    with pytest.raises(LookupError, match="effect workflow"):
+        await adapter.effect("missing", {}, "key")
+
+    read = interop.module(
+        module_id="accounts.lookup",
+        workflow="lookup-account",
+        input_type=str,
+        output_type=dict[str, str],
+        effectful=False,
+    )
+    effect = interop.module(
+        module_id="messages.send",
+        workflow="send-message",
+        input_type=str,
+        output_type=dict[str, str],
+        effectful=True,
+    )
+
+    class Broker:
+        async def read(self, connector: str, operation: str, request: Any, **kwargs: Any) -> Any:
+            return {"account": request}
+
+        async def effect(self, connector: str, operation: str, request: Any, **kwargs: Any) -> Any:
+            return {"sent": request}
+
+    context = ExecutionContext("run", "task", "step", broker=Broker())
+    assert await read.execute("acct", context) == {"account": "acct"}
+    assert await effect.execute("hello", context) == {"sent": "hello"}
+
+
+def test_importers_fail_closed_on_missing_or_wrong_contracts() -> None:
+    provider = Provider()
+    opaque = WorkflowInterop(provider)
+    with pytest.raises(InteropUnsupportedError, match="Workflow IR"):
+        opaque.import_workflow({})
+    with pytest.raises(InteropUnsupportedError, match="trace"):
+        opaque.import_trace({})
+
+    class WrongWorkflowImporter(SpecImporter):
+        def import_workflow(self, source: Any) -> Any:
+            return source
+
+    class WrongTraceImporter(TraceImporter):
+        def import_trace(self, source: Any) -> Any:
+            return source
+
+    with pytest.raises(TypeError, match="WorkflowSpec"):
+        WorkflowInterop(provider, workflow_importer=WrongWorkflowImporter()).import_workflow({})
+    with pytest.raises(TypeError, match="ReplayFixture"):
+        WorkflowInterop(provider, trace_importer=WrongTraceImporter()).import_trace({})
+
+    fixture = object.__new__(ReplayFixture)
+    assert (
+        WorkflowInterop(provider, trace_importer=TraceImporter()).import_trace(fixture) is fixture
+    )
+
+
+def test_provider_and_companion_contracts_validate_exact_identity() -> None:
+    def invalid_provider(**changes: Any) -> Provider:
+        provider = Provider()
+        for name, value in changes.items():
+            setattr(provider, name, value)
+        return provider
+
+    cases = (
+        ({"provider": "not valid"}, ValueError, "stable"),
+        ({"version": ""}, ValueError, "version"),
+        ({"read_only_workflows": {"lookup-account"}}, TypeError, "frozenset"),
+        ({"read_only_workflows": frozenset({"not valid"})}, ValueError, "stable"),
+        (
+            {"idempotent_workflows": frozenset({"lookup-account"})},
+            ValueError,
+            "declared effects",
+        ),
+        ({"invoke": None}, TypeError, "callable"),
+    )
+    for changes, error, message in cases:
+        with pytest.raises(error, match=message):
+            WorkflowInterop(invalid_provider(**changes))
+
+    class Companion:
+        provider = "other"
+        version: str | None = "provider-v1"
+
+        def import_workflow(self, source: Any) -> WorkflowSpec:
+            return SpecImporter().import_workflow(source)
+
+    with pytest.raises(ValueError, match="provider does not match"):
+        WorkflowInterop(Provider(), workflow_importer=Companion())
+    Companion.provider = "example-provider"
+    Companion.version = "other"
+    with pytest.raises(ValueError, match="version does not match"):
+        WorkflowInterop(Provider(), workflow_importer=Companion())
+    Companion.version = "provider-v1"
+    Companion.import_workflow = None  # type: ignore[assignment]
+    with pytest.raises(TypeError, match="implement"):
+        WorkflowInterop(Provider(), workflow_importer=Companion())

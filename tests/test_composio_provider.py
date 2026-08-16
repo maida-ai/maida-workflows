@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import pytest
@@ -138,3 +139,170 @@ def test_trigger_parser_requires_the_verified_current_envelope() -> None:
 def test_binding_rejects_unsubstantiated_read_idempotency() -> None:
     with pytest.raises(ValueError, match="read-only"):
         ComposioToolBinding("find", "GMAIL_FETCH_EMAILS", False, "request_id")
+
+
+@pytest.mark.parametrize(
+    ("values", "error", "message"),
+    (
+        (("not valid", "GMAIL_FETCH_EMAILS", False, None), ValueError, "operation"),
+        (("find", "not valid", False, None), ValueError, "tool_slug"),
+        (("find", "GMAIL_FETCH_EMAILS", 1, None), TypeError, "boolean"),
+        (("send", "GMAIL_SEND_EMAIL", True, "not valid"), ValueError, "idempotency"),
+    ),
+)
+def test_binding_validates_all_deployment_identities(
+    values: tuple[Any, ...], error: type[Exception], message: str
+) -> None:
+    with pytest.raises(error, match=message):
+        ComposioToolBinding(*values)
+
+
+def test_adapter_configuration_is_strict() -> None:
+    binding = ComposioToolBinding("find", "GMAIL_FETCH_EMAILS", False)
+    common: dict[str, Any] = {
+        "connector": "email",
+        "connector_version": "v1",
+        "bindings": (binding,),
+        "session_resolver": lambda operation, request: Session(),
+    }
+    cases: tuple[tuple[dict[str, Any], type[Exception], str], ...] = (
+        ({"connector": "not valid"}, ValueError, "connector"),
+        ({"connector_version": ""}, ValueError, "connector_version"),
+        ({"bindings": ()}, ValueError, "bindings"),
+        ({"bindings": (object(),)}, ValueError, "bindings"),
+        ({"bindings": (binding, binding)}, ValueError, "unique"),
+        ({"session_resolver": 1}, TypeError, "session_resolver"),
+        ({"argument_mapper": 1}, TypeError, "argument_mapper"),
+        ({"account_resolver": 1}, TypeError, "account_resolver"),
+        ({"response_mapper": 1}, TypeError, "response_mapper"),
+    )
+    for changes, error, message in cases:
+        with pytest.raises(error, match=message):
+            ComposioToolAdapter(**{**common, **changes})
+
+
+@pytest.mark.asyncio
+async def test_adapter_validates_resolvers_arguments_accounts_and_idempotency() -> None:
+    read_binding = ComposioToolBinding("find", "GMAIL_FETCH_EMAILS", False)
+    effect_binding = ComposioToolBinding("send", "GMAIL_SEND_EMAIL", True, "request_id")
+
+    invalid_session = ComposioToolAdapter(
+        connector="email",
+        connector_version="v1",
+        bindings=(read_binding,),
+        session_resolver=lambda operation, request: object(),  # type: ignore[arg-type,return-value]
+    )
+    with pytest.raises(TypeError, match="ComposioSession"):
+        await invalid_session.read("find", {})
+
+    invalid_arguments = ComposioToolAdapter(
+        connector="email",
+        connector_version="v1",
+        bindings=(read_binding,),
+        session_resolver=lambda operation, request: Session(),
+        argument_mapper=lambda operation, request: [],  # type: ignore[arg-type,return-value]
+    )
+    with pytest.raises(TypeError, match="return a mapping"):
+        await invalid_arguments.read("find", {})
+
+    invalid_account = ComposioToolAdapter(
+        connector="email",
+        connector_version="v1",
+        bindings=(read_binding,),
+        session_resolver=lambda operation, request: Session(),
+        account_resolver=lambda operation, request: "",
+    )
+    with pytest.raises(ValueError, match="non-empty account"):
+        await invalid_account.read("find", {})
+
+    default_arguments = ComposioToolAdapter(
+        connector="email",
+        connector_version="v1",
+        bindings=(read_binding,),
+        session_resolver=lambda operation, request: Session(),
+    )
+    with pytest.raises(TypeError, match="request mapping"):
+        await default_arguments.read("find", "not-a-mapping")
+
+    idempotent = ComposioToolAdapter(
+        connector="email",
+        connector_version="v1",
+        bindings=(effect_binding,),
+        session_resolver=lambda operation, request: Session(),
+    )
+    with pytest.raises(ValueError, match="requires an idempotency key"):
+        await idempotent.effect("send", {}, None)  # type: ignore[arg-type]
+    with pytest.raises(LookupError, match="read operation"):
+        await idempotent.read("send", {})
+
+
+class AsyncSession(Session):
+    async def execute(
+        self,
+        tool_slug: str,
+        arguments: Mapping[str, Any],
+        account: str | None = None,
+    ) -> Any:
+        self.calls.append((tool_slug, dict(arguments), account))
+        return self.response
+
+
+@dataclass
+class ObjectResponse:
+    data: Any = None
+    error: Any = None
+
+
+@pytest.mark.asyncio
+async def test_adapter_supports_async_sessions_and_object_responses() -> None:
+    session = AsyncSession()
+    adapter = ComposioToolAdapter(
+        connector="email",
+        connector_version="v1",
+        bindings=(ComposioToolBinding("find", "GMAIL_FETCH_EMAILS", False),),
+        session_resolver=lambda operation, request: session,
+    )
+
+    session.response = ObjectResponse(data={"ok": True})
+    assert await adapter.read("find", {}) == {"ok": True}
+    session.response = ObjectResponse(error="private")
+    with pytest.raises(RuntimeError, match="execution failed"):
+        await adapter.read("find", {})
+    session.response = "raw"
+    assert await adapter.read("find", {}) == "raw"
+    session.response = {"value": 1}
+    assert await adapter.read("find", {}) == {"value": 1}
+
+
+def test_trigger_contract_rejects_missing_or_untrusted_fields() -> None:
+    with pytest.raises(TypeError, match="must be a mapping"):
+        ComposioTriggerEvent.from_verified_payload([])  # type: ignore[arg-type]
+    missing = _payload()
+    del missing["id"]
+    with pytest.raises(ValueError, match="missing 'id'"):
+        ComposioTriggerEvent.from_verified_payload(missing)
+    with pytest.raises(TypeError, match="trigger data"):
+        ComposioTriggerEvent("id", "slug", "trigger", "user", [], "now")  # type: ignore[arg-type]
+
+    for field in ("event_id", "trigger_slug", "trigger_id", "user_id", "timestamp"):
+        values: dict[str, Any] = {
+            "event_id": "id",
+            "trigger_slug": "slug",
+            "trigger_id": "trigger",
+            "user_id": "user",
+            "data": {},
+            "timestamp": "now",
+        }
+        values[field] = ""
+        with pytest.raises(ValueError, match=field):
+            ComposioTriggerEvent(**values)
+
+
+def test_trigger_translation_accepts_explicit_application_values() -> None:
+    event = ComposioTriggerEvent.from_verified_payload(_payload())
+
+    start = event.start_request("inspect-commit", input={"selected": True})
+    signal = event.signal_command("commit.received", value={"sha": "selected"})
+
+    assert start.input == {"selected": True}
+    assert signal.value == {"sha": "selected"}
