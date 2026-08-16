@@ -16,7 +16,7 @@ from enum import StrEnum
 from typing import Any, ClassVar, Protocol
 from uuid import uuid4
 
-from ._canonical import canonical_data, digest_data
+from ._canonical import canonical_data
 from .authoring import Workflow
 from .models import Event, ExecutionMode, RunStatus
 from .runtime import DurableRuntimeStore, WorkflowScheduler
@@ -33,70 +33,6 @@ class CommandType(StrEnum):
     RESUME = "resume"
     CANCEL = "cancel"
     RETRY = "retry"
-
-
-class InteractionKind(StrEnum):
-    """Durable reasons that a task may relinquish compute and await a command."""
-
-    INPUT = "input"
-    APPROVAL = "approval"
-    SIGNAL = "signal"
-
-
-@dataclass(frozen=True, kw_only=True)
-class InteractionRequest:
-    """Transport-neutral request that parks a running task.
-
-    This object is runtime infrastructure shared by the public ``Approval``,
-    ``Input``, and ``WaitForSignal`` modules. Applications may also use it when
-    implementing a transport-neutral interaction frontend.
-
-    Parameters
-    ----------
-    request_id
-        Stable identity used by input, approval, or signal commands.
-    kind
-        Interaction category and resulting durable task state.
-    prompt
-        Human-readable application prompt.
-    schema_digest
-        Optional declared input schema digest.
-    schema
-        Optional canonical JSON Schema used to validate a command before the
-        parked task becomes claimable. A digest must accompany it.
-    signal_name
-        Optional named signal required by a signal wait.
-    metadata
-        Canonical non-sensitive presentation metadata.
-    """
-
-    request_id: str
-    kind: InteractionKind
-    prompt: str
-    schema_digest: str | None = None
-    schema: dict[str, Any] | None = None
-    signal_name: str | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        """Validate stable request addressing and signal requirements."""
-        if not self.request_id.strip():
-            raise ValueError("request_id must be non-empty")
-        if not self.prompt.strip():
-            raise ValueError("interaction prompt must be non-empty")
-        if self.kind is InteractionKind.SIGNAL and not (self.signal_name or "").strip():
-            raise ValueError("signal_name is required for a signal interaction")
-        if self.schema is not None and (
-            self.schema_digest is None or digest_data(self.schema) != self.schema_digest
-        ):
-            raise ValueError("schema_digest must identify the declared interaction schema")
-
-    def to_data(self) -> dict[str, Any]:
-        """Return a canonical request event payload."""
-        payload = canonical_data(asdict(self))
-        if not isinstance(payload, dict):  # pragma: no cover - dataclasses encode as objects
-            raise TypeError("interaction request must encode as an object")
-        return {key: value for key, value in payload.items() if value is not None}
 
 
 @dataclass(frozen=True, kw_only=True)

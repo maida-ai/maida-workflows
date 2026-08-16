@@ -127,28 +127,18 @@ The interaction's accepted value becomes an ordinary replayable boundary.
 ## Generated graphs
 
 The generated example keeps planner authority narrow. `PlanFragmentIR` contains
-only stable node keys, allowlisted aliases, dependencies, outputs, and revision
-lineage. `PlanValidator` resolves every module identity, schema, environment,
+only stable node keys, allowlisted aliases, dependencies, and outputs.
+`PlanValidator` resolves every module identity, schema, environment,
 grant, effect, approval rule, and budget from trusted application data before
 `PlanMaterializer` inserts all child tasks atomically. Child work is claimed by
 ordinary workers; the planner never calls another module or manages executors.
 
 ## External systems
 
-`ExternalWorkflow` wraps a provider-owned flow as one typed module. Verification
-fidelity remains explicit:
-
-```text
-typed opaque boundary  → typed input/output and declared access
-canonical boundaries   → behavioral comparison and replay
-importable WorkflowSpec → full graph validation, structural diff, and replay
-```
-
-Provider implementations register behind the normal connector/effect broker.
-For example, the optional Composio adapter accepts a deployment-owned session
-resolver, while the workflow retains only a neutral connector operation and
-immutable version. Replay stops at the Maida effect boundary before the provider
-session can run.
+`ExternalWorkflow` wraps a provider-owned flow as one typed, opaque boundary.
+Deployment-owned adapters register behind the normal connector/effect broker;
+the workflow retains only a neutral connector operation and immutable version.
+Replay stops at the Maida effect boundary before a provider session can run.
 
 ## Compile first
 

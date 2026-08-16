@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Protocol, cast
+from typing import Any, cast
 from uuid import NAMESPACE_URL, uuid5
 
 from psycopg.types.json import Jsonb
@@ -32,74 +32,8 @@ from .models import (
     TaskStatus,
 )
 from .persistence import InvalidRunStateError, PersistenceError, PostgresStore
+from .registry import ModuleRegistry
 from .runtime import TaskWorker
-
-
-class ModuleResolver(Protocol):
-    """Resolve one exact generated module from trusted application code."""
-
-    def resolve(
-        self,
-        definition_digest: str,
-        module_id: str,
-        module_digest: str,
-    ) -> Module[Any, Any]:
-        """Return a module only when every immutable identity matches."""
-        ...
-
-
-class ModuleResolverRegistry:
-    """In-memory exact module resolver for control planes and local runners.
-
-    Registrations contain live trusted module objects and are never serialized.
-    A registration may be scoped to one workflow definition digest or shared
-    across definitions when ``definition_digest`` is omitted.
-    """
-
-    def __init__(self) -> None:
-        self._modules: dict[tuple[str | None, str, str], Module[Any, Any]] = {}
-
-    def register(
-        self,
-        module_id: str,
-        module: Module[Any, Any],
-        *,
-        definition_digest: str | None = None,
-    ) -> None:
-        """Register one module under its recomputed behavior digest.
-
-        Raises
-        ------
-        TypeError
-            If ``module`` is not a workflow module.
-        ValueError
-            If identity is empty or an exact key is already registered.
-        """
-        if not isinstance(module, Module):
-            raise TypeError("module resolver registrations must contain Module instances")
-        if not isinstance(module_id, str) or not module_id.strip():
-            raise ValueError("module_id must be non-empty")
-        if definition_digest is not None and not definition_digest.strip():
-            raise ValueError("definition_digest must be non-empty when supplied")
-        digest = module_digest(module)
-        key = (definition_digest, module_id, digest)
-        if key in self._modules:
-            raise ValueError("module resolver identity is already registered")
-        self._modules[key] = module
-
-    def resolve(
-        self,
-        definition_digest: str,
-        module_id: str,
-        expected_digest: str,
-    ) -> Module[Any, Any]:
-        """Resolve a definition-scoped or explicitly shared exact module."""
-        module = self._modules.get((definition_digest, module_id, expected_digest))
-        if module is None:
-            module = self._modules.get((None, module_id, expected_digest))
-        if module is None or module_digest(module) != expected_digest:
-            raise LookupError("no exact trusted module binding is registered")
-        return module
 
 
 @dataclass(frozen=True)
@@ -108,7 +42,6 @@ class MaterializedPlan:
 
     run_id: str
     region_instance_id: str
-    revision: int
     plan_digest: str
     signature: PlanSignature
     task_ids: tuple[str, ...]
@@ -131,14 +64,14 @@ class PlanMaterializer:
     ----------
     store
         Durable PostgreSQL workflow store.
-    resolver
-        Trusted exact module resolver. Generated content never supplies import
-        paths or executable factories.
+    registry
+        Trusted module registry. Generated content never supplies import paths
+        or executable factories.
     """
 
-    def __init__(self, store: PostgresStore, resolver: ModuleResolver) -> None:
+    def __init__(self, store: PostgresStore, registry: ModuleRegistry) -> None:
         self.store = store
-        self.resolver = resolver
+        self.registry = registry
 
     def materialize(
         self,
@@ -157,7 +90,7 @@ class PlanMaterializer:
         the canonical fragment. Initial dependency-free nodes become ``READY``;
         every other node remains ``BLOCKED`` until
         :class:`DynamicPlanScheduler` observes accepted upstream boundaries.
-        Repeating the exact region/revision/digest is idempotent.
+        Repeating the exact region and digest is idempotent.
         """
         if not isinstance(fragment, PlanFragmentIR):
             raise TypeError("fragment must be PlanFragmentIR")
@@ -184,38 +117,29 @@ class PlanMaterializer:
             and event.payload.get("region_instance_id") == region_instance_id
         )
         latest = existing_events[-1] if existing_events else None
-        if latest is not None and int(latest.payload["revision"]) == fragment.revision:
+        if latest is not None:
             if latest.payload["plan_digest"] != fragment.digest:
-                raise InvalidRunStateError("plan revision conflicts with materialized history")
-            tasks = self._region_tasks(history.tasks, region_instance_id, fragment.revision)
+                raise InvalidRunStateError("a different plan is already materialized for region")
+            tasks = self._region_tasks(history.tasks, region_instance_id)
             signature = validator.validate(
                 fragment,
                 region_input_schema_digest=source.accepted_boundary.input_schema_digest,
                 expected_output_schema_digests=expected_output_schema_digests,
-                expected_revision=fragment.revision,
-                expected_supersedes=fragment.supersedes,
             )
             return MaterializedPlan(
                 run_id,
                 region_instance_id,
-                fragment.revision,
                 fragment.digest,
                 signature,
                 tuple(task.task_id for task in tasks),
             )
-        expected_revision = 1 if latest is None else int(latest.payload["revision"]) + 1
-        expected_supersedes = None if latest is None else cast(str, latest.payload["plan_digest"])
         signature = validator.validate(
             fragment,
             region_input_schema_digest=source.accepted_boundary.input_schema_digest,
             expected_output_schema_digests=expected_output_schema_digests,
-            expected_revision=expected_revision,
-            expected_supersedes=expected_supersedes,
         )
-        modules = self._resolve_modules(history.run.definition_digest, signature)
+        modules = self._resolve_modules(signature)
         tasks = self._insert(
-            history.run.definition_digest,
-            history.definition.workflow_id,
             source,
             region_instance_id,
             fragment,
@@ -226,20 +150,16 @@ class PlanMaterializer:
         return MaterializedPlan(
             run_id,
             region_instance_id,
-            fragment.revision,
             fragment.digest,
             signature,
             tuple(task.task_id for task in tasks),
         )
 
-    def _resolve_modules(
-        self, definition_digest: str, signature: PlanSignature
-    ) -> Mapping[str, Module[Any, Any]]:
+    def _resolve_modules(self, signature: PlanSignature) -> Mapping[str, Module[Any, Any]]:
         modules: dict[str, Module[Any, Any]] = {}
         for descriptor in signature.resolved_nodes:
             key = cast(str, descriptor["key"])
-            module = self.resolver.resolve(
-                definition_digest,
+            module = self.registry.resolve_exact(
                 cast(str, descriptor["module_id"]),
                 cast(str, descriptor["module_digest"]),
             )
@@ -249,8 +169,6 @@ class PlanMaterializer:
 
     def _insert(
         self,
-        definition_digest: str,
-        workflow_id: str,
         source: Task,
         region_instance_id: str,
         fragment: PlanFragmentIR,
@@ -259,7 +177,6 @@ class PlanMaterializer:
         *,
         tenant_id: str,
     ) -> tuple[Task, ...]:
-        del definition_digest, workflow_id
         if source.accepted_boundary is None:  # pragma: no cover - caller checked
             raise PersistenceError("plan source has no boundary")
         source_boundary = source.accepted_boundary
@@ -305,51 +222,7 @@ class PlanMaterializer:
             )
             previous = cursor.fetchone()
             if previous is not None:
-                previous_payload = previous["payload"]
-                if int(previous_payload["revision"]) >= fragment.revision:
-                    raise InvalidRunStateError("plan revision was materialized concurrently")
-                cursor.execute(
-                    """
-                    SELECT t.status, EXISTS (
-                        SELECT 1 FROM workflow_attempts a WHERE a.task_id = t.task_id
-                    ) AS attempted
-                    FROM workflow_tasks t
-                    WHERE t.run_id = %s AND t.plan_region_instance_id = %s
-                      AND t.plan_revision = %s
-                    FOR UPDATE
-                    """,
-                    (
-                        source.run_id,
-                        region_instance_id,
-                        int(previous_payload["revision"]),
-                    ),
-                )
-                previous_tasks = list(cursor.fetchall())
-                if any(row["attempted"] for row in previous_tasks):
-                    raise InvalidRunStateError("a started generated plan cannot be superseded")
-                cursor.execute(
-                    """
-                    UPDATE workflow_tasks SET status = 'CANCELLED', completed_at = now()
-                    WHERE run_id = %s AND plan_region_instance_id = %s
-                      AND plan_revision = %s AND status IN ('BLOCKED', 'READY')
-                    """,
-                    (
-                        source.run_id,
-                        region_instance_id,
-                        int(previous_payload["revision"]),
-                    ),
-                )
-                self.store._append_event(
-                    cursor,
-                    source.run_id,
-                    "PLAN_SUPERSEDED",
-                    {
-                        "region_instance_id": region_instance_id,
-                        "revision": int(previous_payload["revision"]),
-                        "plan_digest": previous_payload["plan_digest"],
-                    },
-                    task_id=source.task_id,
-                )
+                raise InvalidRunStateError("a plan was materialized concurrently for region")
 
             for node_key in sorted(by_key):
                 descriptor = by_key[node_key]
@@ -366,7 +239,7 @@ class PlanMaterializer:
                 task_id = str(
                     uuid5(
                         NAMESPACE_URL,
-                        f"{source.run_id}:{region_instance_id}:{fragment.revision}:{node_key}",
+                        f"{source.run_id}:{region_instance_id}:{node_key}",
                     )
                 )
                 logical_step = f"dynamic/{signature.region_id}/nodes/{node_key}"
@@ -374,7 +247,6 @@ class PlanMaterializer:
                     {
                         "parent_instance": source_boundary.instance_key,
                         "region_instance_id": region_instance_id,
-                        "revision": fragment.revision,
                         "node_key": node_key,
                     }
                 )[:24]
@@ -395,12 +267,12 @@ class PlanMaterializer:
                         capability_grant, budget_declaration, branch_decisions,
                         map_decisions, status, ready_at, parent_task_id,
                         plan_region_id, plan_region_instance_id, plan_node_key,
-                        plan_digest, plan_revision
+                        plan_digest
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s, '[]'::jsonb, '[]'::jsonb, %s,
                         CASE WHEN %s = 'READY' THEN now() ELSE NULL END,
-                        %s, %s, %s, %s, %s, %s
+                        %s, %s, %s, %s, %s
                     ) RETURNING *
                     """,
                     (
@@ -410,7 +282,7 @@ class PlanMaterializer:
                         logical_step,
                         step_instance_id,
                         descriptor["module_digest"],
-                        f"dynamic/{region_instance_id}/r{fragment.revision}/{node_key}",
+                        f"dynamic/{region_instance_id}/{node_key}",
                         Jsonb([source_boundary.instance_key]),
                         Jsonb(list(dependencies)),
                         Jsonb(input_value.to_data()) if input_value is not None else None,
@@ -429,7 +301,6 @@ class PlanMaterializer:
                         region_instance_id,
                         node_key,
                         fragment.digest,
-                        fragment.revision,
                     ),
                 )
                 row = cursor.fetchone()
@@ -450,20 +321,16 @@ class PlanMaterializer:
                     "plan_digest": fragment.digest,
                     "region_id": signature.region_id,
                     "region_instance_id": region_instance_id,
-                    "revision": fragment.revision,
                     "signature": signature.to_dict(),
                     "signature_digest": signature.digest,
                     "source_task_id": source.task_id,
-                    "supersedes": fragment.supersedes,
                 },
                 task_id=source.task_id,
             )
         return tuple(self.store._task_from_row(row) for row in rows)
 
     @staticmethod
-    def _region_tasks(
-        tasks: tuple[Task, ...], region_instance_id: str, revision: int
-    ) -> tuple[Task, ...]:
+    def _region_tasks(tasks: tuple[Task, ...], region_instance_id: str) -> tuple[Task, ...]:
         return tuple(
             sorted(
                 (
@@ -471,7 +338,6 @@ class PlanMaterializer:
                     for task in tasks
                     if task.plan_provenance is not None
                     and task.plan_provenance.region_instance_id == region_instance_id
-                    and task.plan_provenance.revision == revision
                 ),
                 key=lambda task: cast(PlanTaskProvenance, task.plan_provenance).node_key,
             )
@@ -489,26 +355,24 @@ class DynamicPlanScheduler:
     def __init__(
         self,
         store: PostgresStore,
-        resolver: ModuleResolver,
+        registry: ModuleRegistry,
         *,
         run_id: str,
         region_instance_id: str,
-        revision: int,
         tenant_id: str = "local",
     ) -> None:
         self.store = store
-        self.resolver = resolver
+        self.registry = registry
         self.run_id = run_id
         self.region_instance_id = region_instance_id
-        self.revision = revision
         self.tenant_id = tenant_id
 
     def worker(self, *, worker_id: str, **kwargs: Any) -> TaskWorker:
         """Create an ordinary claim worker bound to this generated graph."""
         history = self.store.load_run_history(self.run_id, tenant_id=self.tenant_id)
         modules = {
-            ReplayKey(task.module_id, task.logical_step): self.resolver.resolve(
-                history.run.definition_digest, task.module_id, task.module_digest
+            ReplayKey(task.module_id, task.logical_step): self.registry.resolve_exact(
+                task.module_id, task.module_digest
             )
             for task in self._tasks(history.tasks)
         }
@@ -557,9 +421,7 @@ class DynamicPlanScheduler:
                 dependency_instances.append(upstream.accepted_boundary.instance_key)
             if not available:
                 continue
-            module = self.resolver.resolve(
-                history.run.definition_digest, task.module_id, task.module_digest
-            )
+            module = self.registry.resolve_exact(task.module_id, task.module_digest)
             decoded = [self.store.values.decode(value) for value in values]
             concrete = decoded[0] if len(decoded) == 1 else tuple(decoded)
             input_value = self.store.values.encode(
@@ -591,7 +453,6 @@ class DynamicPlanScheduler:
             for task in tasks
             if task.plan_provenance is not None
             and task.plan_provenance.region_instance_id == self.region_instance_id
-            and task.plan_provenance.revision == self.revision
         )
 
     def _output_keys(self, events: tuple[Any, ...]) -> tuple[str, ...]:
@@ -601,7 +462,6 @@ class DynamicPlanScheduler:
                 for event in reversed(events)
                 if event.event_type == "PLAN_MATERIALIZED"
                 and event.payload.get("region_instance_id") == self.region_instance_id
-                and int(event.payload.get("revision", 0)) == self.revision
             ),
             None,
         )

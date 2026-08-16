@@ -3,7 +3,7 @@
 This module keeps generated planning output deliberately smaller than the
 static workflow IR. A :class:`PlanFragmentIR` contains graph choices only;
 module identities, schemas, execution requirements, and external-access
-declarations remain in a trusted :class:`ModuleCatalog` and are resolved by
+declarations remain in a trusted :class:`ModuleRegistry` and are resolved by
 :class:`PlanValidator` before any later materialization step may use them.
 """
 
@@ -20,11 +20,11 @@ from typing import Any, Self, cast
 
 from ._canonical import canonical_data, canonical_json, digest_data
 from .budget import Budget
-from .ir import PlanIR, ReplayKey, _validated_access_declarations
-from .models import CapabilityGrant, ExecutionSpec
+from .models import CapabilityGrant
+from .registry import ModuleRegistry, _catalog_entry, _CatalogEntry
 
-PLAN_FRAGMENT_VERSION = "0.1.0"
-PLAN_SIGNATURE_VERSION = "0.2.0"
+PLAN_FRAGMENT_VERSION = "0.2.0"
+PLAN_SIGNATURE_VERSION = "0.3.0"
 _REGION_INPUT = "$input"
 _STABLE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 _HEX_DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -32,8 +32,6 @@ _FRAGMENT_FIELDS = {
     "fragment_id",
     "nodes",
     "outputs",
-    "revision",
-    "supersedes",
     "version",
 }
 _NODE_FIELDS = {"dependencies", "key", "module_alias"}
@@ -127,16 +125,16 @@ class PlanNode:
     """One generated module selection and its ordered dependencies.
 
     A node carries only planner-controlled graph data. The selected alias is
-    resolved against a trusted :class:`ModuleCatalog`; generated content never
+    resolved against a trusted :class:`ModuleRegistry`; generated content never
     supplies module digests, schemas, code locations, execution requirements,
     credentials, grants, capabilities, effects, or budgets.
 
     Parameters
     ----------
     key
-        Stable identity for this node within its fragment and revision.
+        Stable identity for this node within its fragment.
     module_alias
-        Allowlisted alias to resolve in the trusted module catalog.
+        Allowlisted alias to resolve in the trusted module registry.
     dependencies
         Ordered source keys for the module input ports. ``$input`` identifies
         the trusted surrounding region input.
@@ -222,16 +220,12 @@ class PlanFragmentIR:
     fragment_id
         Stable diagnostic identity for this planner output. It is not used to
         resolve module definitions.
-    revision
-        One-based revision number checked against trusted runtime lineage.
-    supersedes
-        Digest of the preceding fragment, or ``None`` for the initial plan.
     nodes
         Generated module aliases and dependency topology.
     outputs
         Ordered node keys returned from the surrounding dynamic region.
     version
-        Fragment schema version. Only ``0.1.0`` is currently accepted.
+        Fragment schema version. Only ``0.2.0`` is currently accepted.
 
     Notes
     -----
@@ -240,8 +234,6 @@ class PlanFragmentIR:
     """
 
     fragment_id: str
-    revision: int
-    supersedes: str | None
     nodes: tuple[PlanNode, ...]
     outputs: tuple[str, ...]
     version: str = PLAN_FRAGMENT_VERSION
@@ -254,19 +246,6 @@ class PlanFragmentIR:
                 f"unsupported PlanFragmentIR version {self.version!r}",
             )
         _require_stable_name(self.fragment_id, label="fragment_id")
-        _require_nonnegative_integer(
-            self.revision,
-            label="revision",
-            error_code="PLAN_FRAGMENT_INVALID",
-        )
-        if self.revision == 0:
-            raise _error("PLAN_FRAGMENT_INVALID", "revision must be at least one")
-        if self.supersedes is not None:
-            _require_digest(self.supersedes, label="supersedes")
-        if self.revision == 1 and self.supersedes is not None:
-            raise _error("PLAN_REVISION_INVALID", "initial plan supersedes must be null")
-        if self.revision > 1 and self.supersedes is None:
-            raise _error("PLAN_REVISION_INVALID", "revised plan must provide a supersedes digest")
         if not isinstance(self.nodes, (list, tuple)) or any(
             not isinstance(node, PlanNode) for node in self.nodes
         ):
@@ -286,8 +265,6 @@ class PlanFragmentIR:
             "fragment_id": self.fragment_id,
             "nodes": [node.to_dict() for node in self.nodes],
             "outputs": list(self.outputs),
-            "revision": self.revision,
-            "supersedes": self.supersedes,
             "version": self.version,
         }
 
@@ -336,8 +313,6 @@ class PlanFragmentIR:
         try:
             return cls(
                 fragment_id=data["fragment_id"],
-                revision=data["revision"],
-                supersedes=data["supersedes"],
                 nodes=nodes,
                 outputs=tuple(raw_outputs),
                 version=data["version"],
@@ -353,7 +328,7 @@ class PlanFragmentIR:
 
     @property
     def digest(self) -> str:
-        """Return the SHA-256 digest of this fragment and its lineage fields."""
+        """Return the SHA-256 digest of this generated fragment."""
         return digest_data(self.to_dict())
 
 
@@ -369,8 +344,6 @@ class PlanLimits:
         Maximum dependency depth, counting the first module as depth one.
     max_fanout
         Maximum number of direct consumers of any node or region input.
-    max_replans
-        Maximum number of replans after the initial revision one.
     budget
         Maximum aggregate resource envelope for the generated region. Token,
         tool, and cost limits are summed across node occurrences. Wall time is
@@ -380,7 +353,6 @@ class PlanLimits:
     max_nodes: int
     max_depth: int
     max_fanout: int
-    max_replans: int
     budget: Budget
 
     def __post_init__(self) -> None:
@@ -389,7 +361,6 @@ class PlanLimits:
             ("max_nodes", self.max_nodes),
             ("max_depth", self.max_depth),
             ("max_fanout", self.max_fanout),
-            ("max_replans", self.max_replans),
         ):
             _require_nonnegative_integer(value, label=label)
         if self.max_nodes == 0:
@@ -412,303 +383,6 @@ _CATALOG_FIELDS = {
 }
 
 
-@dataclass(frozen=True)
-class _CatalogEntry:
-    module_id: str
-    module_digest: str
-    input_schema_digests: tuple[str, ...]
-    output_schema_digest: str
-    execution: Mapping[str, Any]
-    capabilities: tuple[Mapping[str, Any], ...]
-    effects: tuple[Mapping[str, Any], ...]
-    budget: Budget
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "execution", cast(Mapping[str, Any], _freeze_json(self.execution)))
-        object.__setattr__(
-            self,
-            "capabilities",
-            tuple(cast(Mapping[str, Any], _freeze_json(item)) for item in self.capabilities),
-        )
-        object.__setattr__(
-            self,
-            "effects",
-            tuple(cast(Mapping[str, Any], _freeze_json(item)) for item in self.effects),
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return cast(
-            dict[str, Any],
-            canonical_data(
-                {
-                    "capabilities": self.capabilities,
-                    "budget": self.budget.to_data(),
-                    "effects": self.effects,
-                    "execution": self.execution,
-                    "input_schema_digests": self.input_schema_digests,
-                    "module_digest": self.module_digest,
-                    "module_id": self.module_id,
-                    "output_schema_digest": self.output_schema_digest,
-                }
-            ),
-        )
-
-
-def _catalog_entry(
-    *,
-    module_id: Any,
-    module_digest: Any,
-    input_schema_digests: Any,
-    output_schema_digest: Any,
-    execution: Any,
-    capabilities: Any,
-    effects: Any,
-    budget: Any,
-    require_canonical: bool = False,
-) -> _CatalogEntry:
-    if not isinstance(module_id, str) or not module_id.strip():
-        raise ValueError("module_id must be a non-empty stable identity")
-    _require_digest(module_digest, label="module_digest")
-    if not isinstance(input_schema_digests, (list, tuple)):
-        raise ValueError("input_schema_digests must be an ordered sequence")
-    inputs = tuple(
-        _require_digest(item, label=f"input_schema_digests[{index}]")
-        for index, item in enumerate(input_schema_digests)
-    )
-    _require_digest(output_schema_digest, label="output_schema_digest")
-    if not isinstance(execution, Mapping):
-        raise ValueError("execution must be a canonical ExecutionSpec mapping")
-    encoded_execution = cast(dict[str, Any], canonical_data(dict(execution)))
-    try:
-        restored_execution = ExecutionSpec.from_data(encoded_execution)
-    except (AttributeError, TypeError, ValueError) as exc:
-        raise ValueError(f"execution is invalid: {exc}") from exc
-    if canonical_json(restored_execution.to_data()) != canonical_json(encoded_execution):
-        raise ValueError("execution fields do not match the ExecutionSpec contract")
-    encoded_capabilities = _validated_access_declarations(
-        capabilities,
-        expected_kind="capability",
-        location="catalog capabilities",
-        require_canonical=require_canonical,
-        error_type=ValueError,
-    )
-    encoded_effects = _validated_access_declarations(
-        effects,
-        expected_kind="effect",
-        location="catalog effects",
-        require_canonical=require_canonical,
-        error_type=ValueError,
-    )
-    if not isinstance(budget, Budget):
-        if not isinstance(budget, Mapping):
-            raise ValueError("budget must be a Budget or canonical budget mapping")
-        try:
-            restored_budget = Budget.from_data(budget)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"budget is invalid: {exc}") from exc
-        if canonical_json(restored_budget.to_data()) != canonical_json(budget):
-            raise ValueError("budget fields do not match the canonical budget contract")
-        budget = restored_budget
-    return _CatalogEntry(
-        module_id=module_id,
-        module_digest=module_digest,
-        input_schema_digests=inputs,
-        output_schema_digest=output_schema_digest,
-        execution=encoded_execution,
-        capabilities=encoded_capabilities,
-        effects=encoded_effects,
-        budget=budget,
-    )
-
-
-class ModuleCatalog:
-    """Immutable allowlist of trusted module aliases and definition pins.
-
-    A catalog is constructed by trusted application or deployment code, never
-    from generated plan content. Each alias resolves to immutable module and
-    schema digests plus credential-free execution, capability, and effect
-    declarations and an immutable per-occurrence resource envelope. Runtime
-    credentials are intentionally not representable.
-
-    Notes
-    -----
-    Use :meth:`allow` to build a catalog explicitly or :meth:`from_plan` to
-    select replay-addressable steps from an existing static workflow IR.
-    """
-
-    def __init__(self) -> None:
-        self._entries: Mapping[str, _CatalogEntry] = MappingProxyType({})
-
-    @classmethod
-    def _from_entries(cls, entries: Mapping[str, _CatalogEntry]) -> ModuleCatalog:
-        catalog = cls()
-        catalog._entries = MappingProxyType(dict(entries))
-        return catalog
-
-    @property
-    def aliases(self) -> tuple[str, ...]:
-        """Return registered aliases in deterministic lexical order."""
-        return tuple(sorted(self._entries))
-
-    def allow(
-        self,
-        alias: str,
-        *,
-        module_id: str,
-        module_digest: str,
-        input_schema_digests: tuple[str, ...],
-        output_schema_digest: str,
-        execution: Mapping[str, Any],
-        budget: Budget,
-        capabilities: tuple[Mapping[str, Any], ...] = (),
-        effects: tuple[Mapping[str, Any], ...] = (),
-    ) -> ModuleCatalog:
-        """Return a new catalog containing one additional trusted alias.
-
-        Parameters
-        ----------
-        alias
-            Stable planner-visible name. An existing alias cannot be replaced.
-        module_id, module_digest
-            Trusted semantic and immutable behavior identities.
-        input_schema_digests
-            Ordered input-port schema digests matched to generated dependencies.
-        output_schema_digest
-            Typed output contract exposed to downstream generated nodes.
-        execution
-            Canonical credential-free execution requirements.
-        budget
-            Trusted resource envelope for each occurrence of this alias.
-        capabilities, effects
-            Canonical external-access declarations inherited from the trusted
-            module definition. They cannot be altered by generated plans.
-
-        Returns
-        -------
-        ModuleCatalog
-            New immutable allowlist retaining all existing aliases.
-
-        Raises
-        ------
-        TypeError
-            If ``budget`` is not a :class:`Budget` declaration.
-        ValueError
-            If an identity or descriptor is invalid or the alias already exists.
-        """
-        if not isinstance(budget, Budget):
-            raise TypeError("budget must be a Budget")
-        try:
-            _require_stable_name(alias, label="module alias")
-            entry = _catalog_entry(
-                module_id=module_id,
-                module_digest=module_digest,
-                input_schema_digests=input_schema_digests,
-                output_schema_digest=output_schema_digest,
-                execution=execution,
-                budget=budget,
-                capabilities=capabilities,
-                effects=effects,
-            )
-        except PlanValidationError as exc:
-            raise ValueError(str(exc)) from exc
-        if alias in self._entries:
-            raise ValueError(f"module alias {alias!r} is already registered")
-        return ModuleCatalog._from_entries({**self._entries, alias: entry})
-
-    @classmethod
-    def from_plan(
-        cls,
-        plan: PlanIR,
-        aliases: Mapping[str, ReplayKey],
-    ) -> ModuleCatalog:
-        """Build an allowlist from selected executable static-plan steps.
-
-        Parameters
-        ----------
-        plan
-            Validated static workflow definition containing trusted module pins.
-        aliases
-            Planner-visible aliases mapped to exact replay keys in ``plan``.
-
-        Returns
-        -------
-        ModuleCatalog
-            Credential-free immutable projection of the selected definitions.
-
-        Raises
-        ------
-        ValueError
-            If an alias is invalid or a replay key is absent or non-executable.
-
-        Notes
-        -----
-        Static modules expose one aggregate input contract. A later runtime may
-        register explicit multi-port adapters with :meth:`allow` when needed.
-        """
-        by_key = {step.replay_key: step for step in plan.executable_steps}
-        catalog = cls()
-        for alias in sorted(aliases):
-            replay_key = aliases[alias]
-            if not isinstance(replay_key, ReplayKey) or replay_key not in by_key:
-                raise ValueError(f"replay key for alias {alias!r} is not in the plan")
-            step = by_key[replay_key]
-            if step.module_id is None or step.module_digest is None or step.input_binding is None:
-                raise ValueError(f"replay key for alias {alias!r} is not executable")
-            catalog = catalog.allow(
-                alias,
-                module_id=step.module_id,
-                module_digest=step.module_digest,
-                input_schema_digests=(step.input_binding.schema_digest,),
-                output_schema_digest=step.output_schema_digest,
-                execution=step.execution or ExecutionSpec().to_data(),
-                budget=Budget.from_data(step.budget) if step.budget is not None else Budget(),
-                capabilities=step.capabilities,
-                effects=step.effects,
-            )
-        return catalog
-
-    def resolve(self, alias: str) -> dict[str, Any]:
-        """Return a copy of one trusted descriptor for inspection.
-
-        Parameters
-        ----------
-        alias
-            Exact planner-visible alias to resolve.
-
-        Returns
-        -------
-        dict
-            Canonical credential-free module descriptor including its budget.
-
-        Raises
-        ------
-        KeyError
-            If the alias is not allowlisted.
-        """
-        try:
-            return self._entries[alias].to_dict()
-        except KeyError as exc:
-            raise KeyError(f"module alias {alias!r} is not allowlisted") from exc
-
-    def to_dict(self) -> dict[str, Any]:
-        """Return the canonical trusted alias descriptor mapping."""
-        return {alias: self._entries[alias].to_dict() for alias in sorted(self._entries)}
-
-    @property
-    def digest(self) -> str:
-        """Return the content digest of the complete trusted allowlist."""
-        return digest_data(self.to_dict())
-
-    def _entry(self, alias: str) -> _CatalogEntry:
-        try:
-            return self._entries[alias]
-        except KeyError as exc:
-            raise _error(
-                "PLAN_MODULE_NOT_ALLOWED",
-                f"module alias {alias!r} is not allowlisted",
-            ) from exc
-
-
 _SIGNATURE_FIELDS = {
     "aggregate_budget",
     "alias_provenance",
@@ -725,9 +399,7 @@ _SIGNATURE_FIELDS = {
     "region_input_schema_digest",
     "required_grant",
     "resolved_nodes",
-    "revision",
     "source_fragment_digest",
-    "supersedes",
     "topology_digest",
     "version",
 }
@@ -797,7 +469,7 @@ class PlanSignature:
     """Resolved behavior and provenance for one validated generated DAG.
 
     A signature contains only behavior selected from a trusted
-    :class:`ModuleCatalog`: immutable module pins, typed ports, execution
+    :class:`ModuleRegistry`: immutable module pins, typed ports, execution
     requirements, exact child grants, resource envelopes, and approval-policy
     requirements. Parsing a signature checks its shape and internal
     consistency but does **not** authorize execution. Before any future
@@ -812,9 +484,6 @@ class PlanSignature:
 
     Parameters
     ----------
-    revision, supersedes
-        Validated one-based revision and preceding fragment digest. They are
-        lineage provenance excluded from behavioral equality and digest.
     region_id
         Stable identity of the trusted dynamic region.
     region_grant, required_grant
@@ -847,8 +516,6 @@ class PlanSignature:
         Resolved signature wire-contract version.
     """
 
-    revision: int = field(compare=False)
-    supersedes: str | None = field(compare=False)
     region_id: str
     region_grant: CapabilityGrant
     required_grant: CapabilityGrant
@@ -875,21 +542,6 @@ class PlanSignature:
                 "PLAN_SIGNATURE_VERSION_UNSUPPORTED",
                 f"unsupported PlanSignature version {self.version!r}",
             )
-        _require_nonnegative_integer(
-            self.revision,
-            label="revision",
-            error_code="PLAN_SIGNATURE_INVALID",
-        )
-        if self.revision == 0:
-            raise _error("PLAN_SIGNATURE_INVALID", "revision must be at least one")
-        if self.supersedes is not None:
-            _require_digest(
-                self.supersedes, label="supersedes", error_code="PLAN_SIGNATURE_INVALID"
-            )
-        if self.revision == 1 and self.supersedes is not None:
-            raise _error("PLAN_SIGNATURE_INVALID", "initial signature supersedes must be null")
-        if self.revision > 1 and self.supersedes is None:
-            raise _error("PLAN_SIGNATURE_INVALID", "revised signature requires supersedes")
         region_id = _require_stable_name(
             self.region_id, label="region_id", error_code="PLAN_SIGNATURE_INVALID"
         )
@@ -1107,9 +759,7 @@ class PlanSignature:
                         for node_key, alias in self.alias_provenance
                     ],
                     "catalog_digest": self.catalog_digest,
-                    "revision": self.revision,
                     "source_fragment_digest": self.source_fragment_digest,
-                    "supersedes": self.supersedes,
                 }
             ),
         )
@@ -1235,8 +885,6 @@ class PlanSignature:
             ):
                 raise ValueError("aggregate_budget is not canonical")
             return cls(
-                revision=data["revision"],
-                supersedes=data["supersedes"],
                 region_id=data["region_id"],
                 region_grant=region_grant,
                 required_grant=required_grant,
@@ -1507,10 +1155,10 @@ class PlanValidator:
 
     Parameters
     ----------
-    catalog
+    registry
         Immutable allowlist that supplies all module pins and behavior metadata.
     limits
-        Hard structural, revision, and aggregate resource limits.
+        Hard structural and aggregate resource limits.
     region_id
         Stable identity of the surrounding dynamic region. It becomes part of
         the behavioral signature and prevents reuse in another region.
@@ -1528,21 +1176,21 @@ class PlanValidator:
     -----
     ``validate`` is the only operation that creates a signature from generated
     graph choices. Imported signatures remain untrusted until
-    :meth:`revalidate` rebuilds them from the source fragment, current catalog,
-    region policy, schemas, limits, and lineage.
+    :meth:`revalidate` rebuilds them from the source fragment, current registry,
+    region policy, schemas, and limits.
     """
 
     def __init__(
         self,
-        catalog: ModuleCatalog,
+        registry: ModuleRegistry,
         limits: PlanLimits,
         *,
         region_id: str,
         region_grant: CapabilityGrant,
         approval_check: Callable[[str, str, str], None] | None = None,
     ) -> None:
-        if not isinstance(catalog, ModuleCatalog):
-            raise TypeError("catalog must be a ModuleCatalog")
+        if not isinstance(registry, ModuleRegistry):
+            raise TypeError("registry must be a ModuleRegistry")
         if not isinstance(limits, PlanLimits):
             raise TypeError("limits must be PlanLimits")
         try:
@@ -1553,7 +1201,7 @@ class PlanValidator:
             raise TypeError("region_grant must be a CapabilityGrant")
         if approval_check is not None and not callable(approval_check):
             raise TypeError("approval_check must be callable or None")
-        self.catalog = catalog
+        self.registry = registry
         self.limits = limits
         self.region_id = trusted_region_id
         self.region_grant = region_grant
@@ -1565,8 +1213,6 @@ class PlanValidator:
         *,
         region_input_schema_digest: str,
         expected_output_schema_digests: tuple[str, ...],
-        expected_revision: int,
-        expected_supersedes: str | None,
     ) -> PlanSignature:
         """Validate generated topology and return its resolved signature.
 
@@ -1578,9 +1224,6 @@ class PlanValidator:
             Trusted schema supplied to the inserted dynamic region.
         expected_output_schema_digests
             Trusted ordered contracts the surrounding workflow expects back.
-        expected_revision, expected_supersedes
-            Trusted lineage state used to reject skipped, repeated, or
-            fabricated revisions.
 
         Returns
         -------
@@ -1591,7 +1234,7 @@ class PlanValidator:
         Raises
         ------
         PlanValidationError
-            If aliases, topology, schemas, lineage, limits, grants, budgets, or
+            If aliases, topology, schemas, limits, grants, budgets, or
             approval policy fail.
         """
         if not isinstance(fragment, PlanFragmentIR):
@@ -1604,11 +1247,6 @@ class PlanValidator:
             _require_digest(value, label="expected_output_schema_digest")
             for value in expected_output_schema_digests
         )
-        if type(expected_revision) is not int or expected_revision < 1:
-            raise _error("PLAN_REVISION_INVALID", "expected revision must be at least one")
-        if expected_supersedes is not None:
-            _require_digest(expected_supersedes, label="expected supersedes")
-        self._validate_lineage(fragment, expected_revision, expected_supersedes)
         signature = self._resolve_graph(fragment, region_input, expected_outputs)
         self._validate_budget(signature.aggregate_budget)
         self._validate_approvals(signature.approval_requirements)
@@ -1621,14 +1259,12 @@ class PlanValidator:
         *,
         region_input_schema_digest: str,
         expected_output_schema_digests: tuple[str, ...],
-        expected_revision: int,
-        expected_supersedes: str | None,
     ) -> PlanSignature:
         """Rebuild and authenticate an imported signature against trusted state.
 
         The method never trusts imported resolved nodes. It resolves the source
-        fragment again through this validator's current catalog, grant, limits,
-        schemas, lineage, and approval policy, then requires an exact canonical
+        fragment again through this validator's current registry, grant, limits,
+        schemas and approval policy, then requires an exact canonical
         match.
 
         Parameters
@@ -1642,8 +1278,6 @@ class PlanValidator:
             Current trusted schema supplied to ``$input`` dependency ports.
         expected_output_schema_digests
             Current ordered output contracts of the surrounding region.
-        expected_revision, expected_supersedes
-            Current trusted lineage state.
 
         Returns
         -------
@@ -1664,8 +1298,6 @@ class PlanValidator:
             fragment,
             region_input_schema_digest=region_input_schema_digest,
             expected_output_schema_digests=expected_output_schema_digests,
-            expected_revision=expected_revision,
-            expected_supersedes=expected_supersedes,
         )
         if signature.canonical_json() != rebuilt.canonical_json():
             raise _error(
@@ -1726,30 +1358,6 @@ class PlanValidator:
                     "trusted approval policy must return None",
                 )
 
-    def _validate_lineage(
-        self,
-        fragment: PlanFragmentIR,
-        expected_revision: int,
-        expected_supersedes: str | None,
-    ) -> None:
-        if fragment.revision != expected_revision:
-            raise _error(
-                "PLAN_REVISION_INVALID",
-                f"fragment revision {fragment.revision} does not match expected revision "
-                f"{expected_revision}",
-            )
-        if fragment.supersedes != expected_supersedes:
-            raise _error(
-                "PLAN_REVISION_INVALID",
-                "fragment supersedes digest does not match trusted lineage",
-            )
-        replan_count = fragment.revision - 1
-        if replan_count > self.limits.max_replans:
-            raise _error(
-                "PLAN_LIMIT_EXCEEDED",
-                f"replan count {replan_count} exceeds {self.limits.max_replans}",
-            )
-
     def _resolve_graph(
         self,
         fragment: PlanFragmentIR,
@@ -1801,7 +1409,13 @@ class PlanValidator:
 
         entries: dict[str, _CatalogEntry] = {}
         for node in fragment.nodes:
-            entries[node.key] = self.catalog._entry(node.module_alias)
+            try:
+                entries[node.key] = self.registry._entry(node.module_alias)
+            except KeyError as exc:
+                raise _error(
+                    "PLAN_MODULE_NOT_ALLOWED",
+                    f"module alias {node.module_alias!r} is not allowlisted",
+                ) from exc
             if len(node.dependencies) != len(set(node.dependencies)):
                 raise _error(
                     "PLAN_TOPOLOGY_INVALID",
@@ -1892,8 +1506,6 @@ class PlanValidator:
                 "generated plan requires access outside the trusted region grant",
             ) from exc
         return PlanSignature(
-            revision=fragment.revision,
-            supersedes=fragment.supersedes,
             region_id=self.region_id,
             region_grant=self.region_grant,
             required_grant=metrics.required_grant,
@@ -1909,7 +1521,7 @@ class PlanValidator:
             output_schema_digests=actual_outputs,
             approval_requirements=metrics.approval_requirements,
             source_fragment_digest=fragment.digest,
-            catalog_digest=self.catalog.digest,
+            catalog_digest=self.registry.digest,
             alias_provenance=tuple((node.key, node.module_alias) for node in fragment.nodes),
         )
 

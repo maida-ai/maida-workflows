@@ -163,20 +163,18 @@ release their worker lease. Typed idempotent commands later resume the task on
 any compatible worker. API and trigger callers can also supply a tenant-scoped
 start idempotency key; exact retries reuse one run and task graph.
 
-Generated planners return a minimal `PlanFragmentIR`. Trusted catalogs and
-`PlanValidator` resolve aliases to exact immutable contracts and enforce graph,
+Generated planners return a minimal `PlanFragmentIR`. One trusted
+`ModuleRegistry` supplies both validation and executable module resolution;
+`PlanValidator` resolves aliases to exact immutable contracts and enforces graph,
 grant, approval, and budget limits before `PlanMaterializer` atomically inserts
 the complete child DAG. Ordinary workers claim those tasks independently, and
 generated histories use the same graph aligner for full-stub and selective
 replay.
 
-`WorkflowInterop` reports one of three honest verification surfaces: typed
-opaque boundary, trace-aware canonical boundaries, or importable Workflow IR.
-`ExternalWorkflow` routes whole external flows through the ordinary
-capability/effect broker. Concrete provider adapters live under
-`maida.workflows.providers`; they hold SDK sessions and credentials only in
-deployment callbacks. Changing providers does not add runtime state or bypass
-effect replay denial.
+`ExternalWorkflow` represents a whole external flow at one typed
+capability/effect boundary. Deployment-owned adapters hold provider sessions
+and credentials outside serialized plans; changing providers does not add
+runtime state or bypass effect replay denial.
 
 ## Durable runtime
 

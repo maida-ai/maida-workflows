@@ -11,15 +11,11 @@ import pytest
 from maida.workflows import (
     Budget,
     CapabilityGrant,
-    DynamicPlanScheduler,
     ExecutionContext,
-    ExecutionSpec,
     Module,
-    ModuleCatalog,
-    ModuleResolverRegistry,
+    ModuleRegistry,
     PlanFragmentIR,
     PlanLimits,
-    PlanMaterializer,
     PlanNode,
     PlanValidator,
     ReplayCase,
@@ -30,7 +26,6 @@ from maida.workflows import (
     Workflow,
     WorkflowScheduler,
     bind_workflow,
-    module_digest,
 )
 from maida.workflows._canonical import canonical_json, schema_digest
 from maida.workflows.fixture import (
@@ -40,6 +35,7 @@ from maida.workflows.fixture import (
     ReplayFixtureExporter,
     load_fixture,
 )
+from maida.workflows.materialization import DynamicPlanScheduler, PlanMaterializer
 from maida.workflows.persistence import PostgresStore
 from maida.workflows.replay import ReplayContractError, ReplayEngine, ReplayStatus
 
@@ -65,8 +61,6 @@ def _fragment(*, include_double: bool = True) -> PlanFragmentIR:
         outputs = ("increment",)
     return PlanFragmentIR(
         fragment_id="generated-math",
-        revision=1,
-        supersedes=None,
         nodes=tuple(nodes),
         outputs=outputs,
     )
@@ -157,45 +151,34 @@ class TraceCounter:
 
 def _contracts(
     *, increment_amount: int = 1
-) -> tuple[ModuleCatalog, ModuleResolverRegistry, dict[ReplayKey, Module[Any, Any]]]:
+) -> tuple[ModuleRegistry, dict[ReplayKey, Module[Any, Any]]]:
     increment = Offset(increment_amount, "math.increment")
     double = Offset(2, "math.double")
     join = Join()
-    catalog = ModuleCatalog()
-    for alias, module, inputs in (
-        ("math.increment", increment, (schema_digest(int),)),
-        ("math.double", double, (schema_digest(int),)),
-        ("math.join", join, (schema_digest(int), schema_digest(int))),
-    ):
-        catalog = catalog.allow(
-            alias,
-            module_id=str(module.module_id),
-            module_digest=module_digest(module),
-            input_schema_digests=inputs,
-            output_schema_digest=schema_digest(module.output_type),
-            execution=ExecutionSpec().to_data(),
-            budget=module.budget,
-        )
-    resolver = ModuleResolverRegistry()
+    registry = ModuleRegistry(
+        modules={
+            "math.increment": lambda: increment,
+            "math.double": lambda: double,
+            "math.join": lambda: join,
+        }
+    )
     modules: dict[ReplayKey, Module[Any, Any]] = {}
     for key, module in (
         ("increment", increment),
         ("double", double),
         ("join", join),
     ):
-        resolver.register(str(module.module_id), module)
         modules[ReplayKey(str(module.module_id), f"dynamic/math-region/nodes/{key}")] = module
-    return catalog, resolver, modules
+    return registry, modules
 
 
-def _validator(catalog: ModuleCatalog) -> PlanValidator:
+def _validator(registry: ModuleRegistry) -> PlanValidator:
     return PlanValidator(
-        catalog,
+        registry,
         PlanLimits(
             10,
             5,
             5,
-            0,
             Budget(
                 wall_time=timedelta(seconds=3),
                 model_tokens=0,
@@ -223,22 +206,21 @@ async def _capture(postgres_store: PostgresStore, output: Path) -> ReplayFixture
     assert await planner_worker.run_once() is not None
     history = postgres_store.load_run_history(scheduler.run_id, tenant_id="local")
     source = next(task for task in history.tasks if task.plan_provenance is None)
-    catalog, resolver, _modules = _contracts()
-    PlanMaterializer(postgres_store, resolver).materialize(
+    registry, _modules = _contracts()
+    PlanMaterializer(postgres_store, registry).materialize(
         run_id=scheduler.run_id,
         tenant_id="local",
         source_task_id=source.task_id,
         region_instance_id="math-for-root",
         fragment=_fragment(),
-        validator=_validator(catalog),
+        validator=_validator(registry),
         expected_output_schema_digests=(schema_digest(int),),
     )
     dynamic = DynamicPlanScheduler(
         postgres_store,
-        resolver,
+        registry,
         run_id=scheduler.run_id,
         region_instance_id="math-for-root",
-        revision=1,
     )
     progress = dynamic.advance()
     for task in progress.tasks:
@@ -267,7 +249,7 @@ async def test_generated_fixture_round_trips_and_full_stub_invokes_nothing(
 ) -> None:
     fixture = await _capture(postgres_store, tmp_path / "generated")
     loaded = load_fixture(tmp_path / "generated")
-    assert loaded.version == "0.2.0"
+    assert loaded.version == "0.3.0"
     assert loaded.digest == fixture.digest
     assert len(loaded.generated_plans) == 1
     assert {key for key, _instance in loaded.generated_plans[0].node_instances} == {
@@ -290,11 +272,11 @@ async def test_generated_fixture_round_trips_and_full_stub_invokes_nothing(
         )
 
     current = GeneratedWorkflow()
-    catalog, _resolver, modules = _contracts()
+    registry, modules = _contracts()
     trace = TraceCounter()
     result = await ReplayEngine(
         trace_bridge=trace,
-        generated_validators={"math-region": _validator(catalog)},
+        generated_validators={"math-region": _validator(registry)},
         generated_modules=modules,
     ).replay(current, ReplayCase(loaded, ReplayMode.FULL_STUB))
 
@@ -305,17 +287,51 @@ async def test_generated_fixture_round_trips_and_full_stub_invokes_nothing(
 
 @pytest.mark.postgres
 @pytest.mark.asyncio
+async def test_generated_fixture_rejects_pre_realign_version(
+    postgres_store: PostgresStore, tmp_path: Path
+) -> None:
+    bundle = tmp_path / "generated-old-version"
+    await _capture(postgres_store, bundle)
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["version"] = "0.2.0"
+    manifest_path.write_text(canonical_json(manifest))
+
+    with pytest.raises(ReplayFixtureError) as captured:
+        load_fixture(bundle)
+    assert captured.value.code is FixtureErrorCode.FIXTURE_VERSION_UNSUPPORTED
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_generated_fixture_rejects_duplicate_region_occurrences(
+    postgres_store: PostgresStore, tmp_path: Path
+) -> None:
+    bundle = tmp_path / "generated-duplicate-region"
+    await _capture(postgres_store, bundle)
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["generated_plans"].append(manifest["generated_plans"][0])
+    manifest_path.write_text(canonical_json(manifest))
+
+    with pytest.raises(ReplayFixtureError, match="region occurrence") as captured:
+        load_fixture(bundle)
+    assert captured.value.code is FixtureErrorCode.FIXTURE_INVALID
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
 async def test_generated_selective_replay_runs_only_exact_changed_node(
     postgres_store: PostgresStore, tmp_path: Path
 ) -> None:
     fixture = await _capture(postgres_store, tmp_path / "generated")
-    catalog, _resolver, modules = _contracts(increment_amount=10)
+    registry, modules = _contracts(increment_amount=10)
     selected = ReplayKey("math.increment", "dynamic/math-region/nodes/increment")
     trace = TraceCounter()
 
     result = await ReplayEngine(
         trace_bridge=trace,
-        generated_validators={"math-region": _validator(catalog)},
+        generated_validators={"math-region": _validator(registry)},
         generated_modules=modules,
     ).replay(
         GeneratedWorkflow(),
@@ -337,11 +353,11 @@ async def test_selective_planner_reports_generated_topology_divergence(
 ) -> None:
     fixture = await _capture(postgres_store, tmp_path / "generated")
     current = GeneratedWorkflow(Planner(include_double=False))
-    catalog, _resolver, modules = _contracts()
+    registry, modules = _contracts()
 
     result = await ReplayEngine(
         trace_bridge=TraceCounter(),
-        generated_validators={"math-region": _validator(catalog)},
+        generated_validators={"math-region": _validator(registry)},
         generated_modules=modules,
     ).replay(
         current,

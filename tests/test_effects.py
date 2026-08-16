@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -20,8 +21,6 @@ from maida.workflows import (
     EffectSpec,
     ExecutionContext,
     Idempotency,
-    InteractionKind,
-    InteractionRequest,
     Module,
     PauseCommand,
     PolicyDecision,
@@ -54,6 +53,10 @@ SEND_MESSAGE = EffectSpec(
 @dataclass(frozen=True)
 class Receipt:
     receipt_id: str
+
+
+def _interaction_request(**payload: object) -> SimpleNamespace:
+    return SimpleNamespace(to_data=payload.copy)
 
 
 SEND_RECEIPTS = EffectSpec(
@@ -1168,9 +1171,9 @@ async def test_approved_effect_executes_but_response_schema_failure_never_commit
     envelope = parking_worker.start(envelope)
     parking_worker.park(
         envelope,
-        InteractionRequest(
+        _interaction_request(
             request_id=request_id,
-            kind=InteractionKind.APPROVAL,
+            kind="approval",
             prompt="Send the message?",
             metadata={
                 "effect_name": approved_effect.name,
@@ -1296,9 +1299,9 @@ async def test_latest_approval_cycle_must_match_the_exact_effect_request(
     assert first is not None
     parking_worker.park(
         parking_worker.start(first),
-        InteractionRequest(
+        _interaction_request(
             request_id=request_id,
-            kind=InteractionKind.APPROVAL,
+            kind="approval",
             prompt="Send this message?",
             metadata=metadata,
         ),
@@ -1308,9 +1311,9 @@ async def test_latest_approval_cycle_must_match_the_exact_effect_request(
     assert second is not None
     parking_worker.park(
         parking_worker.start(second),
-        InteractionRequest(
+        _interaction_request(
             request_id=request_id,
-            kind=InteractionKind.APPROVAL,
+            kind="approval",
             prompt="Send this message after review?",
             metadata={**metadata, **latest_metadata},
         ),
@@ -1390,9 +1393,9 @@ async def test_approval_evidence_cannot_cross_run_task_or_tenant_scope(
     assert envelope is not None
     source_worker.park(
         source_worker.start(envelope),
-        InteractionRequest(
+        _interaction_request(
             request_id=request_id,
-            kind=InteractionKind.APPROVAL,
+            kind="approval",
             prompt="Approve only this run?",
             metadata={
                 "effect_name": effect.name,

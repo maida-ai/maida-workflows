@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -9,15 +10,11 @@ import pytest
 from maida.workflows import (
     Budget,
     CapabilityGrant,
-    DynamicPlanScheduler,
     ExecutionContext,
-    ExecutionSpec,
     Module,
-    ModuleCatalog,
-    ModuleResolverRegistry,
+    ModuleRegistry,
     PlanFragmentIR,
     PlanLimits,
-    PlanMaterializer,
     PlanNode,
     PlanTaskProvenance,
     PlanValidator,
@@ -30,8 +27,12 @@ from maida.workflows import (
     module_digest,
 )
 from maida.workflows._canonical import schema_digest
-from maida.workflows.materialization import _verify_descriptor
-from maida.workflows.persistence import PostgresStore
+from maida.workflows.materialization import (
+    DynamicPlanScheduler,
+    PlanMaterializer,
+    _verify_descriptor,
+)
+from maida.workflows.persistence import InvalidRunStateError, PersistenceError, PostgresStore
 
 RESOURCE_BOUND = Budget(
     wall_time=timedelta(seconds=1),
@@ -44,8 +45,6 @@ RESOURCE_BOUND = Budget(
 def fragment() -> PlanFragmentIR:
     return PlanFragmentIR(
         fragment_id="generated-math",
-        revision=1,
-        supersedes=None,
         nodes=(
             PlanNode("increment", "math.increment", ("$input",)),
             PlanNode("double", "math.double", ("$input",)),
@@ -96,61 +95,37 @@ class Join(Module[tuple[int, int], int]):
         return value[0] + value[1]
 
 
-def generated_contracts() -> tuple[ModuleCatalog, ModuleResolverRegistry]:
+def generated_contracts() -> ModuleRegistry:
     increment = Add(1, "math.increment")
     double = Add(2, "math.double")
     join = Join()
-    catalog = ModuleCatalog()
-    for alias, module, inputs in (
-        ("math.increment", increment, (schema_digest(int),)),
-        ("math.double", double, (schema_digest(int),)),
-        ("math.join", join, (schema_digest(int), schema_digest(int))),
-    ):
-        catalog = catalog.allow(
-            alias,
-            module_id=str(module.module_id),
-            module_digest=module_digest(module),
-            input_schema_digests=inputs,
-            output_schema_digest=schema_digest(module.output_type),
-            execution=ExecutionSpec().to_data(),
-            budget=module.budget,
-        )
-    resolver = ModuleResolverRegistry()
-    for module in (increment, double, join):
-        resolver.register(str(module.module_id), module)
-    return catalog, resolver
+    return ModuleRegistry(
+        modules={
+            "math.increment": lambda: increment,
+            "math.double": lambda: double,
+            "math.join": lambda: join,
+        }
+    )
 
 
-def test_generated_module_resolver_requires_exact_trusted_identity() -> None:
+def test_registry_requires_exact_recomputed_generated_module_identity() -> None:
     module = Add(1, "math.increment")
-    resolver = ModuleResolverRegistry()
+    with pytest.raises(TypeError, match="callable"):
+        ModuleRegistry(modules={"math.increment": object()})  # type: ignore[dict-item]
+    with pytest.raises(ValueError, match="stable"):
+        ModuleRegistry(modules={"": lambda: module})
 
-    with pytest.raises(TypeError, match="Module instances"):
-        resolver.register("math.increment", object())  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="module_id"):
-        resolver.register("", module)
-    with pytest.raises(ValueError, match="definition_digest"):
-        resolver.register("math.increment", module, definition_digest="")
-
-    resolver.register("math.increment", module, definition_digest="definition")
-    assert resolver.resolve("definition", "math.increment", module_digest(module)) is module
-    with pytest.raises(ValueError, match="already registered"):
-        resolver.register("math.increment", module, definition_digest="definition")
-    with pytest.raises(LookupError, match="exact trusted"):
-        resolver.resolve("other", "math.increment", module_digest(module))
-
-    shared = ModuleResolverRegistry()
-    shared.register("math.increment", module)
-    assert shared.resolve("any-definition", "math.increment", module_digest(module)) is module
+    registry = ModuleRegistry(modules={"math.increment": lambda: module})
+    assert registry.resolve_exact("math.increment", module_digest(module)) is module
     module.amount = 2
     with pytest.raises(LookupError, match="exact trusted"):
-        shared.resolve("any-definition", "math.increment", module_digest(Add(1, "math.increment")))
+        registry.resolve_exact("math.increment", module_digest(Add(1, "math.increment")))
 
 
 def test_generated_module_descriptor_is_recomputed_before_materialization() -> None:
     module = Add(1, "math.increment")
-    catalog, _ = generated_contracts()
-    descriptor = catalog.resolve("math.increment")
+    registry = generated_contracts()
+    descriptor = registry.descriptor("math.increment")
     _verify_descriptor(module, descriptor)
 
     mutations: tuple[tuple[str, Any, str], ...] = (
@@ -167,6 +142,79 @@ def test_generated_module_descriptor_is_recomputed_before_materialization() -> N
         changed[field] = value
         with pytest.raises(ValueError, match=message):
             _verify_descriptor(module, changed)
+
+
+def test_materializer_fails_closed_before_inserting_untrusted_or_conflicting_plans() -> None:
+    registry = generated_contracts()
+    inert = cast(PostgresStore, SimpleNamespace())
+    materializer = PlanMaterializer(inert, registry)
+    arguments: dict[str, Any] = {
+        "run_id": "run",
+        "tenant_id": "local",
+        "source_task_id": "source",
+        "region_instance_id": "region",
+        "fragment": fragment(),
+        "validator": object(),
+        "expected_output_schema_digests": (schema_digest(int),),
+    }
+    with pytest.raises(TypeError, match="PlanFragmentIR"):
+        materializer.materialize(**{**arguments, "fragment": object()})
+    with pytest.raises(ValueError, match="region_instance_id"):
+        materializer.materialize(**{**arguments, "region_instance_id": ""})
+
+    empty_store = cast(
+        PostgresStore,
+        SimpleNamespace(load_run_history=lambda *args, **kwargs: SimpleNamespace(tasks=())),
+    )
+    with pytest.raises(InvalidRunStateError, match="source task"):
+        PlanMaterializer(empty_store, registry).materialize(**arguments)
+
+    source_without_boundary = SimpleNamespace(
+        task_id="source", status=TaskStatus.SUCCEEDED, accepted_boundary=None
+    )
+    missing_boundary_store = cast(
+        PostgresStore,
+        SimpleNamespace(
+            load_run_history=lambda *args, **kwargs: SimpleNamespace(
+                tasks=(source_without_boundary,)
+            )
+        ),
+    )
+    with pytest.raises(PersistenceError, match="no accepted boundary"):
+        PlanMaterializer(missing_boundary_store, registry).materialize(**arguments)
+
+    boundary = SimpleNamespace(output_value=object())
+    source = SimpleNamespace(
+        task_id="source", status=TaskStatus.SUCCEEDED, accepted_boundary=boundary
+    )
+    invalid_output_store = cast(
+        PostgresStore,
+        SimpleNamespace(
+            load_run_history=lambda *args, **kwargs: SimpleNamespace(tasks=(source,)),
+            values=SimpleNamespace(decode=lambda value: {"invalid": True}),
+        ),
+    )
+    with pytest.raises(InvalidRunStateError, match="canonical fragment"):
+        PlanMaterializer(invalid_output_store, registry).materialize(**arguments)
+
+    conflicting_history = SimpleNamespace(
+        tasks=(source,),
+        events=(
+            SimpleNamespace(
+                event_type="PLAN_MATERIALIZED",
+                payload={"region_instance_id": "region", "plan_digest": "f" * 64},
+            ),
+        ),
+    )
+    conflict_store = cast(
+        PostgresStore,
+        SimpleNamespace(
+            load_run_history=lambda *args, **kwargs: conflicting_history,
+            values=SimpleNamespace(decode=lambda value: fragment().to_dict()),
+        ),
+    )
+    with pytest.raises(InvalidRunStateError, match="different plan"):
+        PlanMaterializer(conflict_store, registry).materialize(**arguments)
 
 
 @pytest.mark.postgres
@@ -187,14 +235,13 @@ async def test_validated_plan_materializes_and_schedules_one_distributed_dag(
     )
     assert await planner_worker.run_once() is not None
     source = postgres_store.load_run_history(scheduler.run_id, tenant_id="local").tasks[0]
-    catalog, resolver = generated_contracts()
+    registry = generated_contracts()
     validator = PlanValidator(
-        catalog,
+        registry,
         PlanLimits(
             10,
             5,
             5,
-            0,
             Budget(
                 wall_time=timedelta(seconds=3),
                 model_tokens=0,
@@ -206,7 +253,7 @@ async def test_validated_plan_materializes_and_schedules_one_distributed_dag(
         region_grant=CapabilityGrant(),
     )
 
-    materialized = PlanMaterializer(postgres_store, resolver).materialize(
+    materialized = PlanMaterializer(postgres_store, registry).materialize(
         run_id=scheduler.run_id,
         tenant_id="local",
         source_task_id=source.task_id,
@@ -215,7 +262,7 @@ async def test_validated_plan_materializes_and_schedules_one_distributed_dag(
         validator=validator,
         expected_output_schema_digests=(schema_digest(int),),
     )
-    repeated = PlanMaterializer(postgres_store, resolver).materialize(
+    repeated = PlanMaterializer(postgres_store, registry).materialize(
         run_id=scheduler.run_id,
         tenant_id="local",
         source_task_id=source.task_id,
@@ -234,10 +281,9 @@ async def test_validated_plan_materializes_and_schedules_one_distributed_dag(
 
     dynamic = DynamicPlanScheduler(
         postgres_store,
-        resolver,
+        registry,
         run_id=scheduler.run_id,
         region_instance_id="math-for-root",
-        revision=1,
     )
     roots = {
         cast(PlanTaskProvenance, task.plan_provenance).node_key: task

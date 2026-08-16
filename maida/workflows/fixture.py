@@ -14,7 +14,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Never, Protocol, cast
+from typing import Any, Never, cast
 
 from ._canonical import canonical_data, canonical_json, digest_data
 from .alignment import project_execution_path
@@ -32,7 +32,7 @@ from .models import (
 )
 from .persistence import PostgresStore
 
-FIXTURE_VERSION = "0.2.0"
+FIXTURE_VERSION = "0.3.0"
 LEGACY_FIXTURE_VERSION = "0.1.0"
 
 
@@ -96,8 +96,6 @@ class GeneratedPlanRecord:
     region_instance_id: str
     source_task_id: str
     source_instance_key: str
-    revision: int
-    supersedes: str | None
     plan_digest: str
     signature: PlanSignature
     outputs: tuple[str, ...]
@@ -114,11 +112,9 @@ class GeneratedPlanRecord:
             "plan_digest": self.plan_digest,
             "region_id": self.region_id,
             "region_instance_id": self.region_instance_id,
-            "revision": self.revision,
             "signature": self.signature.to_dict(),
             "source_instance_key": self.source_instance_key,
             "source_task_id": self.source_task_id,
-            "supersedes": self.supersedes,
         }
 
     @classmethod
@@ -130,11 +126,9 @@ class GeneratedPlanRecord:
             "plan_digest",
             "region_id",
             "region_instance_id",
-            "revision",
             "signature",
             "source_instance_key",
             "source_task_id",
-            "supersedes",
         }
         if not isinstance(data, dict) or set(data) != expected:
             raise ValueError("generated plan record fields are invalid")
@@ -149,8 +143,6 @@ class GeneratedPlanRecord:
             region_instance_id=str(data["region_instance_id"]),
             source_task_id=str(data["source_task_id"]),
             source_instance_key=str(data["source_instance_key"]),
-            revision=int(data["revision"]),
-            supersedes=data["supersedes"],
             plan_digest=str(data["plan_digest"]),
             signature=PlanSignature.from_dict(data["signature"]),
             outputs=tuple(data["outputs"]),
@@ -243,25 +235,6 @@ class ReplayFixture:
     def digest(self) -> str:
         """Return the SHA-256 digest of the canonical fixture manifest."""
         return digest_data(self.to_manifest())
-
-
-class ReplayFixtureImporter(Protocol):
-    """Interface for converting an approved source into a replay fixture."""
-
-    def import_source(self, source: str) -> ReplayFixture:
-        """Import a source identifier or path as a validated fixture.
-
-        Parameters
-        ----------
-        source
-            Source-specific native run identifier or canonical bundle path.
-
-        Returns
-        -------
-        ReplayFixture
-            Validated fixture ready for replay.
-        """
-        ...
 
 
 class NativeRunFixtureImporter:
@@ -527,8 +500,6 @@ class ReplayFixtureExporter:
                 if (
                     signature.source_fragment_digest != fragment.digest
                     or signature.region_id != payload["region_id"]
-                    or signature.revision != fragment.revision
-                    or signature.supersedes != fragment.supersedes
                     or signature.outputs != fragment.outputs
                     or signature.digest != payload["signature_digest"]
                 ):
@@ -559,8 +530,6 @@ class ReplayFixtureExporter:
                         region_instance_id=str(payload["region_instance_id"]),
                         source_task_id=source_task_id,
                         source_instance_key=source_boundary.instance_key,
-                        revision=int(payload["revision"]),
-                        supersedes=payload.get("supersedes"),
                         plan_digest=fragment.digest,
                         signature=signature,
                         outputs=tuple(payload["outputs"]),
@@ -581,7 +550,6 @@ class ReplayFixtureExporter:
                 records,
                 key=lambda item: (
                     item.region_instance_id,
-                    item.revision,
                     item.plan_digest,
                 ),
             )
@@ -716,8 +684,15 @@ def _validate_loaded_integrity(fixture: ReplayFixture) -> None:
                     f"artifact {integrity.digest} size does not match its manifest",
                 )
     boundaries = {boundary.instance_key: boundary for boundary in fixture.boundaries}
+    generated_regions: set[str] = set()
     generated_instances: set[str] = set()
     for record in fixture.generated_plans:
+        if record.region_instance_id in generated_regions:
+            raise ReplayFixtureError(
+                FixtureErrorCode.FIXTURE_INVALID,
+                "generated region occurrence appears more than once",
+            )
+        generated_regions.add(record.region_instance_id)
         source = boundaries.get(record.source_instance_key)
         if source is None:
             raise ReplayFixtureError(
@@ -735,15 +710,13 @@ def _validate_loaded_integrity(fixture: ReplayFixture) -> None:
         if (
             fragment.digest != record.plan_digest
             or record.signature.source_fragment_digest != record.plan_digest
-            or fragment.revision != record.revision
-            or fragment.supersedes != record.supersedes
             or fragment.outputs != record.outputs
             or record.signature.outputs != record.outputs
             or record.signature.region_id != record.region_id
         ):
             raise ReplayFixtureError(
                 FixtureErrorCode.FIXTURE_INVALID,
-                "generated plan lineage or signature is inconsistent",
+                "generated plan provenance or signature is inconsistent",
             )
         instances = dict(record.node_instances)
         descriptors = {

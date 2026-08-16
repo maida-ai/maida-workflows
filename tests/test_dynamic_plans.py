@@ -16,7 +16,7 @@ from maida.workflows import (
     EffectSpec,
     ExecutionContext,
     Module,
-    ModuleCatalog,
+    ModuleRegistry,
     PlanFragmentIR,
     PlanLimits,
     PlanNode,
@@ -54,7 +54,6 @@ REGION_BUDGET = Budget(
     tool_calls=100,
     cost_usd=10.0,
 )
-_EXPECTED_SUPERSEDES_UNSET = object()
 
 
 class TextModule(Module[str, str]):
@@ -77,7 +76,7 @@ class TextWorkflow(Workflow[str, str]):
 
 
 def _allow(
-    catalog: ModuleCatalog,
+    catalog: ModuleRegistry,
     alias: str,
     module_id: str,
     digest_character: str,
@@ -87,7 +86,7 @@ def _allow(
     budget: Budget = NODE_BUDGET,
     capabilities: tuple[dict[str, Any], ...] = (),
     effects: tuple[dict[str, Any], ...] = (),
-) -> ModuleCatalog:
+) -> ModuleRegistry:
     return catalog.allow(
         alias,
         module_id=module_id,
@@ -101,8 +100,8 @@ def _allow(
     )
 
 
-def _catalog() -> ModuleCatalog:
-    catalog = _allow(ModuleCatalog(), "source", "modules.source", "1", (TEXT,), TEXT)
+def _catalog() -> ModuleRegistry:
+    catalog = _allow(ModuleRegistry(), "source", "modules.source", "1", (TEXT,), TEXT)
     catalog = _allow(catalog, "left", "modules.left", "2", (TEXT,), TEXT)
     catalog = _allow(catalog, "right", "modules.right", "3", (TEXT,), NUMBER)
     return _allow(catalog, "join", "modules.join", "4", (TEXT, NUMBER), FLAG)
@@ -111,15 +110,11 @@ def _catalog() -> ModuleCatalog:
 def _fragment(
     *,
     fragment_id: str = "research-plan",
-    revision: int = 1,
-    supersedes: str | None = None,
 ) -> PlanFragmentIR:
     # Generated data contains only planner-controlled graph choices. Catalog
     # pins and type contracts are deliberately absent.
     return PlanFragmentIR(
         fragment_id=fragment_id,
-        revision=revision,
-        supersedes=supersedes,
         nodes=(
             PlanNode("join", "join", ("left", "right")),
             PlanNode("right", "right", ("source",)),
@@ -133,7 +128,7 @@ def _fragment(
 def _validator(
     *,
     limits: PlanLimits | None = None,
-    catalog: ModuleCatalog | None = None,
+    catalog: ModuleRegistry | None = None,
     region_grant: CapabilityGrant = NO_ACCESS,
     approval_check: Any = None,
 ) -> PlanValidator:
@@ -144,7 +139,6 @@ def _validator(
             max_nodes=8,
             max_depth=5,
             max_fanout=3,
-            max_replans=2,
             budget=REGION_BUDGET,
         ),
         region_id="workflow.dynamic",
@@ -159,21 +153,11 @@ def _validate(
     *,
     input_schema: str = TEXT,
     output_schemas: tuple[str, ...] = (FLAG,),
-    expected_revision: int | None = None,
-    expected_supersedes: object | str | None = _EXPECTED_SUPERSEDES_UNSET,
 ) -> PlanSignature:
-    revision = fragment.revision if expected_revision is None else expected_revision
-    supersedes = (
-        fragment.supersedes
-        if expected_supersedes is _EXPECTED_SUPERSEDES_UNSET
-        else expected_supersedes
-    )
     return validator.validate(
         fragment,
         region_input_schema_digest=input_schema,
         expected_output_schema_digests=output_schemas,
-        expected_revision=revision,
-        expected_supersedes=supersedes,  # type: ignore[arg-type]
     )
 
 
@@ -181,7 +165,7 @@ def test_valid_fragment_is_minimal_canonical_and_resolved_by_trusted_validation(
     fragment = _fragment()
     signature = _validate(_validator(), fragment)
 
-    assert fragment.version == "0.1.0"
+    assert fragment.version == "0.2.0"
     assert [node.key for node in fragment.nodes] == ["join", "left", "right", "source"]
     assert (
         fragment.canonical_json() == PlanFragmentIR.from_dict(fragment.to_dict()).canonical_json()
@@ -211,11 +195,23 @@ def test_valid_fragment_is_minimal_canonical_and_resolved_by_trusted_validation(
         "fragment_id",
         "nodes",
         "outputs",
-        "revision",
-        "supersedes",
         "version",
     }
     assert set(generated["nodes"][0]) == {"dependencies", "key", "module_alias"}
+
+
+def test_pre_realign_generated_contract_versions_fail_closed() -> None:
+    fragment = _fragment().to_dict()
+    fragment["version"] = "0.1.0"
+    with pytest.raises(PlanValidationError) as fragment_error:
+        PlanFragmentIR.from_dict(fragment)
+    assert fragment_error.value.code == "PLAN_FRAGMENT_VERSION_UNSUPPORTED"
+
+    signature = _validate(_validator(), _fragment()).to_dict()
+    signature["version"] = "0.2.0"
+    with pytest.raises(PlanValidationError) as signature_error:
+        PlanSignature.from_dict(signature)
+    assert signature_error.value.code == "PLAN_SIGNATURE_VERSION_UNSUPPORTED"
 
 
 def test_behavioral_signature_ignores_fragment_label_but_tracks_resolved_behavior() -> None:
@@ -242,7 +238,6 @@ def test_behavioral_signature_ignores_fragment_label_but_tracks_resolved_behavio
             max_nodes=8,
             max_depth=5,
             max_fanout=3,
-            max_replans=2,
             budget=REGION_BUDGET,
         ),
         region_id="workflow.dynamic",
@@ -266,12 +261,12 @@ def test_resolved_signature_is_deeply_immutable() -> None:
 
 
 def test_catalog_is_the_only_source_of_module_pins_schemas_and_execution_metadata() -> None:
-    catalog = ModuleCatalog()
+    catalog = ModuleRegistry()
     allowed = _allow(catalog, "text", "modules.text", "a", (TEXT,), TEXT)
 
     assert catalog.aliases == ()
     assert allowed.aliases == ("text",)
-    assert allowed.resolve("text") == {
+    assert allowed.descriptor("text") == {
         "budget": NODE_BUDGET.to_data(),
         "capabilities": [],
         "effects": [],
@@ -284,7 +279,7 @@ def test_catalog_is_the_only_source_of_module_pins_schemas_and_execution_metadat
     with pytest.raises(ValueError, match="already registered"):
         _allow(allowed, "text", "modules.text", "a", (TEXT,), TEXT)
     with pytest.raises(KeyError, match="not allowlisted"):
-        allowed.resolve("missing")
+        allowed.descriptor("missing")
     with pytest.raises(ValueError, match="alias"):
         _allow(catalog, "$unsafe", "modules.text", "a", (TEXT,), TEXT)
 
@@ -293,7 +288,7 @@ def test_catalog_defensively_copies_and_freezes_trusted_descriptors() -> None:
     execution = dict(PROCESS_EXECUTION)
     capabilities = ["local"]
     execution["capabilities"] = capabilities
-    catalog = ModuleCatalog().allow(
+    catalog = ModuleRegistry().allow(
         "text",
         module_id="modules.text",
         module_digest="a" * 64,
@@ -306,10 +301,10 @@ def test_catalog_defensively_copies_and_freezes_trusted_descriptors() -> None:
 
     execution["isolation"] = "vm"
     capabilities[0] = "changed"
-    descriptor = catalog.resolve("text")
+    descriptor = catalog.descriptor("text")
     descriptor["execution"]["isolation"] = "vm"
 
-    assert catalog.resolve("text")["execution"]["isolation"] == "process"
+    assert catalog.descriptor("text")["execution"]["isolation"] == "process"
     assert catalog.digest == original_digest
 
 
@@ -338,7 +333,7 @@ def test_catalog_rejects_invalid_trusted_descriptors(
     descriptor.update(kwargs)
 
     with pytest.raises(ValueError, match=message):
-        ModuleCatalog().allow("text", **descriptor)
+        ModuleRegistry().allow("text", **descriptor)
 
 
 def test_catalog_projects_static_steps_and_retains_credential_free_access_contracts() -> None:
@@ -363,8 +358,8 @@ def test_catalog_projects_static_steps_and_retains_credential_free_access_contra
     plan = compile_workflow(AccessWorkflow())
     replay_key = plan.executable_steps[0].replay_key
     assert replay_key is not None
-    catalog = ModuleCatalog.from_plan(plan, {"lookup": replay_key})
-    descriptor = catalog.resolve("lookup")
+    catalog = ModuleRegistry.from_plan(plan, {"lookup": replay_key})
+    descriptor = catalog.descriptor("lookup")
 
     assert descriptor["module_id"] == "modules.records"
     assert descriptor["capabilities"] == [lookup.to_data()]
@@ -374,7 +369,7 @@ def test_catalog_projects_static_steps_and_retains_credential_free_access_contra
     assert "credentials" not in descriptor
     assert "grants" not in descriptor
     with pytest.raises(ValueError, match="replay key"):
-        ModuleCatalog.from_plan(plan, {"missing": None})  # type: ignore[dict-item]
+        ModuleRegistry.from_plan(plan, {"missing": None})  # type: ignore[dict-item]
 
 
 def test_validator_rejects_unknown_alias_and_trusted_contract_mismatches() -> None:
@@ -450,84 +445,27 @@ def test_topology_rejects_cycles_duplicate_keys_and_invalid_outputs() -> None:
 
 
 @pytest.mark.parametrize(
-    ("limits", "revision", "supersedes", "message"),
+    ("limits", "message"),
     (
-        (
-            PlanLimits(max_nodes=3, max_depth=5, max_fanout=3, max_replans=2, budget=REGION_BUDGET),
-            1,
-            None,
-            "node",
-        ),
-        (
-            PlanLimits(max_nodes=8, max_depth=2, max_fanout=3, max_replans=2, budget=REGION_BUDGET),
-            1,
-            None,
-            "depth",
-        ),
-        (
-            PlanLimits(max_nodes=8, max_depth=5, max_fanout=1, max_replans=2, budget=REGION_BUDGET),
-            1,
-            None,
-            "fanout",
-        ),
-        (
-            PlanLimits(max_nodes=8, max_depth=5, max_fanout=3, max_replans=0, budget=REGION_BUDGET),
-            2,
-            "a" * 64,
-            "replan",
-        ),
+        (PlanLimits(3, 5, 3, REGION_BUDGET), "node"),
+        (PlanLimits(8, 2, 3, REGION_BUDGET), "depth"),
+        (PlanLimits(8, 5, 1, REGION_BUDGET), "fanout"),
     ),
 )
-def test_plan_limits_fail_closed(
-    limits: PlanLimits, revision: int, supersedes: str | None, message: str
-) -> None:
-    fragment = _fragment(revision=revision, supersedes=supersedes)
+def test_plan_limits_fail_closed(limits: PlanLimits, message: str) -> None:
     with pytest.raises(PlanValidationError, match=message):
-        _validate(_validator(limits=limits), fragment)
-
-
-def test_revision_lineage_is_explicit_and_checked_against_trusted_state() -> None:
-    initial = _fragment()
-    revised = _fragment(revision=2, supersedes=initial.digest)
-    signature = _validate(_validator(), revised)
-    assert signature.revision == 2
-    assert signature.supersedes == initial.digest
-
-    with pytest.raises(PlanValidationError, match="revision"):
-        _validate(_validator(), revised, expected_revision=3)
-    with pytest.raises(PlanValidationError, match="supersedes"):
-        _validate(_validator(), revised, expected_supersedes="f" * 64)
-    with pytest.raises(PlanValidationError, match=r"initial.*supersedes"):
-        replace(initial, supersedes="a" * 64)
-    with pytest.raises(PlanValidationError, match=r"revised.*supersedes"):
-        replace(revised, supersedes=None)
-    with pytest.raises(PlanValidationError, match="at least one"):
-        _fragment(revision=0)
-
-
-def test_lineage_changes_preserve_behavioral_equality_and_digest() -> None:
-    initial = _fragment()
-    revised = _fragment(revision=2, supersedes=initial.digest)
-    initial_signature = _validate(_validator(), initial)
-    revised_signature = _validate(_validator(), revised)
-
-    assert initial_signature == revised_signature
-    assert initial_signature.topology_digest == revised_signature.topology_digest
-    assert initial_signature.digest == revised_signature.digest
-    assert initial_signature.canonical_json() != revised_signature.canonical_json()
+        _validate(_validator(limits=limits), _fragment())
 
 
 def test_plan_limits_reject_invalid_configuration() -> None:
     with pytest.raises(ValueError, match="max_nodes"):
-        PlanLimits(max_nodes=0, max_depth=1, max_fanout=1, max_replans=0, budget=UNBOUNDED)
+        PlanLimits(max_nodes=0, max_depth=1, max_fanout=1, budget=UNBOUNDED)
     with pytest.raises(ValueError, match="max_depth"):
-        PlanLimits(max_nodes=1, max_depth=0, max_fanout=1, max_replans=0, budget=UNBOUNDED)
+        PlanLimits(max_nodes=1, max_depth=0, max_fanout=1, budget=UNBOUNDED)
     with pytest.raises(ValueError, match="max_fanout"):
-        PlanLimits(max_nodes=1, max_depth=1, max_fanout=-1, max_replans=0, budget=UNBOUNDED)
-    with pytest.raises(ValueError, match="max_replans"):
-        PlanLimits(max_nodes=1, max_depth=1, max_fanout=1, max_replans=-1, budget=UNBOUNDED)
+        PlanLimits(max_nodes=1, max_depth=1, max_fanout=-1, budget=UNBOUNDED)
     with pytest.raises(ValueError, match="integer"):
-        PlanLimits(max_nodes=True, max_depth=1, max_fanout=1, max_replans=0, budget=UNBOUNDED)
+        PlanLimits(max_nodes=True, max_depth=1, max_fanout=1, budget=UNBOUNDED)
 
 
 def test_budget_and_region_authority_are_explicit_trusted_inputs() -> None:
@@ -536,7 +474,6 @@ def test_budget_and_region_authority_are_explicit_trusted_inputs() -> None:
             max_nodes=8,
             max_depth=5,
             max_fanout=3,
-            max_replans=2,
         )
     with pytest.raises(TypeError, match="region_grant"):
         PlanValidator(
@@ -545,7 +482,6 @@ def test_budget_and_region_authority_are_explicit_trusted_inputs() -> None:
                 max_nodes=8,
                 max_depth=5,
                 max_fanout=3,
-                max_replans=2,
                 budget=REGION_BUDGET,
             ),
             region_id="workflow.dynamic",
@@ -591,11 +527,6 @@ def test_strict_import_rejects_versions_shapes_and_noncanonical_node_order() -> 
     with pytest.raises(PlanValidationError, match="canonical key order"):
         PlanFragmentIR.from_dict(reordered)
 
-    malformed_lineage = _fragment(revision=2, supersedes="a" * 64).to_dict()
-    malformed_lineage["supersedes"] = "not-a-digest"
-    with pytest.raises(PlanValidationError, match="sha256"):
-        PlanFragmentIR.from_dict(malformed_lineage)
-
     with pytest.raises(PlanValidationError, match="unsupported"):
         replace(_fragment(), version="9.0.0")
     with pytest.raises(PlanValidationError, match="PlanNode"):
@@ -616,8 +547,6 @@ def test_strict_fragment_import_rejects_malformed_generated_values() -> None:
         PlanFragmentIR.from_dict(dict(encoded, outputs="join"))
     with pytest.raises(PlanValidationError, match="duplicate node key"):
         PlanFragmentIR.from_dict(dict(encoded, nodes=[*encoded["nodes"], encoded["nodes"][-1]]))
-    with pytest.raises(PlanValidationError, match="integer"):
-        PlanFragmentIR.from_dict(dict(encoded, revision="one"))
 
 
 def test_signature_import_is_strict() -> None:
@@ -666,8 +595,6 @@ def test_signature_import_rejects_invalid_shapes_lineage_and_descriptors() -> No
 
     cases: tuple[tuple[str, Any, str], ...] = (
         ("version", "9.0.0", "unsupported"),
-        ("revision", 0, "at least one"),
-        ("supersedes", "a" * 64, "initial signature supersedes"),
         ("module_composition", "source", "composition must be an array"),
         ("resolved_nodes", "source", "resolved_nodes must be an array"),
         ("outputs", "join", "outputs must be an array"),
@@ -682,11 +609,6 @@ def test_signature_import_rejects_invalid_shapes_lineage_and_descriptors() -> No
             "PLAN_SIGNATURE_INVALID",
             "PLAN_SIGNATURE_VERSION_UNSUPPORTED",
         }
-
-    revised_without_lineage = deepcopy(valid)
-    revised_without_lineage["revision"] = 2
-    with pytest.raises(PlanValidationError, match="requires supersedes"):
-        PlanSignature.from_dict(revised_without_lineage)
 
     malformed_composition = deepcopy(valid)
     malformed_composition["module_composition"] = [{"module_id": "modules.source"}]
@@ -784,8 +706,6 @@ def test_signature_import_revalidates_resolved_graph_topology_and_schemas() -> N
 def _single_fragment(alias: str = "unit") -> PlanFragmentIR:
     return PlanFragmentIR(
         fragment_id="single-plan",
-        revision=1,
-        supersedes=None,
         nodes=(PlanNode("unit", alias, ("$input",)),),
         outputs=("unit",),
     )
@@ -798,9 +718,9 @@ def _single_catalog(
     budget: Budget = NODE_BUDGET,
     capabilities: tuple[dict[str, Any], ...] = (),
     effects: tuple[dict[str, Any], ...] = (),
-) -> ModuleCatalog:
+) -> ModuleRegistry:
     return _allow(
-        ModuleCatalog(),
+        ModuleRegistry(),
         alias,
         "modules.unit",
         digest_character,
@@ -876,9 +796,9 @@ def test_alias_renames_preserve_resolved_behavior_and_digest() -> None:
         "join": "decide",
     }
     original_catalog = _catalog()
-    renamed_catalog = ModuleCatalog()
+    renamed_catalog = ModuleRegistry()
     for original_alias, renamed_alias in sorted(aliases.items()):
-        descriptor = original_catalog.resolve(original_alias)
+        descriptor = original_catalog.descriptor(original_alias)
         renamed_catalog = renamed_catalog.allow(
             renamed_alias,
             module_id=descriptor["module_id"],
@@ -919,7 +839,7 @@ def test_budget_aggregation_counts_occurrences_and_uses_dag_critical_path() -> N
         ),
         "join": Budget(wall_time=timedelta(seconds=8), model_tokens=40, tool_calls=4, cost_usd=0.0),
     }
-    catalog = ModuleCatalog()
+    catalog = ModuleRegistry()
     specifications = (
         ("source", "modules.source", "1", (TEXT,), TEXT),
         ("left", "modules.left", "2", (TEXT,), TEXT),
@@ -940,7 +860,6 @@ def test_budget_aggregation_counts_occurrences_and_uses_dag_critical_path() -> N
         max_nodes=8,
         max_depth=5,
         max_fanout=3,
-        max_replans=2,
         budget=Budget(
             wall_time=timedelta(seconds=13),
             model_tokens=100,
@@ -1004,7 +923,6 @@ def test_finite_region_budget_rejects_unbounded_child_dimension(
             max_nodes=1,
             max_depth=1,
             max_fanout=1,
-            max_replans=0,
             budget=limit,
         ),
     )
@@ -1030,7 +948,6 @@ def test_aggregate_budget_cannot_exceed_a_finite_region_limit(
         max_nodes=8,
         max_depth=5,
         max_fanout=3,
-        max_replans=2,
         budget=limit,
     )
     with pytest.raises(PlanValidationError, match=f"aggregate {dimension}") as rejected:
@@ -1049,8 +966,6 @@ def test_budget_aggregation_overflow_is_a_typed_validation_failure() -> None:
     )
     fragment = PlanFragmentIR(
         fragment_id="overflow-plan",
-        revision=1,
-        supersedes=None,
         nodes=(
             PlanNode("first", "unit", ("$input",)),
             PlanNode("second", "unit", ("first",)),
@@ -1065,7 +980,6 @@ def test_budget_aggregation_overflow_is_a_typed_validation_failure() -> None:
                     max_nodes=2,
                     max_depth=2,
                     max_fanout=1,
-                    max_replans=0,
                     budget=UNBOUNDED,
                 ),
             ),
@@ -1090,7 +1004,7 @@ def test_exact_child_grants_are_derived_and_region_escalation_is_rejected() -> N
         input_type=str,
         output_type=str,
     ).to_data()
-    catalog = ModuleCatalog().allow(
+    catalog = ModuleRegistry().allow(
         "unit",
         module_id="modules.unit",
         module_digest="a" * 64,
@@ -1206,8 +1120,6 @@ def test_signature_revalidation_rebuilds_pins_instead_of_trusting_imported_data(
             fragment,
             region_input_schema_digest=TEXT,
             expected_output_schema_digests=(TEXT,),
-            expected_revision=1,
-            expected_supersedes=None,
         )
         == trusted
     )
@@ -1217,8 +1129,6 @@ def test_signature_revalidation_rebuilds_pins_instead_of_trusting_imported_data(
             fragment,
             region_input_schema_digest=TEXT,
             expected_output_schema_digests=(TEXT,),
-            expected_revision=1,
-            expected_supersedes=None,
         )
     assert rejected.value.code == "PLAN_SIGNATURE_UNTRUSTED"
 
@@ -1290,7 +1200,7 @@ def test_public_catalog_rejects_wire_budget_in_place_of_budget_object() -> None:
         "budget": NODE_BUDGET.to_data(),
     }
     with pytest.raises(TypeError, match="budget must be a Budget"):
-        ModuleCatalog().allow("unit", **descriptor)  # type: ignore[arg-type]
+        ModuleRegistry().allow("unit", **descriptor)  # type: ignore[arg-type]
 
 
 def test_region_identity_and_limit_budget_types_fail_closed() -> None:
@@ -1301,7 +1211,6 @@ def test_region_identity_and_limit_budget_types_fail_closed() -> None:
                 max_nodes=1,
                 max_depth=1,
                 max_fanout=1,
-                max_replans=0,
                 budget=REGION_BUDGET,
             ),
             region_id="not a stable identity",
@@ -1312,7 +1221,6 @@ def test_region_identity_and_limit_budget_types_fail_closed() -> None:
             max_nodes=1,
             max_depth=1,
             max_fanout=1,
-            max_replans=0,
             budget=None,  # type: ignore[arg-type]
         )
 
@@ -1336,8 +1244,6 @@ def test_deep_generated_chain_uses_iterative_graph_validation() -> None:
     )
     fragment = PlanFragmentIR(
         fragment_id="deep-chain",
-        revision=1,
-        supersedes=None,
         nodes=nodes,
         outputs=(f"n{node_count - 1:04d}",),
     )
@@ -1349,7 +1255,6 @@ def test_deep_generated_chain_uses_iterative_graph_validation() -> None:
                     max_nodes=node_count,
                     max_depth=10,
                     max_fanout=1,
-                    max_replans=0,
                     budget=zero_budget,
                 ),
             ),
@@ -1365,7 +1270,6 @@ def test_deep_generated_chain_uses_iterative_graph_validation() -> None:
                 max_nodes=node_count,
                 max_depth=node_count,
                 max_fanout=1,
-                max_replans=0,
                 budget=zero_budget,
             ),
         ),

@@ -552,8 +552,8 @@ class ReplayEngine:
 
     def _align_generated(
         self, fixture: ReplayFixture
-    ) -> tuple[dict[tuple[str, int], PlanSignature], ReplayDivergence | None]:
-        current: dict[tuple[str, int], PlanSignature] = {}
+    ) -> tuple[dict[str, PlanSignature], ReplayDivergence | None]:
+        current: dict[str, PlanSignature] = {}
         for record in fixture.generated_plans:
             validator = self.generated_validators.get(record.region_id)
             if validator is None:
@@ -567,8 +567,6 @@ class ReplayEngine:
                     fragment,
                     region_input_schema_digest=source.input_schema_digest,
                     expected_output_schema_digests=record.signature.output_schema_digests,
-                    expected_revision=record.revision,
-                    expected_supersedes=record.supersedes,
                 )
             except PlanValidationError as exc:
                 raise ReplayContractError(
@@ -581,16 +579,16 @@ class ReplayEngine:
             if alignment.diff.first_divergence is not None:
                 change = alignment.diff.first_divergence
                 return current, ReplayDivergence(change, alignment.diff)
-            current[(record.region_instance_id, record.revision)] = signature
+            current[record.region_instance_id] = signature
         return current, None
 
     def _validate_generated_contracts(
         self,
         fixture: ReplayFixture,
-        signatures: Mapping[tuple[str, int], PlanSignature],
+        signatures: Mapping[str, PlanSignature],
     ) -> None:
         for record in fixture.generated_plans:
-            signature = signatures[(record.region_instance_id, record.revision)]
+            signature = signatures[record.region_instance_id]
             descriptors = {
                 cast(str, descriptor["key"]): descriptor for descriptor in signature.resolved_nodes
             }
@@ -690,7 +688,7 @@ class ReplayEngine:
         case: ReplayCase,
         historical_output: Any,
         built_output: RuntimeValue[Any],
-        generated_signatures: Mapping[tuple[str, int], PlanSignature],
+        generated_signatures: Mapping[str, PlanSignature],
     ) -> ReplayResult:
         selected = set(case.live_steps)
         available = {
@@ -886,7 +884,7 @@ class ReplayEngine:
         fixture: ReplayFixture,
         boundary: BoundaryRecord,
         output: Any,
-        current_signatures: Mapping[tuple[str, int], PlanSignature],
+        current_signatures: Mapping[str, PlanSignature],
     ) -> ReplayDivergence | None:
         records = tuple(
             record
@@ -908,14 +906,12 @@ class ReplayEngine:
                     fragment,
                     region_input_schema_digest=boundary.input_schema_digest,
                     expected_output_schema_digests=record.signature.output_schema_digests,
-                    expected_revision=record.revision,
-                    expected_supersedes=record.supersedes,
                 )
             except PlanValidationError as exc:
                 raise ReplayContractError(
                     f"selective planner output failed generated policy: {exc.code}"
                 ) from exc
-            current = current_signatures[(record.region_instance_id, record.revision)]
+            current = current_signatures[record.region_instance_id]
             alignment = self.aligner.align(_signature_plan(current), _signature_plan(proposed))
             if alignment.diff.first_divergence is not None:
                 return ReplayDivergence(alignment.diff.first_divergence, alignment.diff)

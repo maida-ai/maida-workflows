@@ -680,13 +680,13 @@ class PlanTaskProvenance:
         Stable dynamic-region definition and concrete runtime occurrence.
     node_key
         Generated node identity independent of declaration order.
-    plan_digest, revision
-        Exact source fragment and one-based lineage used for this occurrence.
+    plan_digest
+        Exact source fragment used for this occurrence.
 
     Notes
     -----
-    Revision and fragment digest identify an execution instance. They do not
-    enter the generated node's logical definition position.
+    The fragment digest identifies the generated execution instance. It does
+    not enter the generated node's logical definition position.
     """
 
     parent_task_id: str
@@ -694,7 +694,6 @@ class PlanTaskProvenance:
     region_instance_id: str
     node_key: str
     plan_digest: str
-    revision: int
 
     def to_data(self) -> dict[str, Any]:
         """Return canonical generated-task provenance for history and replay."""

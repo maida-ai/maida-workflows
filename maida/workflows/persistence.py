@@ -2293,7 +2293,6 @@ class PostgresStore:
                     region_instance_id=str(row["plan_region_instance_id"]),
                     node_key=str(row["plan_node_key"]),
                     plan_digest=str(row["plan_digest"]),
-                    revision=int(row["plan_revision"]),
                 )
                 if row.get("parent_task_id") is not None
                 else None

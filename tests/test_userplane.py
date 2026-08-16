@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,8 +21,6 @@ from maida.workflows.userplane import (
     ApproveCommand,
     CancelCommand,
     InputCommand,
-    InteractionKind,
-    InteractionRequest,
     PauseCommand,
     RejectCommand,
     ResumeCommand,
@@ -59,6 +58,10 @@ class UpperWorkflow(Workflow[str, str]):
 @dataclass(frozen=True)
 class Account:
     account_id: str
+
+
+def _interaction_request(**payload: object) -> SimpleNamespace:
+    return SimpleNamespace(to_data=payload.copy)
 
 
 def test_typed_commands_have_canonical_transport_payloads() -> None:
@@ -107,13 +110,7 @@ def test_typed_commands_reject_ambiguous_addresses() -> None:
         InputCommand(command_id="c-1", request_id="", value=None)
 
 
-def test_interaction_requests_validate_durable_addresses() -> None:
-    with pytest.raises(ValueError, match="request_id"):
-        InteractionRequest(request_id="", kind=InteractionKind.INPUT, prompt="Choose")
-    with pytest.raises(ValueError, match="prompt"):
-        InteractionRequest(request_id="account", kind=InteractionKind.INPUT, prompt="")
-    with pytest.raises(ValueError, match="signal_name"):
-        InteractionRequest(request_id="wake", kind=InteractionKind.SIGNAL, prompt="Continue?")
+def test_parse_commands_rejects_malformed_payloads() -> None:
     with pytest.raises(ValueError, match="type must be a string"):
         parse_command({})
     with pytest.raises(ValueError, match="command_id"):
@@ -296,9 +293,9 @@ def test_approval_and_input_requests_park_without_holding_compute(
     envelope = worker.claim()
     assert envelope is not None
     envelope = worker.start(envelope)
-    request = InteractionRequest(
+    request = _interaction_request(
         request_id="publish",
-        kind=InteractionKind.APPROVAL,
+        kind="approval",
         prompt="Publish this response?",
     )
 
@@ -319,9 +316,9 @@ def test_approval_and_input_requests_park_without_holding_compute(
     second = worker.start(second)
     worker.park(
         second,
-        InteractionRequest(
+        _interaction_request(
             request_id="publish-again",
-            kind=InteractionKind.APPROVAL,
+            kind="approval",
             prompt="Publish the revised response?",
         ),
     )
@@ -352,9 +349,9 @@ def test_signals_inputs_and_retries_are_tenant_scoped_typed_events(
     envelope = worker.start(envelope)
     worker.park(
         envelope,
-        InteractionRequest(
+        _interaction_request(
             request_id="account",
-            kind=InteractionKind.INPUT,
+            kind="input",
             prompt="Choose an account",
             schema_digest=schema_digest(Account),
         ),
@@ -407,9 +404,9 @@ def test_targeted_signal_resumes_waiting_task_and_invalid_targets_fail(
     envelope = worker.start(envelope)
     worker.park(
         envelope,
-        InteractionRequest(
+        _interaction_request(
             request_id="wake",
-            kind=InteractionKind.SIGNAL,
+            kind="signal",
             prompt="Continue processing?",
             signal_name="continue",
         ),

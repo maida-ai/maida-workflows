@@ -16,17 +16,14 @@ from maida.workflows import (
     Budget,
     CapabilityGrant,
     ExecutionContext,
-    ExecutionSpec,
     Module,
-    ModuleCatalog,
-    ModuleResolverRegistry,
+    ModuleRegistry,
     PlanFragmentIR,
     PlanLimits,
     PlanNode,
     PlanValidator,
     RuntimeValue,
     Workflow,
-    module_digest,
 )
 from maida.workflows._canonical import schema_digest
 
@@ -39,8 +36,6 @@ NODE_BUDGET = Budget(
 
 fragment = PlanFragmentIR(
     fragment_id="generated-math",
-    revision=1,
-    supersedes=None,
     nodes=(
         PlanNode("increment", "math.increment", ("$input",)),
         PlanNode("double", "math.double", ("$input",)),
@@ -101,31 +96,20 @@ class GeneratedMath(Workflow[int, dict[str, Any]]):
 increment = _Offset("math.increment", 1)
 double = _Offset("math.double", 2)
 join = _Join()
-catalog = ModuleCatalog()
-resolver = ModuleResolverRegistry()
-for alias, module, inputs in (
-    ("math.increment", increment, (schema_digest(int),)),
-    ("math.double", double, (schema_digest(int),)),
-    ("math.join", join, (schema_digest(int), schema_digest(int))),
-):
-    catalog = catalog.allow(
-        alias,
-        module_id=str(module.module_id),
-        module_digest=module_digest(module),
-        input_schema_digests=inputs,
-        output_schema_digest=schema_digest(module.output_type),
-        execution=ExecutionSpec().to_data(),
-        budget=module.budget,
-    )
-    resolver.register(str(module.module_id), module)
+registry = ModuleRegistry(
+    modules={
+        "math.increment": lambda: increment,
+        "math.double": lambda: double,
+        "math.join": lambda: join,
+    }
+)
 
 validator = PlanValidator(
-    catalog,
+    registry,
     PlanLimits(
         max_nodes=8,
         max_depth=4,
         max_fanout=4,
-        max_replans=0,
         budget=Budget(
             wall_time=timedelta(seconds=3),
             model_tokens=0,
@@ -148,6 +132,4 @@ def validate_fragment() -> None:
         fragment,
         region_input_schema_digest=schema_digest(int),
         expected_output_schema_digests=(schema_digest(int),),
-        expected_revision=1,
-        expected_supersedes=None,
     )
