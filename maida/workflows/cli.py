@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
-import os
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -21,7 +20,6 @@ from ._canonical import canonical_data
 from .alignment import GraphAligner
 from .artifacts import ArtifactStore, ValueCodec
 from .authoring import Workflow
-from .baseline import create_baseline, write_baseline
 from .fixture import (
     CanonicalBundleImporter,
     NativeRunFixtureImporter,
@@ -42,7 +40,6 @@ from .replay import (
     resolve_selectors,
 )
 from .runtime import TaskWorker, WorkflowRunner, WorkflowScheduler
-from .verification import VerificationPolicy, VerificationSuite, verify_workflow
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -291,84 +288,6 @@ def replay_command(
     _echo_data(result)
     if result.blocking:
         raise typer.Exit(1)
-
-
-@app.command("verify")
-def verify_command(
-    source: str,
-    workflow: str = typer.Option(..., "--workflow"),
-    live: list[str] | None = typer.Option(None, "--live"),
-    block_divergence: bool = typer.Option(False, "--block-divergence"),
-    block_changes: bool = typer.Option(False, "--block-changes"),
-    tenant_id: str = typer.Option("local", "--tenant"),
-    dsn: str | None = DSN_OPTION,
-    artifacts: Path = ARTIFACT_OPTION,
-) -> None:
-    selected = _load_workflow(workflow)
-    fixture = _load_fixture_source(
-        source,
-        dsn=dsn,
-        artifacts=artifacts,
-        tenant_id=tenant_id,
-    )
-    keys = resolve_selectors(compile_workflow(selected), live or [])
-    cases = [ReplayCase(fixture, ReplayMode.FULL_STUB)]
-    if keys:
-        cases.append(ReplayCase(fixture, ReplayMode.SELECTIVE, keys))
-    result = asyncio.run(
-        verify_workflow(
-            selected,
-            VerificationSuite(tuple(cases)),
-            policy=VerificationPolicy(block_divergence, block_changes),
-        )
-    )
-    _echo_data(result)
-    if result.verdict.value == "FAIL":
-        raise typer.Exit(1)
-
-
-def _baseline_command(
-    source: str,
-    output: Path,
-    tenant_id: str,
-    dsn: str | None,
-    artifacts: Path,
-    accepted: bool,
-) -> None:
-    fixture = _load_fixture_source(
-        source,
-        dsn=dsn,
-        artifacts=artifacts,
-        tenant_id=tenant_id,
-    )
-    baseline = create_baseline(
-        [fixture],
-        provenance={"accepted": accepted, "actor": os.environ.get("USER", "unknown")},
-    )
-    write_baseline(baseline, output)
-    _echo_data({"baseline_digest": baseline.digest, "output": str(output)})
-
-
-@app.command("baseline")
-def baseline_command(
-    source: str,
-    output: Path = typer.Option(..., "--output"),
-    tenant_id: str = typer.Option("local", "--tenant"),
-    dsn: str | None = DSN_OPTION,
-    artifacts: Path = ARTIFACT_OPTION,
-) -> None:
-    _baseline_command(source, output, tenant_id, dsn, artifacts, False)
-
-
-@app.command("accept")
-def accept_command(
-    source: str,
-    output: Path = typer.Option(..., "--output"),
-    tenant_id: str = typer.Option("local", "--tenant"),
-    dsn: str | None = DSN_OPTION,
-    artifacts: Path = ARTIFACT_OPTION,
-) -> None:
-    _baseline_command(source, output, tenant_id, dsn, artifacts, True)
 
 
 def main() -> None:

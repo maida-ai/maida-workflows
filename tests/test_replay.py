@@ -19,7 +19,6 @@ from maida.workflows import (
     when,
 )
 from maida.workflows.alignment import DiffKind, GraphAligner
-from maida.workflows.baseline import create_baseline
 from maida.workflows.fixture import (
     FixtureErrorCode,
     ReplayFixture,
@@ -42,12 +41,6 @@ from maida.workflows.replay import (
     resolve_selectors,
 )
 from maida.workflows.runtime import WorkflowRunner
-from maida.workflows.verification import (
-    VerificationPolicy,
-    VerificationSuite,
-    VerificationVerdict,
-    verify_workflow,
-)
 
 
 class FakeTraceBridge:
@@ -387,7 +380,7 @@ class BranchWithInsertedNegativeStep(HistoricalBranch):
 
 @pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_divergence_uses_structured_diff_and_policy_controls_blocking(
+async def test_divergence_uses_structured_diff_and_remains_diagnostic(
     postgres_store: PostgresStore,
 ) -> None:
     fixture = await capture_fixture(postgres_store, Chain(), 1)
@@ -395,15 +388,12 @@ async def test_divergence_uses_structured_diff_and_policy_controls_blocking(
     assert alignment.diff.first_divergence is not None
     assert alignment.diff.first_divergence.kind is DiffKind.INSERTION
 
-    suite = VerificationSuite((ReplayCase(fixture, ReplayMode.FULL_STUB),))
-    diagnostic = await verify_workflow(InsertedChain(), suite)
-    blocking = await verify_workflow(
+    diagnostic = await ReplayEngine(trace_bridge=FakeTraceBridge()).replay(
         InsertedChain(),
-        suite,
-        policy=VerificationPolicy(replay_divergence_blocking=True),
+        ReplayCase(fixture, ReplayMode.FULL_STUB),
     )
-    assert diagnostic.verdict is VerificationVerdict.PASS
-    assert blocking.verdict is VerificationVerdict.FAIL
+    assert diagnostic.status is ReplayStatus.REPLAY_DIVERGENCE
+    assert diagnostic.blocking is False
 
 
 @pytest.mark.postgres
@@ -597,20 +587,6 @@ def test_ambiguous_and_invalid_selectors_are_rejected() -> None:
         ReplayKey("reused-selector.shared", "first"),
         ReplayKey("reused-selector.shared", "second"),
     )
-
-
-@pytest.mark.postgres
-@pytest.mark.asyncio
-async def test_baseline_contains_digests_and_provenance_not_payloads(
-    postgres_store: PostgresStore,
-) -> None:
-    secret = "do-not-copy-this-payload"
-    fixture = await capture_fixture(postgres_store, EchoWorkflow(), secret)
-    baseline = create_baseline([fixture], provenance={"actor": "test"})
-
-    assert baseline.sources[0].fixture_digest == fixture.digest
-    assert secret not in str(baseline.to_data())
-    assert baseline.provenance == {"actor": "test"}
 
 
 def test_replay_worker_policy_scrubs_credentials_and_rejects_effect_adapters() -> None:

@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from maida.plan_contract import PlanValidationIssue
+from maida.policy import load_policy
 
 from maida.workflows import (
     Budget,
@@ -31,6 +33,7 @@ from maida.workflows import (
 from maida.workflows._canonical import schema_digest
 from maida.workflows.dynamic import _plan_from_signature
 from maida.workflows.fixture import ReplayFixtureExporter, load_fixture
+from maida.workflows.guardrail import PlanGuardrailError
 from maida.workflows.persistence import (
     InvalidRunStateError,
     PersistenceError,
@@ -310,6 +313,18 @@ async def test_generated_root_plan_varies_executes_and_exports_verifiable_histor
     assert thorough_history.definition.digest == thorough.definition_digest
     assert thorough_history.run.definition_digest == thorough.definition_digest
     assert thorough_history.run.status is RunStatus.SUCCEEDED
+    approved = next(
+        event for event in thorough_history.events if event.event_type == "PLAN_APPROVED"
+    )
+    assert approved.payload["checked_before_execution"] is True
+    assert approved.payload["artifact"]["artifact_id"]
+    proved = next(
+        event for event in thorough_history.events if event.event_type == "PLAN_EXECUTION_VERIFIED"
+    )
+    assert proved.payload == {
+        "artifact_id": approved.payload["artifact"]["artifact_id"],
+        "region_instance_id": "request-plan-root",
+    }
 
     fixture = ReplayFixtureExporter(postgres_store.values).export(
         thorough_history,
@@ -342,6 +357,81 @@ async def test_generated_root_plan_rejects_unknown_alias_before_child_insertion(
     assert not any(task.plan_provenance is not None for task in history.tasks)
     failed = next(event for event in history.events if event.event_type == "RUN_FAILED")
     assert failed.payload["code"] == "PLAN_MODULE_NOT_ALLOWED"
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_generated_root_plan_is_refused_by_core_policy_before_child_insertion(
+    postgres_store: PostgresStore,
+    tmp_path: Path,
+) -> None:
+    policy_path = tmp_path / "policy.yaml"
+    policy_path.write_text(
+        "version: 2.1\nmetrics:\n  plan_fanout: {kind: measured, direction: upper, limit: 1}\n",
+        encoding="utf-8",
+    )
+    runner = WorkflowRunner(postgres_store)
+
+    with pytest.raises(PlanGuardrailError) as captured:
+        await runner.run_generated(
+            Planner(),
+            "thorough request",
+            policy=load_policy(policy_path),
+        )
+
+    assert captured.value.code == "PLAN_FANOUT_EXCEEDED"
+    assert str(captured.value) == (
+        "PLAN REFUSED: PLAN_FANOUT_EXCEEDED\n"
+        "Plan fan-out is 2; policy allows at most 1 (plan_fanout)."
+    )
+    with postgres_store.connect() as connection:
+        row = connection.execute(
+            "SELECT run_id FROM workflow_runs ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+    assert row is not None
+    history = postgres_store.load_run_history(str(row["run_id"]), tenant_id="local")
+    assert history.run.status is RunStatus.FAILED
+    assert not any(task.plan_provenance is not None for task in history.tasks)
+    refused = next(event for event in history.events if event.event_type == "PLAN_REJECTED")
+    assert refused.payload["valid"] is False
+    assert refused.payload["issues"][0]["code"] == "PLAN_FANOUT_EXCEEDED"
+    failed = next(event for event in history.events if event.event_type == "RUN_FAILED")
+    assert failed.payload["code"] == "PLAN_FANOUT_EXCEEDED"
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_generated_root_plan_fails_closed_when_execution_diverges(
+    postgres_store: PostgresStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    issue = PlanValidationIssue(
+        code="PLAN_EXECUTION_DIVERGENCE",
+        message="Executed module did not match the approved plan.",
+        location="execution.nodes.normalize",
+    )
+    monkeypatch.setattr(
+        "maida.workflows.guardrail.PlanGuardrail.verify_execution",
+        lambda *_args, **_kwargs: (issue,),
+    )
+
+    with pytest.raises(RuntimeError, match="did not match the approved plan") as captured:
+        await WorkflowRunner(postgres_store).run_generated(Planner(), "brief request")
+
+    assert cast(Any, captured.value).code == "PLAN_EXECUTION_DIVERGENCE"
+    with postgres_store.connect() as connection:
+        row = connection.execute(
+            "SELECT run_id FROM workflow_runs ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+    assert row is not None
+    history = postgres_store.load_run_history(str(row["run_id"]), tenant_id="local")
+    assert history.run.status is RunStatus.FAILED
+    divergence = next(
+        event for event in history.events if event.event_type == "PLAN_EXECUTION_DIVERGED"
+    )
+    assert divergence.payload["issues"] == [issue.to_dict()]
+    failed = next(event for event in history.events if event.event_type == "RUN_FAILED")
+    assert failed.payload["code"] == "PLAN_EXECUTION_DIVERGENCE"
 
 
 def test_plan_boundary_rejects_untrusted_marker_configuration() -> None:

@@ -180,6 +180,14 @@ caller never computes schema, module, or execution digests. Ordinary workers
 claim child tasks independently, and generated histories retain the bootstrap
 boundary as provenance without treating the static shell as the result.
 
+Pass the core policy returned by `maida.policy.load_policy()` and, when the
+task has an accepted recurring-plan population, its core baseline data as
+`policy=` and `plan_baseline=`. The runner evaluates the canonical core
+`PlanArtifact` before definition adoption or child insertion. A refusal raises
+`maida.workflows.guardrail.PlanGuardrailError` with a stable code and readable
+reason; accepted runs retain `PLAN_APPROVED` and `PLAN_EXECUTION_VERIFIED`
+evidence in durable history.
+
 `ExternalWorkflow` represents a whole external flow at one typed
 capability/effect boundary. Deployment-owned adapters hold provider sessions
 and credentials outside serialized plans; changing providers does not add
@@ -223,7 +231,6 @@ maida-workflows diff replay-fixtures/case --workflow package.module:workflow
 maida-workflows replay replay-fixtures/case --workflow package.module:workflow --mode full-stub
 maida-workflows replay replay-fixtures/case --workflow package.module:workflow --live module:workflow.module_id
 maida-workflows replay replay-fixtures/case --workflow package.module:workflow --live step:logical-step
-maida-workflows verify replay-fixtures/case --workflow package.module:workflow
 ```
 
 Full-stub replay validates integrity/alignment and injects every accepted output;
@@ -235,11 +242,13 @@ downstream outputs. Supported effect paths always go through `ReplayBroker`;
 any effect attempt is a hard `REPLAY_EFFECT_VIOLATION`, while an explicitly
 selected `effectful` module remains stubbed.
 
-`REPLAY_DIVERGENCE` is diagnostic by default and can be promoted with
-`verify --block-divergence`. Invalid fixtures, contract-invalid injection,
-selective execution failures, budget failures, and effect violations block.
-Baselines contain fixture/population digests and provenance, never fixture
-payloads.
+`REPLAY_DIVERGENCE` remains diagnostic in the replay detail. Invalid fixtures,
+contract-invalid injection, selective execution failures, budget failures, and
+effect violations block. Product-level policy and report decisions use Maida's
+core schemas rather than a second verification container in this package.
+Replay fixtures keep private payloads in local content-addressed storage; the
+plan guardrail consumes Maida's core payload-free baseline population rather
+than defining a second baseline format here.
 
 ## Native replay demo
 

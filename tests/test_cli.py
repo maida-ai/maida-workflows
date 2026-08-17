@@ -28,11 +28,8 @@ def test_cli_help_and_compile_surface() -> None:
         "worker",
         "db",
         "trace",
-        "baseline",
         "diff",
         "replay",
-        "verify",
-        "accept",
     ):
         assert command in help_result.stdout
 
@@ -159,34 +156,6 @@ async def test_cli_exports_replays_diffs_and_baselines_native_history(
     )
     assert diffed.exit_code == 0, diffed.output
     assert '"changes": []' in diffed.stdout
-
-    baseline = tmp_path / "baseline.json"
-    accepted = runner.invoke(
-        app,
-        ["accept", str(bundle), "--output", str(baseline)],
-    )
-    assert accepted.exit_code == 0, accepted.output
-    assert baseline.is_file()
-
-    baseline_output = tmp_path / "baseline-unaccepted.json"
-    baselined = runner.invoke(
-        app,
-        ["baseline", str(bundle), "--output", str(baseline_output)],
-    )
-    assert baselined.exit_code == 0
-
-    verified = await asyncio.to_thread(
-        runner.invoke,
-        app,
-        [
-            "verify",
-            str(bundle),
-            "--workflow",
-            "examples.adversarial_workflows:AdversarialBranchWorkflow",
-        ],
-    )
-    assert verified.exit_code == 0, verified.output
-    assert '"verdict": "PASS"' in verified.stdout
 
     missing_run = runner.invoke(
         app,

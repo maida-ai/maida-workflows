@@ -144,7 +144,6 @@ from .userplane import (
     WorkflowRun,
     parse_command,
 )
-from .verification import VerificationSuite
 
 __all__ = [
     "AccessBroker",
@@ -234,7 +233,6 @@ __all__ = [
     "TaskWorker",
     "UserplaneASGI",
     "ValidationIssue",
-    "VerificationSuite",
     "WaitForSignal",
     "Workflow",
     "WorkflowBundle",

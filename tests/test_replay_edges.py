@@ -34,7 +34,6 @@ from maida.workflows.replay import (
     assert_replay_worker_environment,
 )
 from maida.workflows.runtime import WorkflowRunner
-from maida.workflows.verification import VerificationSuite, VerificationVerdict, verify_workflow
 
 
 class NoTraceBridge:
@@ -315,14 +314,6 @@ async def test_fixture_execution_instance_and_dependency_integrity_is_validated(
     broken = replace(fixture, boundaries=(missing_dependency,))
     with pytest.raises(ReplayContractError, match="unavailable dependencies"):
         await engine.replay(SingleWorkflow(), ReplayCase(broken, ReplayMode.FULL_STUB))
-
-    verification = await verify_workflow(
-        SingleWorkflow(),
-        VerificationSuite((ReplayCase(duplicate, ReplayMode.FULL_STUB),)),
-        engine=engine,
-    )
-    assert verification.verdict is VerificationVerdict.FAIL
-    assert verification.replay_results[0].error_code == "REPLAY_CONTRACT_INVALID"
 
 
 @pytest.mark.postgres
