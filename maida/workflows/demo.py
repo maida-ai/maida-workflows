@@ -151,14 +151,11 @@ def run_plan_demo(
     )
     guardrail = PlanGuardrail(policy=policy)
     evidence = guardrail.evaluate(signature)
-    metric = policy.metrics.get("plan_fanout")
-    limit = metric.limit if metric is not None else None
     return {
         "evidence": evidence,
         "execution_attempts": 0,
         "max_fanout": signature.max_fanout,
         "node_count": signature.node_count,
-        "policy_rule": f"plan_fanout <= {limit:g}" if isinstance(limit, int | float) else "none",
         "schemas": {
             "policy": POLICY_SCHEMA_VERSION,
             "report": REPORT_SCHEMA_VERSION,

@@ -197,7 +197,9 @@ evidence in durable history.
 
 The `maida demo --plan` command lazy-loads this package as an optional backend.
 Core Maida keeps working when the package is absent; only the generated-plan
-demo and runtime-plan gate require it.
+demo and runtime-plan gate require it. The core command uses
+`.maida/policy.yaml` when present, identifies the selected source in every
+result, and otherwise falls back to this package's bundled refusal policy.
 
 `ExternalWorkflow` represents a whole external flow at one typed
 capability/effect boundary. Deployment-owned adapters hold provider sessions

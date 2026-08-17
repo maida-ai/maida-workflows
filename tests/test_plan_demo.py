@@ -67,3 +67,66 @@ def test_plan_demo_planner_selects_a_smaller_graph_from_runtime_input() -> None:
     assert result["node_count"] == 2
     assert result["max_fanout"] == 1
     assert result["topology"] == "normalize -> draft"
+
+
+def test_plan_demo_uses_core_evidence_for_lower_direction_policy(tmp_path: Path) -> None:
+    policy = tmp_path / "lower-policy.yaml"
+    policy.write_text(
+        "version: 2.1\nmetrics:\n  plan_depth: {kind: measured, direction: lower, limit: 4}\n",
+        encoding="utf-8",
+    )
+
+    result = run_plan_demo(policy)
+    evidence = result["evidence"]
+
+    assert isinstance(evidence, PlanEvidence)
+    assert evidence.valid is False
+    assert evidence.issues[0].code == "PLAN_DEPTH_BELOW_MINIMUM"
+    assert "policy requires at least 4 (plan_depth)" in str(result["rendered"])
+    assert "policy_rule" not in result
+
+
+def test_plan_demo_uses_core_evidence_for_non_fanout_policy(tmp_path: Path) -> None:
+    policy = tmp_path / "module-policy.yaml"
+    policy.write_text(
+        "version: 2.1\n"
+        "metrics:\n"
+        "  plan_modules:\n"
+        "    kind: invariant\n"
+        "    allowed: [demo.normalize, demo.draft, demo.review]\n",
+        encoding="utf-8",
+    )
+
+    result = run_plan_demo(policy)
+    evidence = result["evidence"]
+
+    assert isinstance(evidence, PlanEvidence)
+    assert evidence.valid is False
+    assert evidence.issues[0].code == "PLAN_MODULE_FORBIDDEN"
+    assert "demo.publish" in str(result["rendered"])
+    assert "policy_rule" not in result
+
+
+def test_plan_demo_uses_core_evidence_for_multi_rule_policy(tmp_path: Path) -> None:
+    policy = tmp_path / "multi-rule-policy.yaml"
+    policy.write_text(
+        "version: 2.1\n"
+        "metrics:\n"
+        "  plan_depth: {kind: measured, direction: upper, limit: 2}\n"
+        "  plan_fanout: {kind: measured, direction: upper, limit: 1}\n",
+        encoding="utf-8",
+    )
+
+    result = run_plan_demo(policy)
+    evidence = result["evidence"]
+    rendered = str(result["rendered"])
+
+    assert isinstance(evidence, PlanEvidence)
+    assert evidence.valid is False
+    assert {issue.code for issue in evidence.issues} == {
+        "PLAN_DEPTH_EXCEEDED",
+        "PLAN_FANOUT_EXCEEDED",
+    }
+    assert "policy allows at most 2 (plan_depth)" in rendered
+    assert "policy allows at most 1 (plan_fanout)" in rendered
+    assert "policy_rule" not in result
