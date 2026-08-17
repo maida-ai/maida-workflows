@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from maida.plan_contract import PlanValidationIssue
-from maida.policy import load_policy
+from maida.plan_contract import PlanValidationIssue  # type: ignore[import-untyped]
+from maida.policy import load_policy  # type: ignore[import-untyped]
 
 from maida.workflows import (
     Budget,

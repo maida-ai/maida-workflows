@@ -9,7 +9,10 @@ child task. The local adapter simulates reads and effects deterministically.
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from maida.assertions import AssertionPolicy  # type: ignore[import-untyped]
 
 from maida.workflows import (
     Budget,
@@ -192,6 +195,15 @@ EXAMPLE_INPUT = "thorough request"
 EXPECTED_OUTPUT = "delivered:draft:THOROUGH REQUEST | context:thorough request"
 
 
-async def run_example(store: PostgresStore, value: str = EXAMPLE_INPUT) -> RunResult:
-    """Run the real generated-plan loop through its one-call entrypoint."""
-    return await WorkflowRunner(store, connectors=connectors).run_generated(planner, value)
+async def run_example(
+    store: PostgresStore,
+    value: str = EXAMPLE_INPUT,
+    *,
+    policy: AssertionPolicy | None = None,
+) -> RunResult:
+    """Generate a plan and gate it under an optional core policy before execution."""
+    return await WorkflowRunner(store, connectors=connectors).run_generated(
+        planner,
+        value,
+        policy=policy,
+    )

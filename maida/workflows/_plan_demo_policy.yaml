@@ -1,0 +1,6 @@
+version: 2.1
+metrics:
+  plan_fanout:
+    kind: measured
+    direction: upper
+    limit: 1

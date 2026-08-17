@@ -7,6 +7,7 @@ from types import ModuleType
 from typing import Any, cast
 
 import pytest
+from maida.policy import load_policy  # type: ignore[import-untyped]
 
 from examples.workflow_creation import (
     advanced_interactive,
@@ -22,6 +23,7 @@ from examples.workflow_creation import (
     intermediate_parallel,
 )
 from maida.workflows import BoundWorkflow, Workflow, compile_workflow
+from maida.workflows.guardrail import PlanGuardrailError
 from maida.workflows.persistence import PostgresStore
 from maida.workflows.runtime import WorkflowRunner
 
@@ -151,3 +153,24 @@ async def test_generated_example_runs_the_input_dependent_root_plan(
     assert result.output == expert_generated_workflow.EXPECTED_OUTPUT
     assert history.definition.workflow_id == "dynamic:request-plan"
     assert materialized.payload["signature"]["node_count"] == 5
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_generated_example_accepts_core_policy_and_refuses_before_children(
+    postgres_store: PostgresStore,
+    tmp_path: Path,
+) -> None:
+    policy_path = tmp_path / "policy.yaml"
+    policy_path.write_text(
+        "version: 2.1\nmetrics:\n  plan_fanout: {kind: measured, direction: upper, limit: 1}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PlanGuardrailError, match="PLAN REFUSED") as excinfo:
+        await expert_generated_workflow.run_example(
+            postgres_store,
+            policy=load_policy(policy_path),
+        )
+
+    assert excinfo.value.code == "PLAN_FANOUT_EXCEEDED"

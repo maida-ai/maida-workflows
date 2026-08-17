@@ -1,11 +1,18 @@
 # Maida Workflows
 
-Maida Workflows turns runtime planner output into a canonical, trusted plan
-before it executes. It validates generated topology against application-owned
-module contracts, schedules accepted module attempts through durable task
-envelopes, records what actually ran in PostgreSQL, and projects successful
-runs into portable replay fixtures. Static workflow authoring remains a
-convenience path onto the same durable module machinery.
+Maida Workflows is the optional generated-plan backend for Maida, the
+behavioral regression gate for AI agents. It turns runtime planner output into
+a canonical plan, validates it against application-owned module contracts and
+the core Maida policy before execution, and proves what actually ran. Static
+workflow authoring remains a convenience path onto the same durable module
+machinery.
+
+See the pre-execution gate refuse a simulated generated plan in one local,
+credential-free command:
+
+```bash
+maida demo --plan
+```
 
 The package supports:
 
@@ -187,6 +194,10 @@ task has an accepted recurring-plan population, its core baseline data as
 `maida.workflows.guardrail.PlanGuardrailError` with a stable code and readable
 reason; accepted runs retain `PLAN_APPROVED` and `PLAN_EXECUTION_VERIFIED`
 evidence in durable history.
+
+The `maida demo --plan` command lazy-loads this package as an optional backend.
+Core Maida keeps working when the package is absent; only the generated-plan
+demo and runtime-plan gate require it.
 
 `ExternalWorkflow` represents a whole external flow at one typed
 capability/effect boundary. Deployment-owned adapters hold provider sessions

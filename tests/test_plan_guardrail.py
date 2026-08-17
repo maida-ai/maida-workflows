@@ -3,13 +3,16 @@ from __future__ import annotations
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
-from maida.baseline_sample import create_baseline_from_report
-from maida.plan_contract import PlanEvidence, PlanValidationIssue
-from maida.policy import load_policy
-from maida.schema_versions import REPORT_SCHEMA_VERSION
+from maida.baseline_sample import create_baseline_from_report  # type: ignore[import-untyped]
+from maida.plan_contract import (  # type: ignore[import-untyped]
+    PlanEvidence,
+    PlanValidationIssue,
+)
+from maida.policy import load_policy  # type: ignore[import-untyped]
+from maida.schema_versions import REPORT_SCHEMA_VERSION  # type: ignore[import-untyped]
 
 from maida.workflows import (
     Budget,
@@ -90,7 +93,7 @@ LIMITS = PlanLimits(
 REGION_GRANT = CapabilityGrant(effects=(SEND.name,))
 
 
-def _signature(*, alias: str = "text.normalize", with_effect: bool = False):
+def _signature(*, alias: str = "text.normalize", with_effect: bool = False) -> Any:
     nodes = [PlanNode("normalize", alias, ("$input",))]
     outputs = ("normalize",)
     if with_effect:
@@ -117,29 +120,32 @@ def _baseline(artifact: Any) -> dict[str, Any]:
         "event_type_sequence": ["RUN_START", "RUN_END"],
         "final_status": "ok",
     }
-    return create_baseline_from_report(
-        {
-            "report_version": REPORT_SCHEMA_VERSION,
-            "metadata": {
-                "trials_used": 1,
-                "trials_budgeted": 1,
-                "environment_fingerprint": {},
-            },
-            "trials": [
-                {
-                    "trace_id": "0" * 32,
-                    "run_name": "planned-task",
-                    "metric_values": {},
-                    "invariant_outcomes": {},
-                    "structural_signature": trace_signature,
-                }
-            ],
-            "plan_evidence": [PlanEvidence(artifact=artifact, valid=True).to_dict()],
-        }
+    return cast(
+        dict[str, Any],
+        create_baseline_from_report(
+            {
+                "report_version": REPORT_SCHEMA_VERSION,
+                "metadata": {
+                    "trials_used": 1,
+                    "trials_budgeted": 1,
+                    "environment_fingerprint": {},
+                },
+                "trials": [
+                    {
+                        "trace_id": "0" * 32,
+                        "run_name": "planned-task",
+                        "metric_values": {},
+                        "invariant_outcomes": {},
+                        "structural_signature": trace_signature,
+                    }
+                ],
+                "plan_evidence": [PlanEvidence(artifact=artifact, valid=True).to_dict()],
+            }
+        ),
     )
 
 
-def _policy(tmp_path: Path, metrics: str):
+def _policy(tmp_path: Path, metrics: str) -> Any:
     path = tmp_path / "policy.yaml"
     path.write_text(f"version: 2.1\nmetrics:\n{metrics}", encoding="utf-8")
     return load_policy(path)

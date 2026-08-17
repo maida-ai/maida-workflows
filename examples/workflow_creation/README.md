@@ -148,6 +148,20 @@ The generated plan becomes the run definition. The durable bootstrap planner
 task remains only as the parent provenance for its generated children; it is
 not a static workflow shell and does not provide the run result.
 
+Pass the same core policy file used by Maida's gate to refuse a generated plan
+before any child module executes:
+
+```python
+from maida.policy import load_policy
+
+policy = load_policy(".maida/policy.yaml")
+result = await run_example(store, policy=policy)
+```
+
+For the credential-free refusal story without PostgreSQL, run
+`maida demo --plan`. The CLI uses policy 2.1, plan artifact 0.1.0, and report
+evidence 2.0.1 from the core contract rather than local schema copies.
+
 ## External systems
 
 `ExternalWorkflow` wraps a provider-owned flow as one typed, opaque boundary.
