@@ -1,9 +1,9 @@
 """Serialize workflow definitions as safe, canonical, data-only bundles.
 
-A ``.maida-workflow`` file contains editable authoring data when available,
-compiled Workflow IR, exact trusted binding requirements, and credential-free
-provenance. Loading validates bytes and digests but never imports or executes
-Python. Explicit registry or catalog binding is required before execution.
+A ``.maida-workflow`` file contains canonical Workflow IR, exact trusted
+binding requirements, and credential-free provenance. Loading validates bytes
+and digests but never imports or executes Python. Explicit registry or catalog
+binding is required before execution.
 """
 
 from __future__ import annotations
@@ -24,14 +24,13 @@ from .coordination import WorkflowCatalog
 from .definitions import BoundWorkflow, bind_workflow
 from .ir import PlanIR, ReplayKey
 from .registry import ModuleRegistry
-from .spec import WorkflowSpec, compile_workflow_spec
 
-BUNDLE_VERSION = "0.2.0"
+BUNDLE_VERSION = "0.3.0"
 DEFAULT_MAX_BUNDLE_BYTES = 16 * 1024 * 1024
 
 
 class WorkflowPortability(StrEnum):
-    """How a portable file can be rebound to trusted executable modules."""
+    """How canonical plan data can be rebound to trusted executable modules."""
 
     RECONSTRUCTABLE = "reconstructable"
     FACTORY_BOUND = "factory-bound"
@@ -49,12 +48,9 @@ class WorkflowBundle:
     ----------
     plan
         Canonical compiled Workflow IR used by scheduling and verification.
-    spec
-        Editable :class:`WorkflowSpec` for reconstructable definitions, or
-        ``None`` when arbitrary Python authoring requires an exact factory.
     binding_requirements
-        Credential-free aliases, configs, schemas, and module digests required
-        to bind the plan.
+        Credential-free module identities and digests required to bind the
+        plan.
     portability
         Trusted rebinding strategy.
     provenance
@@ -71,7 +67,7 @@ class WorkflowBundle:
 
     Examples
     --------
-    >>> bundle = WorkflowBundle.from_spec(spec, registry)  # doctest: +SKIP
+    >>> bundle = WorkflowBundle.from_plan(plan, registry)  # doctest: +SKIP
     >>> bundle.save(Path("review.maida-workflow"))  # doctest: +SKIP
     >>> bound = WorkflowBundle.load(Path("review.maida-workflow")).bind(  # doctest: +SKIP
     ...     module_registry=registry
@@ -79,7 +75,6 @@ class WorkflowBundle:
     """
 
     plan: PlanIR
-    spec: WorkflowSpec | None
     binding_requirements: tuple[Mapping[str, Any], ...]
     portability: WorkflowPortability
     provenance: Mapping[str, Any]
@@ -89,61 +84,16 @@ class WorkflowBundle:
         """Validate cross-object identity and freeze canonical metadata."""
         if self.version != BUNDLE_VERSION:
             raise WorkflowBundleError(f"unsupported workflow bundle version {self.version!r}")
-        if self.portability is WorkflowPortability.RECONSTRUCTABLE and self.spec is None:
-            raise WorkflowBundleError("reconstructable bundle requires an editable spec")
-        if self.portability is WorkflowPortability.FACTORY_BOUND and self.spec is not None:
-            raise WorkflowBundleError("factory-bound bundle cannot claim an editable spec")
-        if self.spec is not None and self.spec.workflow_id != self.plan.workflow_id:
-            raise WorkflowBundleError("workflow spec and plan identities do not match")
+        if not isinstance(self.portability, WorkflowPortability):
+            raise WorkflowBundleError("workflow bundle portability is invalid")
         requirements = tuple(
             MappingProxyType(cast(dict[str, Any], canonical_data(dict(requirement))))
             for requirement in self.binding_requirements
         )
         requirements = tuple(sorted(requirements, key=canonical_json))
         object.__setattr__(self, "binding_requirements", requirements)
-        provenance = canonical_data(dict(self.provenance))
-        if not isinstance(provenance, dict):
-            raise WorkflowBundleError("workflow bundle provenance must be an object")
+        provenance = cast(dict[str, Any], canonical_data(dict(self.provenance)))
         object.__setattr__(self, "provenance", MappingProxyType(provenance))
-
-    @classmethod
-    def from_spec(
-        cls,
-        spec: WorkflowSpec,
-        registry: ModuleRegistry,
-    ) -> WorkflowBundle:
-        """Compile editable authoring data into a reconstructable bundle.
-
-        Parameters
-        ----------
-        spec
-            Valid portable authoring definition.
-        registry
-            Trusted registry used to resolve and pin every module.
-
-        Returns
-        -------
-        WorkflowBundle
-            Canonical bundle containing both source spec and compiled plan.
-
-        Raises
-        ------
-        WorkflowBundleError
-            If the specification cannot compile through the trusted registry.
-        """
-        compilation = compile_workflow_spec(spec, registry)
-        if not compilation.ok or compilation.plan is None:
-            diagnostics = "; ".join(
-                f"{issue.code} at {issue.location}" for issue in compilation.issues
-            )
-            raise WorkflowBundleError(f"workflow spec cannot be bundled: {diagnostics}")
-        return cls(
-            plan=compilation.plan,
-            spec=spec,
-            binding_requirements=compilation.binding_requirements,
-            portability=WorkflowPortability.RECONSTRUCTABLE,
-            provenance={"source": "workflow-spec"},
-        )
 
     @classmethod
     def from_workflow(
@@ -185,7 +135,6 @@ class WorkflowBundle:
         )
         return cls(
             plan=bound.plan,
-            spec=None,
             binding_requirements=requirements,
             portability=WorkflowPortability.FACTORY_BOUND,
             provenance={"source": "python-workflow"},
@@ -196,28 +145,16 @@ class WorkflowBundle:
         """Bundle canonical PlanIR with exact trusted module requirements."""
         if not isinstance(plan, PlanIR):
             raise TypeError("plan must be PlanIR")
-        requirements: list[dict[str, Any]] = []
-        for step in plan.executable_steps:
-            if step.replay_key is None or step.module_digest is None:
-                raise WorkflowBundleError("canonical plan has incomplete module identity")
-            try:
-                registry.resolve_exact(step.replay_key.module_id, step.module_digest)
-            except (LookupError, TypeError, ValueError) as exc:
-                raise WorkflowBundleError(
-                    "canonical plan cannot bind through this module registry"
-                ) from exc
-            requirements.append(
-                {
-                    "logical_step": step.replay_key.logical_step,
-                    "module_digest": step.module_digest,
-                    "module_id": step.replay_key.module_id,
-                }
-            )
+        try:
+            requirements, _modules = _reconstruct_plan(plan, registry)
+        except (LookupError, TypeError, ValueError) as exc:
+            raise WorkflowBundleError(
+                "canonical plan cannot bind through this module registry"
+            ) from exc
         return cls(
             plan=PlanIR.from_dict(plan.to_dict()),
-            spec=None,
-            binding_requirements=tuple(requirements),
-            portability=WorkflowPortability.FACTORY_BOUND,
+            binding_requirements=requirements,
+            portability=WorkflowPortability.RECONSTRUCTABLE,
             provenance={"source": "canonical-plan"},
         )
 
@@ -272,8 +209,6 @@ class WorkflowBundle:
             "workflow_id",
             "definition_digest",
             "portability",
-            "spec",
-            "spec_digest",
             "plan",
             "bindings",
             "provenance",
@@ -294,10 +229,6 @@ class WorkflowBundle:
             if not isinstance(plan_data, Mapping):
                 raise ValueError("plan must be an object")
             plan = PlanIR.from_dict(plan_data)
-            raw_spec = data["spec"]
-            if raw_spec is not None and not isinstance(raw_spec, Mapping):
-                raise ValueError("spec must be an object or null")
-            spec = WorkflowSpec.from_dict(raw_spec) if raw_spec is not None else None
             portability = WorkflowPortability(data["portability"])
             bindings = data["bindings"]
             provenance = data["provenance"]
@@ -309,23 +240,17 @@ class WorkflowBundle:
                 raise ValueError("provenance must be an object")
             bundle = cls(
                 plan=plan,
-                spec=spec,
                 binding_requirements=tuple(cast(Mapping[str, Any], item) for item in bindings),
                 portability=portability,
                 provenance=provenance,
                 version=str(data["version"]),
             )
         except (KeyError, TypeError, ValueError) as exc:
-            if isinstance(exc, WorkflowBundleError):
-                raise
             raise WorkflowBundleError(f"workflow bundle contract is invalid: {exc}") from exc
         if data["workflow_id"] != bundle.plan.workflow_id:
             raise WorkflowBundleError("workflow bundle workflow identity is invalid")
         if data["definition_digest"] != bundle.plan.digest:
             raise WorkflowBundleError("workflow bundle definition digest is invalid")
-        expected_spec_digest = bundle.spec.digest if bundle.spec is not None else None
-        if data["spec_digest"] != expected_spec_digest:
-            raise WorkflowBundleError("workflow bundle spec digest is invalid")
         if bundle.to_dict() != dict(data):
             raise WorkflowBundleError("workflow bundle is not in canonical contract form")
         return bundle
@@ -341,8 +266,8 @@ class WorkflowBundle:
         Parameters
         ----------
         module_registry
-            Required for reconstructable specs. Every alias, configuration,
-            schema, access declaration, and digest is recomputed.
+            Required for reconstructable plans. Every module identity and
+            digest is recomputed from trusted code.
         workflow_catalog
             Required for factory-bound Python workflows. Resolution uses the
             exact persisted definition digest.
@@ -358,54 +283,25 @@ class WorkflowBundle:
             If the appropriate trust registry is missing or current behavior
             no longer matches the serialized definition.
         """
-        if self.provenance.get("source") == "canonical-plan":
+        if self.portability is WorkflowPortability.RECONSTRUCTABLE:
             if module_registry is None:
                 raise WorkflowBundleError(
                     "canonical plan bundle requires a trusted module registry"
                 )
-            modules = {}
-            map_item_keys: dict[str, str] = {}
             try:
-                for step in self.plan.executable_steps:
-                    key = step.replay_key
-                    if key is None or step.module_digest is None:
-                        raise ValueError("canonical plan module identity is incomplete")
-                    modules[key] = module_registry.resolve_exact(key.module_id, step.module_digest)
-                    if step.kind == "map_module":
-                        control = step.control or {}
-                        item_key = control.get("item_key")
-                        if not isinstance(item_key, Mapping) or set(item_key) != {"field"}:
-                            raise ValueError(
-                                "serialized map plans require a field item-key contract"
-                            )
-                        map_item_keys[step.node_id] = cast(str, item_key["field"])
+                requirements, modules = _reconstruct_plan(self.plan, module_registry)
+                if canonical_json(requirements) != canonical_json(self.binding_requirements):
+                    raise ValueError("canonical plan binding requirements changed")
                 return BoundWorkflow(
                     plan=self.plan,
                     input_type=Any,
                     output_type=Any,
-                    modules=cast(dict[ReplayKey, Any], modules),
-                    map_item_keys=map_item_keys,
+                    modules=modules,
                 )
             except (LookupError, TypeError, ValueError) as exc:
                 raise WorkflowBundleError(
                     "canonical plan bundle cannot rebind through this registry"
                 ) from exc
-        if self.portability is WorkflowPortability.RECONSTRUCTABLE:
-            if module_registry is None or self.spec is None:
-                raise WorkflowBundleError(
-                    "reconstructable bundle requires a trusted module registry"
-                )
-            compilation = compile_workflow_spec(self.spec, module_registry)
-            if not compilation.ok or compilation.bound is None or compilation.plan is None:
-                raise WorkflowBundleError("workflow bundle cannot rebind through this registry")
-            current_requirements = tuple(
-                sorted(compilation.binding_requirements, key=canonical_json)
-            )
-            if compilation.plan.canonical_json() != self.plan.canonical_json() or canonical_json(
-                current_requirements
-            ) != canonical_json(self.binding_requirements):
-                raise WorkflowBundleError("workflow bundle rebind changed its exact definition")
-            return compilation.bound
         if workflow_catalog is None:
             raise WorkflowBundleError("factory-bound bundle requires a trusted workflow catalog")
         try:
@@ -425,8 +321,6 @@ class WorkflowBundle:
             "workflow_id": self.plan.workflow_id,
             "definition_digest": self.plan.digest,
             "portability": self.portability.value,
-            "spec": self.spec.to_dict() if self.spec is not None else None,
-            "spec_digest": self.spec.digest if self.spec is not None else None,
             "plan": self.plan.to_dict(),
             "bindings": [canonical_data(item) for item in self.binding_requirements],
             "provenance": canonical_data(self.provenance),
@@ -482,6 +376,41 @@ def _unique_object(items: list[tuple[str, Any]]) -> dict[str, Any]:
             raise WorkflowBundleError(f"workflow bundle contains duplicate field {key!r}")
         result[key] = value
     return result
+
+
+def _reconstruct_plan(
+    plan: PlanIR,
+    registry: ModuleRegistry,
+) -> tuple[
+    tuple[Mapping[str, Any], ...],
+    dict[ReplayKey, Any],
+]:
+    """Resolve a canonical plan through exact trusted fixed-module identities."""
+    requirements: list[Mapping[str, Any]] = []
+    modules: dict[ReplayKey, Any] = {}
+    for step in plan.executable_steps:
+        key = step.replay_key
+        if key is None or step.module_digest is None:
+            raise ValueError("canonical plan module identity is incomplete")
+        modules[key] = registry.resolve_exact(key.module_id, step.module_digest)
+        requirements.append(
+            {
+                "logical_step": key.logical_step,
+                "module_digest": step.module_digest,
+                "module_id": key.module_id,
+            }
+        )
+        if step.kind == "map_module":
+            control = step.control or {}
+            item_key = control.get("item_key")
+            if (
+                not isinstance(item_key, Mapping)
+                or set(item_key) != {"field"}
+                or not isinstance(item_key["field"], str)
+                or not item_key["field"].strip()
+            ):
+                raise ValueError("serialized map plans require a field item-key contract")
+    return tuple(sorted(requirements, key=canonical_json)), modules
 
 
 def _fixed_aliases_by_digest(registry: ModuleRegistry) -> dict[str, str]:

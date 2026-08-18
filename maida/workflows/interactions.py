@@ -25,22 +25,6 @@ from .authoring import ExecutionContext, Module
 
 
 @dataclass(frozen=True)
-class _SchemaAnnotation:
-    schema: Mapping[str, Any]
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "schema",
-            MappingProxyType(cast(dict[str, Any], canonical_data(self.schema))),
-        )
-
-    @property
-    def __maida_schema__(self) -> Mapping[str, Any]:
-        return self.schema
-
-
-@dataclass(frozen=True)
 class ApprovalDecision:
     """Typed result of one durable approval request.
 

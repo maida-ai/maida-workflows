@@ -6,21 +6,18 @@ from typing import Any, ClassVar, cast
 import pytest
 
 from maida.workflows import (
-    BindingSpec,
     BoundWorkflow,
     ExecutionContext,
     Module,
     ModuleRegistry,
-    NodeSpec,
     RuntimeValue,
     Workflow,
+    WorkflowBundle,
     WorkflowRunner,
-    WorkflowSpec,
     bind_workflow,
-    compile_workflow_spec,
+    compile_workflow,
     when,
 )
-from maida.workflows._canonical import type_schema
 from maida.workflows.ir import ReplayKey
 from maida.workflows.persistence import PostgresStore
 
@@ -164,16 +161,6 @@ def test_bound_workflow_validates_every_pinned_step_contract() -> None:
 
 
 def test_schema_bound_workflow_validates_values_without_python_root_types() -> None:
-    spec = WorkflowSpec(
-        "schema-bound",
-        type_schema(str),
-        type_schema(str),
-        (NodeSpec.task("echo", "echo", BindingSpec.root()),),
-        BindingSpec.node("echo"),
-    )
-    bound = compile_workflow_spec(spec, ModuleRegistry(modules={"echo": lambda: Offset(1)})).bound
-    assert bound is None
-
     class Echo(Module[str, str]):
         module_id = "text.echo"
         input_type = str
@@ -182,8 +169,19 @@ def test_schema_bound_workflow_validates_values_without_python_root_types() -> N
         async def execute(self, value: str, ctx: ExecutionContext) -> str:
             return value
 
-    compiled = compile_workflow_spec(spec, ModuleRegistry(modules={"echo": Echo}))
-    schema_bound = compiled.raise_for_errors()
+    class EchoWorkflow(Workflow[str, str]):
+        workflow_id = "schema-bound"
+        input_type = str
+        output_type = str
+        echo = Echo()
+
+        def build(self, value: RuntimeValue[str]) -> RuntimeValue[str]:
+            return self.echo(value)
+
+    registry = ModuleRegistry(modules={"echo": Echo})
+    schema_bound = WorkflowBundle.from_plan(compile_workflow(EchoWorkflow()), registry).bind(
+        module_registry=registry
+    )
 
     assert schema_bound.input_type is Any
     assert schema_bound.accepts_input("value")

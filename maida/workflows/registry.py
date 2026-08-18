@@ -1,9 +1,9 @@
-"""Register trusted modules for portable and generated workflow definitions.
+"""Register trusted modules for generated-plan validation and exact rebinding.
 
-Workflow files contain stable aliases and canonical configuration, never
-Python import paths or executable code.  Applications decide which factories
-those aliases may resolve through :class:`ModuleRegistry`.  Exact module
-digests and schemas are recomputed at the trust boundary before a definition
+Generated graph choices contain stable aliases but never Python import paths or
+executable code. Canonical plan bundles contain graph-independent module
+identities and digests. Applications decide which trusted factories can satisfy
+either address, and every resolution recomputes the module contract before it
 can execute.
 """
 
@@ -62,9 +62,10 @@ class ModuleTemplate[ConfigT]:
 
     Notes
     -----
-    The factory itself is never serialized.  A portable workflow records only
-    the alias chosen by its registry, this identity/version pair, canonical
-    configuration, and the exact resolved module contract.
+    The factory and authoring configuration are never serialized by a workflow
+    bundle. The resolved module's public configuration participates in its
+    behavior digest; reconstructable plans bind that digest through an exact
+    fixed registration.
 
     Examples
     --------
@@ -281,7 +282,7 @@ class ModuleRegistry:
     Registries are application infrastructure, not durable runtime state. They
     must not contain credentials in descriptions or serialized requirements.
     Binding always recomputes module digests rather than trusting claims from a
-    workflow file.
+    canonical plan bundle.
 
     Examples
     --------
@@ -326,13 +327,13 @@ class ModuleRegistry:
         Parameters
         ----------
         alias
-            Stable registry address stored in an authoring specification.
+            Stable registry address selected by trusted authoring code.
         config
             Configuration for a parameterized template. Fixed modules accept
             only ``None`` or an empty mapping.
         expected_digest
-            Optional behavior digest pinned by a compiled definition or
-            portable bundle.
+            Optional behavior digest pinned by a compiled definition or plan
+            bundle.
 
         Returns
         -------
@@ -383,7 +384,7 @@ class ModuleRegistry:
         alias: str,
         config: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Return credential-free exact binding data for serialization.
+        """Return credential-free resolved module contract data.
 
         Parameters
         ----------

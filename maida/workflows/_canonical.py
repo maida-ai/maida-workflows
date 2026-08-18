@@ -74,9 +74,6 @@ def qualified_name(value: Any) -> str:
 
 def type_schema(annotation: Any) -> dict[str, Any]:
     """Return a small deterministic schema for runtime boundary validation."""
-    declared_schema = getattr(annotation, "__maida_schema__", None)
-    if isinstance(declared_schema, Mapping):
-        return cast(dict[str, Any], canonical_data(declared_schema))
     if annotation is Any or annotation is typing.Any:
         return {}
     if annotation is None or annotation is type(None):
@@ -124,11 +121,6 @@ def schema_digest(annotation: Any) -> str:
 
 
 def value_matches_type(value: Any, annotation: Any) -> bool:
-    declared_schema = getattr(annotation, "__maida_schema__", None)
-    if isinstance(declared_schema, Mapping):
-        from ._schema import value_matches_schema
-
-        return value_matches_schema(canonical_data(value), declared_schema)
     if annotation is Any or annotation is typing.Any:
         return True
     if value is None:
@@ -180,8 +172,6 @@ def value_matches_type(value: Any, annotation: Any) -> bool:
 
 
 def _rehydrate_value(value: Any, annotation: Any) -> Any:
-    if isinstance(getattr(annotation, "__maida_schema__", None), Mapping):
-        return value
     if dataclasses.is_dataclass(annotation) and isinstance(value, dict):
         hints = typing.get_type_hints(annotation)
         data_class = cast(typing.Callable[..., Any], annotation)

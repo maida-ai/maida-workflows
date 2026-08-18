@@ -8,11 +8,9 @@ from maida.workflows import (
     Approval,
     ApprovalDecision,
     ApproveCommand,
-    BindingSpec,
     Input,
     InputCommand,
     ModuleRegistry,
-    NodeSpec,
     RejectCommand,
     ReplayCase,
     ReplayMode,
@@ -22,13 +20,12 @@ from maida.workflows import (
     TaskWorker,
     WaitForSignal,
     Workflow,
+    WorkflowBundle,
     WorkflowRun,
     WorkflowScheduler,
-    WorkflowSpec,
     bind_workflow,
-    compile_workflow_spec,
+    compile_workflow,
 )
-from maida.workflows._canonical import type_schema
 from maida.workflows.fixture import ReplayFixtureExporter
 from maida.workflows.persistence import InvalidRunStateError, PostgresStore
 from maida.workflows.replay import ReplayEngine, ReplayStatus
@@ -43,7 +40,11 @@ class ApprovalWorkflow(Workflow[str, ApprovalDecision]):
     workflow_id = "interaction-approval"
     input_type = str
     output_type = ApprovalDecision
-    approval = Approval(str, prompt="Deploy this change?")
+    approval = Approval(
+        str,
+        prompt="Deploy this change?",
+        metadata={"audience": "release-manager"},
+    )
 
     def build(self, value: RuntimeValue[str]) -> RuntimeValue[ApprovalDecision]:
         return self.approval(value)
@@ -69,61 +70,42 @@ class SignalWorkflow(Workflow[str, int]):
         return self.signal(value)
 
 
-def approval_spec() -> WorkflowSpec:
-    return WorkflowSpec(
-        workflow_id="spec-interaction-approval",
-        input_schema=type_schema(str),
-        output_schema=type_schema(ApprovalDecision),
-        nodes=(
-            NodeSpec.approval(
-                "review",
-                BindingSpec.root(),
+class ChainedInteractionWorkflow(Workflow[str, int]):
+    workflow_id = "interaction-chain"
+    input_type = str
+    output_type = int
+    answer = Input(str, int, prompt="Answer with a number")
+    settled = WaitForSignal(int, int, name="payment.settled")
+
+    def build(self, value: RuntimeValue[str]) -> RuntimeValue[int]:
+        return self.settled(self.answer(value))
+
+
+def approval_registry() -> ModuleRegistry:
+    return ModuleRegistry(
+        modules={
+            "approval": lambda: Approval(
+                str,
                 prompt="Deploy this change?",
                 metadata={"audience": "release-manager"},
-            ),
-        ),
-        output=BindingSpec.node("review"),
+            )
+        }
     )
 
 
-def test_interactions_are_portable_explainable_workflow_spec_nodes() -> None:
-    restored = WorkflowSpec.from_dict(approval_spec().to_dict())
-    compilation = compile_workflow_spec(restored, ModuleRegistry())
+def test_interactions_compile_to_canonical_plan_nodes() -> None:
+    plan = compile_workflow(ApprovalWorkflow())
 
-    assert compilation.ok
-    assert compilation.plan is not None
-    step = compilation.plan.executable_steps[0]
+    step = plan.executable_steps[0]
     assert step.control == {"interaction": "approval"}
-    assert compilation.explanation.nodes[0]["kind"] == "approval"
+    assert step.replay_key is not None
+    assert step.replay_key.module_id == "maida.interaction.approval"
 
 
-def test_typed_input_and_signal_spec_nodes_validate_their_schemas() -> None:
-    spec = WorkflowSpec(
-        workflow_id="spec-interactions",
-        input_schema=type_schema(str),
-        output_schema=type_schema(int),
-        nodes=(
-            NodeSpec.request_input(
-                "answer",
-                BindingSpec.root(),
-                response_schema=type_schema(int),
-                prompt="Answer with a number",
-            ),
-            NodeSpec.wait_for_signal(
-                "settled",
-                BindingSpec.node("answer"),
-                payload_schema=type_schema(int),
-                name="payment.settled",
-            ),
-        ),
-        output=BindingSpec.node("settled"),
-    )
+def test_typed_input_and_signal_modules_retain_their_plan_contracts() -> None:
+    plan = compile_workflow(ChainedInteractionWorkflow())
 
-    compilation = compile_workflow_spec(spec, ModuleRegistry())
-
-    assert compilation.ok
-    assert compilation.plan is not None
-    assert [step.control for step in compilation.plan.executable_steps] == [
+    assert [step.control for step in plan.executable_steps] == [
         {"interaction": "input"},
         {"interaction": "signal", "signal_name": "payment.settled"},
     ]
@@ -177,10 +159,13 @@ async def test_interaction_handler_cannot_bypass_durable_worker_protocol() -> No
 
 @pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_spec_authored_approval_uses_the_same_durable_protocol(
+async def test_plan_rebound_approval_uses_the_same_durable_protocol(
     postgres_store: PostgresStore,
 ) -> None:
-    bound = compile_workflow_spec(approval_spec(), ModuleRegistry()).raise_for_errors()
+    registry = approval_registry()
+    bound = WorkflowBundle.from_plan(compile_workflow(ApprovalWorkflow()), registry).bind(
+        module_registry=registry
+    )
     scheduler = WorkflowScheduler.submit(postgres_store, bound, "release")
     scheduler.advance()
     worker = TaskWorker(
@@ -188,7 +173,7 @@ async def test_spec_authored_approval_uses_the_same_durable_protocol(
         workflow_id=bound.plan.workflow_id,
         definition_digest=bound.plan.digest,
         modules=bound.modules,
-        worker_id="spec-interaction-worker",
+        worker_id="plan-interaction-worker",
     )
     assert await worker.run_once() is None
     history = postgres_store.load_run_history(scheduler.run_id, tenant_id="local")
@@ -199,7 +184,7 @@ async def test_spec_authored_approval_uses_the_same_durable_protocol(
     )
 
     WorkflowRun(postgres_store, scheduler.run_id).send(
-        ApproveCommand(request_id=request_id, command_id="spec-approval")
+        ApproveCommand(request_id=request_id, command_id="plan-approval")
     )
 
     assert await worker.run_once() is not None

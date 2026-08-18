@@ -37,6 +37,7 @@ from .authoring import (
     _WorkflowBinding,
 )
 from .budget import Budget
+from .interactions import _InteractionModule
 from .model import _model_contract, _validated_model_contract
 
 IR_VERSION = "0.6.0"
@@ -817,6 +818,12 @@ class _Compiler:
                 external_input=external_input,
             )
             dependencies = input_binding.source_nodes
+            control: dict[str, Any] | None = None
+            if isinstance(binding.module, _InteractionModule):
+                control = {"interaction": binding.module.interaction_kind}
+                signal_name = getattr(binding.module, "signal_name", None)
+                if signal_name is not None:
+                    control["signal_name"] = signal_name
             step = self._module_step(
                 binding.module,
                 binding.logical_step,
@@ -824,7 +831,7 @@ class _Compiler:
                 path,
                 dependencies,
                 input_binding=input_binding,
-                control=None,
+                control=control,
             )
         elif expression.kind == "map":
             binding = expression.payload

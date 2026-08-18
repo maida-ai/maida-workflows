@@ -170,25 +170,22 @@ add authenticated plan lineage and concrete generated instances.
 Native `Workflow.build()` is the shortest authoring path for Python
 applications and emits canonical `PlanIR`. Generated planners emit only a
 restricted graph-choice mapping, which a trusted `ModuleRegistry` resolves
-directly into that same `PlanIR`. `WorkflowSpec` remains only as a temporary
-compatibility front-end for existing callers; it has no independent plan
-compiler or extra runtime representation.
+directly into that same `PlanIR`. The plan is the sole serialized graph
+representation regardless of how it was authored.
 
 ```python
-compilation = compile_workflow_spec(spec, registry)
-print(compilation.issues)
-print(compilation.explanation)
-workflow = compilation.raise_for_errors()
+plan = compile_workflow(MyWorkflow())
+bundle = WorkflowBundle.from_plan(plan, registry)
+bundle.save(Path("review.maida-workflow"))
 ```
 
 `WorkflowBundle.from_plan()` saves canonical `PlanIR` as `.maida-workflow`
-data with integrity digests and restrictive permissions. Compatibility specs
-may still accompany older bundles until their follow-on deletion task.
-Loading parses no executable code. Rebinding through the trusted registry or an
-exact factory catalog recomputes all module, schema, execution, access, model,
-and budget identities before the definition can run. Pickle, bytecode, SDK
-clients, credentials, runtime values, and execution history are never stored in
-a workflow bundle.
+data with integrity digests and restrictive permissions. Loading parses no
+executable code. Reconstructable plans rebind through a trusted module registry;
+native definitions containing Python-only behavior rebind through an exact
+factory catalog. Both paths recompute their trusted module or definition
+identities before the plan can run. Pickle, bytecode, SDK clients, credentials,
+runtime values, and execution history are never stored in a workflow bundle.
 
 ## Interactions, generated graphs, and integrations
 
