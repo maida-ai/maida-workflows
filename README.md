@@ -99,6 +99,16 @@ substrate-specific. Canonical plan data, module and occurrence identity,
 dependency order, typed input/output digests, grants, budgets, effect evidence,
 and plan approval/execution proof are the portable verified surface.
 
+## Documentation
+
+Full guide and reference in [`docs/`](docs/index.md): quickstart, concepts, an
+end-to-end tutorial, connectors and effects, fan-out plans, human boundaries,
+[execution substrates](docs/substrates.md), a [Composio
+recipe](docs/integrations/composio.md), and all 105 exports.
+
+Build it locally with `make docs` (output in `site/`), or read the Markdown
+directly on GitHub.
+
 ## Run the real path
 
 The command above is the shortest gate demonstration. To execute accepted
