@@ -7,11 +7,12 @@ policy, and only an accepted plan can execute.
 
 Examples are organized by reliability boundary, not by authoring difficulty.
 Static composition depth is ordinary Python authoring, not a product
-capability. The four examples each exercise one distinct boundary:
+capability. The five examples each exercise one distinct boundary:
 
 | Example | What actually runs |
 | --- | --- |
 | `generated_plan.py` | Two input-dependent plans through `WorkflowRunner.run_generated()` |
+| `celery_backend.py` | The brief generated plan through the real Celery adapter and an offline transport stub |
 | `serialized_plan.py` | Registry-bound canonical plan data through the ordinary runner |
 | `approval_boundary.py` | A task that parks, receives a durable approval, and resumes |
 | `external_boundary.py` | An external effect through a deterministic deployment-owned adapter |
@@ -108,8 +109,17 @@ The output is deterministic:
 delivered:draft:THOROUGH REQUEST | context:thorough request
 ```
 
-Change the import to `serialized_plan`, `approval_boundary`, or
-`external_boundary` to execute the other examples with the same store.
+Change the import to `celery_backend`, `serialized_plan`, `approval_boundary`,
+or `external_boundary` to execute the other examples with the same store.
+
+## Celery execution backend
+
+`celery_backend.py` uses the same `CeleryBackend` API as a deployment. Its
+eager task replaces only Celery's broker and worker pool so the example remains
+offline; the adapter still JSON-round-trips the strict execution request and
+the registered handler still resolves trusted modules and commits real durable
+boundaries. Queue routing, retry timing, worker identity, and compute placement
+are intentionally not part of the Maida plan or the cross-backend comparison.
 
 ## Canonical serialized plan
 

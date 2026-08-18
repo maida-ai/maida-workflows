@@ -7,6 +7,7 @@ import pytest
 
 from maida.workflows import (
     ExecutionContext,
+    ExecutionRequest,
     ExecutionSpec,
     ExecutorCapabilities,
     LocalExecutor,
@@ -296,9 +297,22 @@ async def test_durable_dag_runs_across_executors_and_recovers_a_dead_vm(
             capabilities=VM_CAPABILITIES,
         )
     )
-    assert live_worker.worker_id == "vm-42"
-    assert live_worker.capabilities == VM_CAPABILITIES
-    assert await live_worker.run_once() is not None
+    live_task = next(
+        task
+        for task in postgres_store.load_run_history(scheduler.run_id, tenant_id="tenant-a").tasks
+        if task.status is TaskStatus.READY
+    )
+
+    def request(task_id: str) -> ExecutionRequest:
+        return ExecutionRequest(
+            run_id=scheduler.run_id,
+            tenant_id="tenant-a",
+            workflow_id=scheduler.plan.workflow_id,
+            definition_digest=scheduler.plan.digest,
+            task_id=task_id,
+        )
+
+    assert await live_worker.execute(request(live_task.task_id))
     assert scheduler.advance().ready_tasks == 0
 
     time.sleep(recovery_lease.total_seconds() + 0.05)
@@ -312,7 +326,7 @@ async def test_durable_dag_runs_across_executors_and_recovers_a_dead_vm(
             capabilities=VM_CAPABILITIES,
         )
     )
-    assert await recovery_worker.run_once() is not None
+    assert await recovery_worker.execute(request(dead_envelope.task_id))
 
     assert scheduler.advance().ready_tasks == 1
     join_worker = LocalExecutor(
@@ -325,7 +339,12 @@ async def test_durable_dag_runs_across_executors_and_recovers_a_dead_vm(
             capabilities=VM_CAPABILITIES,
         )
     )
-    assert await join_worker.run_once() is not None
+    join_task = next(
+        task
+        for task in postgres_store.load_run_history(scheduler.run_id, tenant_id="tenant-a").tasks
+        if task.status is TaskStatus.READY
+    )
+    assert await join_worker.execute(request(join_task.task_id))
     terminal = scheduler.advance()
 
     assert terminal.status is RunStatus.SUCCEEDED

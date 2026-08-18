@@ -11,6 +11,7 @@ from maida.policy import load_policy  # type: ignore[import-untyped]
 from examples import adversarial_workflows, userplane_quickstart
 from examples.workflow_creation import (
     approval_boundary,
+    celery_backend,
     external_boundary,
     generated_plan,
     serialized_plan,
@@ -24,6 +25,7 @@ SHIPPED_EXAMPLE_MODULES = {
     "examples.native_replay_demo",
     "examples.userplane_quickstart",
     "examples.workflow_creation.approval_boundary",
+    "examples.workflow_creation.celery_backend",
     "examples.workflow_creation.external_boundary",
     "examples.workflow_creation.generated_plan",
     "examples.workflow_creation.serialized_plan",
@@ -45,7 +47,7 @@ def test_shipped_example_inventory_has_execution_coverage() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "module",
-    (approval_boundary, external_boundary, serialized_plan),
+    (approval_boundary, celery_backend, external_boundary, serialized_plan),
     ids=lambda module: module.__name__.rsplit(".", maxsplit=1)[-1],
 )
 async def test_specialized_examples_execute_offline(

@@ -27,8 +27,7 @@ from .fixture import (
     ReplayFixtureError,
     ReplayFixtureExporter,
 )
-from .ir import _compile_workflow_graph, compile_workflow
-from .models import ExecutorCapabilities
+from .ir import compile_workflow
 from .persistence import PersistenceError, PostgresStore
 from .replay import (
     ReplayCase,
@@ -36,10 +35,9 @@ from .replay import (
     ReplayMode,
     ReplaySelectorError,
     assert_replay_worker_environment,
-    build_module_registry,
     resolve_selectors,
 )
-from .runtime import TaskWorker, WorkflowRunner, WorkflowScheduler
+from .runtime import WorkflowRunner
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -139,88 +137,6 @@ def run_command(
         )
     )
     _echo_data(result)
-
-
-@app.command("submit")
-def submit_command(
-    workflow: str = typer.Option(..., "--workflow"),
-    input_json: str = typer.Option(..., "--input", help="Canonical JSON workflow input."),
-    tenant_id: str = typer.Option("local", "--tenant"),
-    dsn: str | None = DSN_OPTION,
-    artifacts: Path = ARTIFACT_OPTION,
-) -> None:
-    selected = _load_workflow(workflow)
-    scheduler = WorkflowScheduler.submit(
-        _store(dsn, artifacts),
-        selected,
-        json.loads(input_json),
-        tenant_id=tenant_id,
-    )
-    progress = scheduler.advance()
-    _echo_data(
-        {
-            "run_id": scheduler.run_id,
-            "definition_digest": scheduler.plan.digest,
-            "status": progress.status,
-            "ready_tasks": progress.ready_tasks,
-        }
-    )
-
-
-@app.command("schedule")
-def schedule_command(
-    run_id: str,
-    workflow: str = typer.Option(..., "--workflow"),
-    tenant_id: str = typer.Option("local", "--tenant"),
-    dsn: str | None = DSN_OPTION,
-    artifacts: Path = ARTIFACT_OPTION,
-) -> None:
-    scheduler = WorkflowScheduler.resume(
-        _store(dsn, artifacts),
-        _load_workflow(workflow),
-        run_id,
-        tenant_id=tenant_id,
-    )
-    _echo_data(scheduler.advance())
-
-
-@app.command("worker")
-def worker_command(
-    workflow: str = typer.Option(..., "--workflow"),
-    worker_id: str = typer.Option("workflow-worker", "--worker-id"),
-    isolation: list[str] | None = typer.Option(None, "--isolation"),
-    image: list[str] | None = typer.Option(None, "--image"),
-    cpu: int | None = typer.Option(None, "--cpu"),
-    memory: str | None = typer.Option(None, "--memory"),
-    capability: list[str] | None = typer.Option(None, "--capability"),
-    dsn: str | None = DSN_OPTION,
-    artifacts: Path = ARTIFACT_OPTION,
-) -> None:
-    selected = _load_workflow(workflow)
-    compiled = _compile_workflow_graph(selected)
-    plan = compiled.plan
-    try:
-        capabilities = ExecutorCapabilities(
-            isolations=frozenset(isolation or ["process"]),
-            images=frozenset(image or []),
-            cpu=cpu,
-            memory=memory,
-            capabilities=frozenset(capability or []),
-        )
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    worker = TaskWorker(
-        _store(dsn, artifacts),
-        workflow_id=plan.workflow_id,
-        definition_digest=plan.digest,
-        modules=build_module_registry(selected, plan, output=compiled.output),
-        worker_id=worker_id,
-        capabilities=capabilities,
-    )
-    boundary = asyncio.run(worker.run_once())
-    _echo_data(
-        {"claimed": boundary is not None, "boundary": boundary.to_data() if boundary else None}
-    )
 
 
 @trace_app.command("export")

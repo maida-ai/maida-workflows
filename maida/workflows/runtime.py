@@ -2,9 +2,10 @@
 
 The runtime records runs, tasks, attempts, accepted boundary values, usage, and
 control decisions through a :class:`DurableRuntimeStore`. Control-plane
-services use :class:`WorkflowScheduler`; executor services use
-:class:`TaskWorker`. :class:`WorkflowRunner` hosts both roles only as a local
-development convenience.
+services use :class:`WorkflowScheduler`; trusted boundary handlers use
+:class:`TaskWorker`. :class:`WorkflowRunner` dispatches exact task identities
+through an :class:`ExecutionBackend`, defaulting only to the local reference
+fixture.
 """
 
 from __future__ import annotations
@@ -319,6 +320,88 @@ class RunResult:
 
 
 @dataclass(frozen=True)
+class ExecutionRequest:
+    """Address one ready Maida task without choosing how it is dispatched.
+
+    The request contains only Maida-owned identity and tenancy fields. Queue
+    names, retry policy, worker pools, credentials, and compute placement stay
+    with the selected execution backend.
+    """
+
+    run_id: str
+    tenant_id: str
+    workflow_id: str
+    definition_digest: str
+    task_id: str
+
+    def __post_init__(self) -> None:
+        """Reject incomplete identity and malformed definition digests."""
+        for name in ("run_id", "tenant_id", "workflow_id", "task_id"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty string")
+        if (
+            not isinstance(self.definition_digest, str)
+            or len(self.definition_digest) != 64
+            or any(character not in "0123456789abcdef" for character in self.definition_digest)
+        ):
+            raise ValueError("definition_digest must be a lowercase sha256 digest")
+
+    @property
+    def execution_id(self) -> str:
+        """Return the stable idempotency key shared with an execution backend."""
+        return digest_data(
+            {
+                "definition_digest": self.definition_digest,
+                "run_id": self.run_id,
+                "task_id": self.task_id,
+                "tenant_id": self.tenant_id,
+                "workflow_id": self.workflow_id,
+            }
+        )
+
+    def to_data(self) -> dict[str, str]:
+        """Return the canonical transport mapping accepted by backends."""
+        return {
+            "definition_digest": self.definition_digest,
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "tenant_id": self.tenant_id,
+            "workflow_id": self.workflow_id,
+        }
+
+    @classmethod
+    def from_data(cls, data: Mapping[str, Any]) -> ExecutionRequest:
+        """Strictly decode an execution request from untrusted transport data."""
+        expected = {
+            "definition_digest",
+            "run_id",
+            "task_id",
+            "tenant_id",
+            "workflow_id",
+        }
+        if not isinstance(data, Mapping) or set(data) != expected:
+            raise ValueError("execution request fields do not match the transport contract")
+        if any(not isinstance(data[field], str) for field in expected):
+            raise ValueError("execution request fields must be strings")
+        return cls(
+            run_id=cast(str, data["run_id"]),
+            tenant_id=cast(str, data["tenant_id"]),
+            workflow_id=cast(str, data["workflow_id"]),
+            definition_digest=cast(str, data["definition_digest"]),
+            task_id=cast(str, data["task_id"]),
+        )
+
+
+class ExecutionBackend(Protocol):
+    """Dispatch one exact task while preserving Maida's identity contract."""
+
+    async def execute(self, request: ExecutionRequest) -> bool:
+        """Wait until the addressed task is accepted or cannot be dispatched."""
+        ...
+
+
+@dataclass(frozen=True)
 class TaskEnvelope:
     """Small transport-safe control envelope returned by a worker claim.
 
@@ -517,6 +600,52 @@ class TaskWorker:
         )
         return TaskEnvelope.from_claim(claim) if claim is not None else None
 
+    def validate_request(self, request: ExecutionRequest) -> Task:
+        """Resolve an exact transport request without crossing run or tenant scope."""
+        if request.workflow_id != self.workflow_id:
+            raise RuntimeContractError("execution request workflow does not match worker")
+        if request.definition_digest != self.definition_digest:
+            raise RuntimeContractError("execution request definition does not match worker")
+        history = self.store.load_run_history(
+            request.run_id,
+            tenant_id=request.tenant_id,
+        )
+        task = next(
+            (item for item in history.tasks if item.task_id == request.task_id),
+            None,
+        )
+        if task is None or task.run_id != request.run_id:
+            raise RuntimeContractError("execution request task does not belong to its run")
+        boundary = task.accepted_boundary
+        if boundary is not None:
+            matches_definition = (
+                boundary.workflow_id == request.workflow_id
+                and boundary.definition_digest == request.definition_digest
+            )
+        else:
+            matches_definition = (
+                history.definition.workflow_id == request.workflow_id
+                and history.run.definition_digest == request.definition_digest
+            )
+        if not matches_definition:
+            raise RuntimeContractError("execution request does not match its persisted run")
+        return cast(Task, task)
+
+    async def run_request(self, request: ExecutionRequest) -> bool:
+        """Execute one validated backend request or accept an idempotent redelivery."""
+        self.validate_request(request)
+        boundary = await self.run_once(task_id=request.task_id)
+        if boundary is not None:
+            return True
+        history = self.store.load_run_history(
+            request.run_id,
+            tenant_id=request.tenant_id,
+        )
+        return any(
+            task.task_id == request.task_id and task.status is TaskStatus.SUCCEEDED
+            for task in history.tasks
+        )
+
     def start(self, envelope: TaskEnvelope) -> TaskEnvelope:
         """Start a claimed attempt using its current lease token."""
         return TaskEnvelope.from_claim(self.store.start_task(envelope._claim()))
@@ -636,37 +765,6 @@ class TaskWorker:
         finally:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
-
-    async def serve(
-        self,
-        *,
-        stop: Callable[[], bool],
-        poll_interval: float = 0.25,
-    ) -> int:
-        """Poll and execute compatible tasks until ``stop`` returns true.
-
-        Parameters
-        ----------
-        stop
-            Caller-owned predicate used for graceful process shutdown.
-        poll_interval
-            Delay after an empty claim pass.
-
-        Returns
-        -------
-        int
-            Number of accepted boundaries produced by this worker.
-        """
-        if poll_interval <= 0:
-            raise ValueError("poll_interval must be positive")
-        processed = 0
-        while not stop():
-            boundary = await self.run_once()
-            if boundary is None:
-                await asyncio.sleep(poll_interval)
-            else:
-                processed += 1
-        return processed
 
     async def _heartbeat_loop(
         self,
@@ -867,54 +965,21 @@ class TaskWorker:
         return self.complete(envelope, boundary)
 
 
-class Executor(Protocol):
-    """Infrastructure adapter that runs claim-capable workers.
-
-    A conforming executor may use the current process, a container, a warm VM,
-    or a remote worker. Workflow and scheduler semantics depend only on the
-    worker protocol, never on how the environment is provisioned.
-    """
-
-    @property
-    def worker_id(self) -> str:
-        """Return the diagnostic identity used for physical attempts."""
-        ...
-
-    @property
-    def capabilities(self) -> ExecutorCapabilities:
-        """Return environments and resources this executor can satisfy."""
-        ...
-
-    async def run_once(self) -> BoundaryRecord | None:
-        """Claim, start, and finish at most one compatible task."""
-        ...
-
-
 class LocalExecutor:
-    """Run the standard worker protocol in the current Python process.
+    """Reference fixture that executes one task in the current Python process.
 
-    This executor is intended for development and tests. It does not bypass the
-    durable queue: every module still starts from a claimable task envelope and
-    commits through the same lease-token compare-and-swap boundary used by
-    remote executors.
+    This is the offline standalone implementation, not a product surface or a
+    workflow engine. It exists for examples and tests while preserving the same
+    Maida identity, budget, grant, and accepted-boundary checks used by external
+    backends.
     """
 
     def __init__(self, worker: TaskWorker) -> None:
         self.worker = worker
 
-    @property
-    def worker_id(self) -> str:
-        """Return the wrapped worker's diagnostic identity."""
-        return self.worker.worker_id
-
-    @property
-    def capabilities(self) -> ExecutorCapabilities:
-        """Return the wrapped worker's executor capabilities."""
-        return self.worker.capabilities
-
-    async def run_once(self) -> BoundaryRecord | None:
-        """Execute at most one compatible durable task."""
-        return await self.worker.run_once()
+    async def execute(self, request: ExecutionRequest) -> bool:
+        """Execute the exact requested task and report durable acceptance."""
+        return await self.worker.run_request(request)
 
 
 def key_for(claim: ClaimedTask) -> ReplayKey:
@@ -1521,20 +1586,21 @@ def _bootstrap_plan(planner: Module[Any, Any]) -> PlanIR:
 
 
 class WorkflowRunner:
-    """Run the durable scheduler and local executor as a development convenience.
+    """Run a plan through an execution backend as a development convenience.
 
-    Production deployments should run :class:`WorkflowScheduler` and workers in
-    separate processes. This facade preserves the same queue, lease, and task
-    envelope semantics while hosting both roles in one process for local use.
+    With no backend this facade uses :class:`LocalExecutor`, the offline
+    reference fixture rather than a product scheduler. Production applications
+    supply an external backend and keep its queues, retries, worker pools, and
+    compute placement outside Maida.
 
     Parameters
     ----------
     store
         Durable runtime store used by both the scheduler and local worker.
     worker_id
-        Diagnostic worker identity recorded on physical attempts.
+        Diagnostic worker identity used only by the local reference fixture.
     max_attempts
-        Maximum physical attempts allowed for each logical task result.
+        Maximum physical attempts used only by the local reference fixture.
     connectors
         Provider-neutral read/effect adapter registry. The runner creates a fresh
         :class:`~maida.workflows.access.AccessBroker` for every task attempt;
@@ -1545,12 +1611,16 @@ class WorkflowRunner:
         need a durable evidence reference verified against that same task.
     model_adapters
         Provider adapter registry used only at declared model boundaries.
+    backend
+        Optional external execution backend. When omitted, the reference
+        in-process fixture executes exact ready tasks.
 
     Notes
     -----
-    ``ExecutionSpec.capabilities`` controls which executor may claim a task. It
-    is intentionally separate from connector authorization, which is derived
-    exclusively from the module's compiled capability and effect declarations.
+    The reference fixture uses ``ExecutionSpec.capabilities`` for eligibility;
+    external backends own their routing and compute posture. Executor labels are
+    intentionally separate from connector authorization, which is derived only
+    from compiled capability and effect declarations.
     """
 
     def __init__(
@@ -1562,6 +1632,7 @@ class WorkflowRunner:
         connectors: ConnectorRegistry | None = None,
         access_policy: AccessPolicy | None = None,
         model_adapters: ModelAdapterRegistry | None = None,
+        backend: ExecutionBackend | None = None,
     ) -> None:
         self.store = store
         self.worker_id = worker_id
@@ -1569,6 +1640,26 @@ class WorkflowRunner:
         self.connectors = connectors or ConnectorRegistry()
         self.access_policy = access_policy
         self.model_adapters = model_adapters or ModelAdapterRegistry()
+        self.backend = backend
+
+    async def _execute_request(
+        self,
+        request: ExecutionRequest,
+        local: LocalExecutor | None,
+    ) -> bool:
+        backend = self.backend or local
+        if backend is None:  # pragma: no cover - callers always supply the fixture
+            raise RuntimeExecutionError("no execution backend is configured")
+        accepted = await backend.execute(request)
+        if not accepted:
+            return False
+        history = self.store.load_run_history(request.run_id, tenant_id=request.tenant_id)
+        task = next((item for item in history.tasks if item.task_id == request.task_id), None)
+        if task is None or task.status is not TaskStatus.SUCCEEDED:
+            raise RuntimeContractError(
+                "execution backend reported acceptance without a durable boundary"
+            )
+        return True
 
     async def run[InputT, OutputT](
         self,
@@ -1587,19 +1678,23 @@ class WorkflowRunner:
             tenant_id=tenant_id,
             execution_mode=execution_mode,
         )
-        executor = LocalExecutor(
-            TaskWorker(
-                self.store,
-                workflow_id=scheduler.plan.workflow_id,
-                definition_digest=scheduler.plan.digest,
-                modules=definition.modules,
-                worker_id=self.worker_id,
-                max_attempts=self.max_attempts,
-                capabilities=ExecutorCapabilities.local_process(),
-                connectors=self.connectors,
-                access_policy=self.access_policy,
-                model_adapters=self.model_adapters,
+        executor = (
+            LocalExecutor(
+                TaskWorker(
+                    self.store,
+                    workflow_id=scheduler.plan.workflow_id,
+                    definition_digest=scheduler.plan.digest,
+                    modules=definition.modules,
+                    worker_id=self.worker_id,
+                    max_attempts=self.max_attempts,
+                    capabilities=ExecutorCapabilities.local_process(),
+                    connectors=self.connectors,
+                    access_policy=self.access_policy,
+                    model_adapters=self.model_adapters,
+                )
             )
+            if self.backend is None
+            else None
         )
         last_error: Exception | None = None
         while True:
@@ -1615,15 +1710,37 @@ class WorkflowRunner:
                 if last_error is not None:
                     raise last_error
                 raise RuntimeExecutionError(f"run {scheduler.run_id} failed")
+            history = self.store.load_run_history(scheduler.run_id, tenant_id=tenant_id)
+            ready = next(
+                (
+                    task
+                    for task in sorted(history.tasks, key=lambda item: item.task_id)
+                    if task.status is TaskStatus.READY
+                ),
+                None,
+            )
+            if ready is None:
+                raise RuntimeExecutionError("no ready task is available for execution")
+            request = ExecutionRequest(
+                run_id=scheduler.run_id,
+                tenant_id=tenant_id,
+                workflow_id=scheduler.plan.workflow_id,
+                definition_digest=scheduler.plan.digest,
+                task_id=ready.task_id,
+            )
             try:
-                boundary = await executor.run_once()
+                accepted = await self._execute_request(request, executor)
             except Exception as exc:
+                if self.backend is not None:
+                    raise
                 last_error = exc
                 continue
-            if boundary is None:
+            if not accepted:
                 raise RuntimeExecutionError(
-                    "no local executor can claim the remaining durable tasks; "
-                    "start an executor matching their execution requirements"
+                    "no reference executor can claim the remaining durable tasks; "
+                    "configure an external backend matching their execution requirements"
+                    if self.backend is None
+                    else "the execution backend did not accept the remaining durable task"
                 )
 
     async def run_generated[InputT, OutputT](
@@ -1683,22 +1800,38 @@ class WorkflowRunner:
             history = self.store.load_run_history(run.run_id, tenant_id=tenant_id)
             source = next(task for task in history.tasks if task.task_id == source.task_id)
             if source.status is not TaskStatus.SUCCEEDED:
-                planner_worker = TaskWorker(
-                    self.store,
+                planner_executor = (
+                    LocalExecutor(
+                        TaskWorker(
+                            self.store,
+                            workflow_id=bootstrap.workflow_id,
+                            definition_digest=bootstrap.digest,
+                            modules={cast(ReplayKey, planner_step.replay_key): planner},
+                            worker_id=self.worker_id,
+                            max_attempts=self.max_attempts,
+                            capabilities=ExecutorCapabilities.local_process(),
+                            connectors=self.connectors,
+                            access_policy=self.access_policy,
+                            model_adapters=self.model_adapters,
+                        )
+                    )
+                    if self.backend is None
+                    else None
+                )
+                attempts = self.max_attempts if self.backend is None else 1
+                request = ExecutionRequest(
+                    run_id=run.run_id,
+                    tenant_id=tenant_id,
                     workflow_id=bootstrap.workflow_id,
                     definition_digest=bootstrap.digest,
-                    modules={cast(ReplayKey, planner_step.replay_key): planner},
-                    worker_id=self.worker_id,
-                    max_attempts=self.max_attempts,
-                    capabilities=ExecutorCapabilities.local_process(),
-                    connectors=self.connectors,
-                    access_policy=self.access_policy,
-                    model_adapters=self.model_adapters,
+                    task_id=source.task_id,
                 )
-                for _attempt in range(self.max_attempts):
+                for _attempt in range(attempts):
                     try:
-                        accepted = await planner_worker.run_once(task_id=source.task_id)
+                        accepted = await self._execute_request(request, planner_executor)
                     except Exception:
+                        if self.backend is not None:
+                            raise
                         history = self.store.load_run_history(run.run_id, tenant_id=tenant_id)
                         source = next(
                             task for task in history.tasks if task.task_id == source.task_id
@@ -1706,9 +1839,9 @@ class WorkflowRunner:
                         if source.status is TaskStatus.FAILED:
                             raise
                         continue
-                    if accepted is None:
+                    if not accepted:
                         raise RuntimeExecutionError(
-                            "the local executor cannot claim the bootstrap planner task"
+                            "the execution backend did not accept the bootstrap planner task"
                         )
                     break
 
@@ -1828,22 +1961,47 @@ class WorkflowRunner:
                     )
                     self.store.complete_run(run.run_id, root_output)
                     return RunResult(run.run_id, output, generated_plan.digest)
-                worker = scheduler.worker(
-                    worker_id=self.worker_id,
-                    max_attempts=self.max_attempts,
-                    capabilities=ExecutorCapabilities.local_process(),
-                    connectors=self.connectors,
-                    access_policy=self.access_policy,
-                    model_adapters=self.model_adapters,
+                ready = next(
+                    (
+                        task
+                        for task in sorted(progress.tasks, key=lambda item: item.task_id)
+                        if task.status is TaskStatus.READY
+                    ),
+                    None,
+                )
+                if ready is None:
+                    raise RuntimeExecutionError("generated plan has no ready task to execute")
+                executor = (
+                    LocalExecutor(
+                        scheduler.worker(
+                            worker_id=self.worker_id,
+                            max_attempts=self.max_attempts,
+                            capabilities=ExecutorCapabilities.local_process(),
+                            connectors=self.connectors,
+                            access_policy=self.access_policy,
+                            model_adapters=self.model_adapters,
+                        )
+                    )
+                    if self.backend is None
+                    else None
+                )
+                request = ExecutionRequest(
+                    run_id=run.run_id,
+                    tenant_id=tenant_id,
+                    workflow_id=generated_plan.workflow_id,
+                    definition_digest=generated_plan.digest,
+                    task_id=ready.task_id,
                 )
                 try:
-                    accepted = await worker.run_once()
+                    accepted = await self._execute_request(request, executor)
                 except Exception as exc:
+                    if self.backend is not None:
+                        raise
                     last_error = exc
                     continue
-                if accepted is None:
+                if not accepted:
                     raise RuntimeExecutionError(
-                        "no local executor can claim the remaining generated tasks"
+                        "the execution backend did not accept the remaining generated task"
                     )
         except Exception as exc:
             diagnostic = {

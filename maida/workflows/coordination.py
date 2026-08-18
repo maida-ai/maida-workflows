@@ -9,7 +9,6 @@ definition loader while keeping scheduling semantics unchanged.
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -183,27 +182,3 @@ class WorkflowCoordinator:
             ready += progress.ready_tasks
             completed += int(progress.status is RunStatus.SUCCEEDED)
         return CoordinatorProgress(len(active), advanced, unavailable, ready, completed)
-
-    async def serve(
-        self,
-        *,
-        stop: Callable[[], bool],
-        poll_interval: float = 0.25,
-        limit: int = 100,
-    ) -> int:
-        """Poll active runs until a caller-owned stop predicate becomes true.
-
-        Returns
-        -------
-        int
-            Total scheduler passes performed across all polling iterations.
-        """
-        if poll_interval <= 0:
-            raise ValueError("poll_interval must be positive")
-        passes = 0
-        while not stop():
-            progress = self.run_once(limit=limit)
-            passes += progress.advanced_runs
-            if progress.scanned_runs == 0:
-                await asyncio.sleep(poll_interval)
-        return passes

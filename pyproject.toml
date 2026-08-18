@@ -1,7 +1,7 @@
 [project]
 name = "maida-workflows"
 dynamic = ["version"]
-description = "Durable, replayable workflows for Maida"
+description = "Verifiable runtime-generated plans for Maida"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 license = "Apache-2.0"

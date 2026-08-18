@@ -1,9 +1,9 @@
 """Build, run, and replay typed Maida workflows.
 
-The package-level namespace contains the stable authoring and execution API.
+The package-level namespace contains the stable authoring and backend API.
 Start with :class:`Module` and :class:`Workflow`, compile definitions with
-:func:`compile_workflow`, and use :class:`WorkflowRunner` for local durable
-execution.
+:func:`compile_workflow`, and use :class:`WorkflowRunner` with either its local
+reference fixture or an external execution backend.
 
 Examples
 --------
@@ -58,6 +58,7 @@ from .bundle import (
     WorkflowBundleError,
     WorkflowPortability,
 )
+from .celery import CeleryBackend
 from .coordination import CoordinatorProgress, WorkflowCatalog, WorkflowCoordinator
 from .definitions import BoundWorkflow, bind_workflow
 from .dynamic import (
@@ -105,7 +106,8 @@ from .replay import (
     ReplayResult,
 )
 from .runtime import (
-    Executor,
+    ExecutionBackend,
+    ExecutionRequest,
     LocalExecutor,
     RunResult,
     ScheduleProgress,
@@ -152,6 +154,7 @@ __all__ = [
     "CancelCommand",
     "Capability",
     "CapabilityGrant",
+    "CeleryBackend",
     "CommandReceipt",
     "CommandType",
     "CompileError",
@@ -163,10 +166,11 @@ __all__ = [
     "EffectAdapter",
     "EffectSpec",
     "EventPage",
+    "ExecutionBackend",
     "ExecutionContext",
     "ExecutionMode",
+    "ExecutionRequest",
     "ExecutionSpec",
-    "Executor",
     "ExecutorCapabilities",
     "ExternalWorkflow",
     "GeneratedPlanRecord",

@@ -142,7 +142,7 @@ def test_coordinator_reports_unavailable_pinned_definitions(
 
 @pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_worker_heartbeats_long_attempt_and_persistent_polling(
+async def test_reference_worker_heartbeats_a_long_attempt(
     postgres_store: PostgresStore,
 ) -> None:
     workflow = SlowWorkflow()
@@ -177,14 +177,9 @@ async def test_worker_heartbeats_long_attempt_and_persistent_polling(
     assert history.tasks[0].status is TaskStatus.SUCCEEDED
     assert any(event.event_type == "ATTEMPT_HEARTBEAT" for event in history.events)
 
-    # Persistent polling exits through a caller-owned stop predicate and does
-    # not create another attempt when no work remains.
-    processed = await worker.serve(stop=lambda: True, poll_interval=0.001)
-    assert processed == 0
-
 
 @pytest.mark.asyncio
-async def test_worker_polling_validates_intervals_without_storage() -> None:
+async def test_reference_worker_validates_heartbeat_intervals_without_storage() -> None:
     worker = TaskWorker(
         object(),  # type: ignore[arg-type]
         workflow_id="test",
@@ -192,14 +187,11 @@ async def test_worker_polling_validates_intervals_without_storage() -> None:
         modules={},
         worker_id="worker",
     )
-    with pytest.raises(ValueError, match="poll_interval"):
-        await worker.serve(stop=lambda: False, poll_interval=0)
     with pytest.raises(ValueError, match="heartbeat_every"):
         await worker.run_once(heartbeat_every=timedelta(0))
 
 
-@pytest.mark.asyncio
-async def test_coordinator_polling_handles_idle_stores_and_validates_limits() -> None:
+def test_runtime_does_not_ship_worker_or_coordinator_polling_loops() -> None:
     class EmptyStore:
         def list_active_runs(self, *, limit: int) -> tuple[tuple[str, str, str], ...]:
             return ()
@@ -207,13 +199,5 @@ async def test_coordinator_polling_handles_idle_stores_and_validates_limits() ->
     coordinator = WorkflowCoordinator(EmptyStore(), WorkflowCatalog())  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="limit"):
         coordinator.run_once(limit=0)
-    with pytest.raises(ValueError, match="poll_interval"):
-        await coordinator.serve(stop=lambda: False, poll_interval=0)
-    checks = 0
-
-    def stop() -> bool:
-        nonlocal checks
-        checks += 1
-        return checks > 1
-
-    assert await coordinator.serve(stop=stop, poll_interval=0.001) == 0
+    assert not hasattr(TaskWorker, "serve")
+    assert not hasattr(WorkflowCoordinator, "serve")

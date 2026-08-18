@@ -8,8 +8,6 @@ import pytest
 from typer.testing import CliRunner
 
 from examples.adversarial_workflows import AdversarialBranchWorkflow
-from maida.workflows import compile_workflow
-from maida.workflows._canonical import schema_digest
 from maida.workflows.cli import app
 from maida.workflows.ir import IR_VERSION
 from maida.workflows.persistence import PostgresStore
@@ -24,15 +22,14 @@ def test_cli_help_and_compile_surface() -> None:
     for command in (
         "compile",
         "run",
-        "submit",
-        "schedule",
-        "worker",
         "db",
         "trace",
         "diff",
         "replay",
     ):
         assert command in help_result.stdout
+    for command in ("submit", "schedule", "worker"):
+        assert command not in help_result.stdout
 
     compiled = runner.invoke(
         app,
@@ -77,33 +74,6 @@ async def test_cli_exports_replays_diffs_and_baselines_native_history(
     ]
     upgraded = runner.invoke(app, ["db", "upgrade", *common])
     assert upgraded.exit_code == 0
-
-    submitted = runner.invoke(
-        app,
-        [
-            "submit",
-            "--workflow",
-            "examples.adversarial_workflows:AdversarialBranchWorkflow",
-            "--input",
-            '{"escalated":true}',
-            *common,
-        ],
-    )
-    assert submitted.exit_code == 0, submitted.output
-    submitted_data = json.loads(submitted.stdout)
-    assert submitted_data["ready_tasks"] == 1
-    scheduled = runner.invoke(
-        app,
-        [
-            "schedule",
-            submitted_data["run_id"],
-            "--workflow",
-            "examples.adversarial_workflows:AdversarialBranchWorkflow",
-            *common,
-        ],
-    )
-    assert scheduled.exit_code == 0, scheduled.output
-    assert json.loads(scheduled.stdout)["status"] == "RUNNING"
 
     live_run = await asyncio.to_thread(
         runner.invoke,
@@ -170,29 +140,3 @@ async def test_cli_exports_replays_diffs_and_baselines_native_history(
         ],
     )
     assert missing_run.exit_code == 2
-
-    workflow = AdversarialBranchWorkflow()
-    plan = compile_workflow(workflow)
-    root = postgres_store.values.encode(
-        {"escalated": True}, schema_digest=schema_digest(dict[str, object])
-    )
-    pending_run = postgres_store.create_run(plan, tenant_id="local", root_input=root)
-    urgent = next(step for step in plan.executable_steps if step.logical_step == "route-urgent")
-    postgres_store.enqueue_task(
-        pending_run.run_id,
-        urgent,
-        step_instance_id="cli-worker",
-        input_value=root,
-    )
-    worked = await asyncio.to_thread(
-        runner.invoke,
-        app,
-        [
-            "worker",
-            "--workflow",
-            "examples.adversarial_workflows:AdversarialBranchWorkflow",
-            *common,
-        ],
-    )
-    assert worked.exit_code == 0, worked.output
-    assert '"claimed": true' in worked.stdout
