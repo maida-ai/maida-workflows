@@ -303,6 +303,7 @@ async def test_workflow_runner_binds_an_attempt_scoped_broker_for_connector_read
 
 
 class SplitGrantModule(Module[str, str]):
+    module_id = "access.split-grant"
     input_type = str
     output_type = str
     execution = ExecutionSpec(capabilities=("executor.egress",))

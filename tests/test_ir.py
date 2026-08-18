@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
 from dataclasses import dataclass
 
 import pytest
@@ -17,9 +20,11 @@ from maida.workflows import (
     when,
 )
 from maida.workflows.alignment import DiffKind, GraphAligner
+from maida.workflows.ir import IR_VERSION
 
 
 class AddOne(Module[int, int]):
+    module_id = "math.add-one"
     input_type = int
     output_type = int
 
@@ -28,6 +33,7 @@ class AddOne(Module[int, int]):
 
 
 class IsPositive(Module[int, bool]):
+    module_id = "math.is-positive"
     input_type = int
     output_type = bool
 
@@ -36,6 +42,7 @@ class IsPositive(Module[int, bool]):
 
 
 class Identity(Module[int, int]):
+    module_id = "core.identity"
     input_type = int
     output_type = int
 
@@ -53,19 +60,68 @@ class Simple(Workflow[int, int]):
         return self.add(value)
 
 
-def test_default_identity_and_canonical_ir_are_stable() -> None:
+def test_module_identity_must_be_self_declared() -> None:
+    class Anonymous(Module[int, int]):
+        input_type = int
+        output_type = int
+
+        async def execute(self, value: int, ctx: ExecutionContext) -> int:
+            return value
+
+    class AnonymousWorkflow(Workflow[int, int]):
+        workflow_id = "anonymous"
+        input_type = int
+        output_type = int
+        nested_attribute_name = Anonymous()
+
+        def build(self, value: RuntimeValue[int]) -> RuntimeValue[int]:
+            return self.nested_attribute_name(value)
+
+    with pytest.raises(CompileError, match=r"Anonymous.*module_id"):
+        compile_workflow(AnonymousWorkflow())
+
+
+def test_replay_addresses_are_versioned_and_stable_across_processes() -> None:
+    script = """
+import json
+from examples.adversarial_workflows import ADVERSARIAL_WORKFLOWS
+from maida.workflows import compile_workflow
+
+plan = compile_workflow(ADVERSARIAL_WORKFLOWS[0])
+print(json.dumps([step.replay_key.as_string() for step in plan.executable_steps]))
+"""
+
+    first = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    second = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    first_addresses = json.loads(first.stdout)
+
+    assert first.stdout == second.stdout
+    assert first_addresses
+    assert all(address.startswith("replay-v1:") for address in first_addresses)
+
+
+def test_declared_identity_and_canonical_ir_are_stable() -> None:
     first = compile_workflow(Simple())
     second = compile_workflow(Simple())
 
-    assert first.version == "0.2.0"
+    assert first.version == IR_VERSION
     assert first.canonical_json() == second.canonical_json()
     assert first.digest == second.digest
-    assert first.digest == "8783a3d322b3edd68ee32edbcb527c8ef1a42a1b0d3084395a6742671f0c3995"
+    assert len(first.digest) == 64
     step = first.executable_steps[0]
-    assert (
-        step.definition_digest == "15894aeadf64d4ab56280ffdab3b3a658de429c63e0d2a9ef408ea2abb6741da"
-    )
-    assert step.module_id == "simple.add"
+    assert step.definition_digest is not None
+    assert len(step.definition_digest) == 64
+    assert step.module_id == AddOne.module_id
     assert step.logical_step == "root"
     assert step.replay_key is not None
 
@@ -154,6 +210,7 @@ class Item:
 
 
 class ReadItem(Module[Item, int]):
+    module_id = "items.read"
     input_type = Item
     output_type = int
 
@@ -206,13 +263,17 @@ def test_branch_parallel_and_nested_workflows_are_replay_addressable() -> None:
             return parallel(branch, self.child(value))
 
     plan = compile_workflow(Parent())
-    keys = {step.replay_key.as_string() for step in plan.executable_steps if step.replay_key}
+    addresses = {
+        (step.module_id, step.logical_step)
+        for step in plan.executable_steps
+        if step.replay_key is not None
+    }
 
-    assert keys == {
-        "parent.check@root.dep0.dep0",
-        "parent.left@root.dep0.dep1",
-        "parent.right@root.dep0.dep2",
-        "child.identity@root.dep1.nested[child]",
+    assert addresses == {
+        (IsPositive.module_id, "root.dep0.dep0"),
+        (AddOne.module_id, "root.dep0.dep1"),
+        (Identity.module_id, "root.dep0.dep2"),
+        (Identity.module_id, "root.dep1.nested"),
     }
     assert any(step.kind == "when" for step in plan.steps)
     assert plan.steps[-1].kind == "parallel"
@@ -273,6 +334,7 @@ def test_runtime_values_reject_ordinary_python_control_flow() -> None:
 
 def test_incompatible_module_handoff_fails_during_graph_construction() -> None:
     class AsText(Module[int, str]):
+        module_id = "math.as-text"
         input_type = int
         output_type = str
 

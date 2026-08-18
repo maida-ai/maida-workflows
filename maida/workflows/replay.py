@@ -1049,10 +1049,10 @@ class _StubGraphExecutor:
             nested = binding.workflow
             result = await self._visit(
                 binding.output,
-                path=f"{path}.nested[{nested.workflow_id}]",
+                path=f"{path}.nested",
                 workflow=nested,
                 external=source,
-                scope=(*scope, f"workflow:{nested.workflow_id}"),
+                scope=scope,
             )
         elif expression.kind == "module":
             source = await self._visit(
@@ -1300,7 +1300,7 @@ def build_module_registry(
             visit(expression.dependencies[0], f"{path}.input", owner)
             binding = cast(_WorkflowBinding, expression.payload)
             nested = binding.workflow
-            visit(binding.output, f"{path}.nested[{nested.workflow_id}]", nested)
+            visit(binding.output, f"{path}.nested", nested)
             return
         if expression.kind in {"input", "literal"}:
             return

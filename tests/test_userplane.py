@@ -32,6 +32,7 @@ from maida.workflows.userplane import (
 
 
 class Upper(Module[str, str]):
+    module_id = "userplane.upper"
     input_type = str
     output_type = str
 

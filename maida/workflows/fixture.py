@@ -32,8 +32,8 @@ from .models import (
 )
 from .persistence import PostgresStore
 
-FIXTURE_VERSION = "0.3.0"
-LEGACY_FIXTURE_VERSION = "0.1.0"
+FIXTURE_VERSION = "0.4.0"
+STATIC_FIXTURE_VERSION = "0.2.0"
 
 
 class FixtureErrorCode(StrEnum):
@@ -327,7 +327,7 @@ class ReplayFixtureExporter:
         )
         generated = self._generated_records(history)
         return ReplayFixture(
-            version=FIXTURE_VERSION if generated else LEGACY_FIXTURE_VERSION,
+            version=FIXTURE_VERSION if generated else STATIC_FIXTURE_VERSION,
             source=SourceProvenance(
                 kind="native_workflow_run",
                 run_id=history.run.run_id,
@@ -636,7 +636,7 @@ def load_fixture(path: Path) -> ReplayFixture:
             FixtureErrorCode.FIXTURE_INVALID,
             "fixture manifest is not canonical JSON",
         )
-    if data.get("version") not in {LEGACY_FIXTURE_VERSION, FIXTURE_VERSION}:
+    if data.get("version") not in {STATIC_FIXTURE_VERSION, FIXTURE_VERSION}:
         raise ReplayFixtureError(
             FixtureErrorCode.FIXTURE_VERSION_UNSUPPORTED,
             f"expected a supported fixture version, found {data.get('version')!r}",

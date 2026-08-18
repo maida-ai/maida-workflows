@@ -107,8 +107,8 @@ deterministic, credential-free starting point.
 
 Every executable occurrence has three independent identities:
 
-- `module_id` aligns the semantic component (by default
-  `<workflow_id>.<module_attribute_path>`);
+- required, self-declared `module_id` aligns the semantic component regardless
+  of which static or generated plan uses it;
 - `logical_step` aligns its stable workflow position;
 - `module_digest` changes when implementation, immutable configuration, schema,
   or effect classification changes.
@@ -116,7 +116,14 @@ Every executable occurrence has three independent identities:
 Definitions align by `(module_id, logical_step)`. A mapped or nested execution
 adds a deterministic `step_instance_id`; mapped values therefore require a
 stable field or callback key. Reusing a module without `.at("stable-step")`, or
-creating a duplicate replay key, is a compile error.
+creating a duplicate replay key, is a compile error. Modules without a
+non-empty `module_id` are also compile errors; identity is never inferred from
+a workflow class, attribute name, or enclosing workflow.
+
+This identity inversion is an intentional wire break. Pre-inversion Workflow
+IR, specs, bundles, and replay fixtures are rejected; recompile plans and
+re-export fixtures instead of comparing artifacts whose identity semantics
+changed.
 
 ## Resource envelopes
 
@@ -130,6 +137,7 @@ from maida.workflows import Budget, ExecutionContext, Module
 
 
 class Research(Module[str, str]):
+    module_id = "research.execute"
     input_type = str
     output_type = str
     budget = Budget(
@@ -153,9 +161,9 @@ Replay fixtures are projections of successful native runs: a
 canonical manifest plus SHA-256-addressed blobs. Failed, cancelled, paused,
 incomplete, redacted, truncated, missing, or corrupt histories fail closed.
 Ordinary Maida/OTel/Langfuse/export traces are not accepted because their spans
-do not prove replay-complete module boundaries. Static histories retain the
-original fixture contract; generated histories use the next compatible bundle
-version to include authenticated plan lineage and concrete generated instances.
+do not prove replay-complete module boundaries. Static and generated fixture
+formats both carry the graph-independent identity contract; generated histories
+add authenticated plan lineage and concrete generated instances.
 
 ## Explainable authoring and serialization
 
@@ -259,7 +267,7 @@ maida-workflows worker --workflow package.module:workflow --worker-id worker-1
 maida-workflows trace export RUN_ID --output replay-fixtures/case
 maida-workflows diff replay-fixtures/case --workflow package.module:workflow
 maida-workflows replay replay-fixtures/case --workflow package.module:workflow --mode full-stub
-maida-workflows replay replay-fixtures/case --workflow package.module:workflow --live module:workflow.module_id
+maida-workflows replay replay-fixtures/case --workflow package.module:workflow --live module:application.component
 maida-workflows replay replay-fixtures/case --workflow package.module:workflow --live step:logical-step
 ```
 

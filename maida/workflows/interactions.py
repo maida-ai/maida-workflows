@@ -122,10 +122,6 @@ class Approval[InputT](_InteractionModule[InputT, ApprovalDecision]):
         Human-readable question shown by the application.
     metadata
         Optional canonical, non-sensitive presentation data.
-    module_id
-        Optional stable semantic identity. Workflow attribute identity is used
-        when omitted.
-
     Returns
     -------
     ApprovalDecision
@@ -143,6 +139,7 @@ class Approval[InputT](_InteractionModule[InputT, ApprovalDecision]):
     """
 
     interaction_kind = "approval"
+    module_id = "maida.interaction.approval"
     output_type = ApprovalDecision
 
     def __init__(
@@ -151,14 +148,12 @@ class Approval[InputT](_InteractionModule[InputT, ApprovalDecision]):
         *,
         prompt: str,
         metadata: Mapping[str, Any] | None = None,
-        module_id: str | None = None,
     ) -> None:
         if not prompt.strip():
             raise ValueError("approval prompt must be non-empty")
         self.input_type = input_type
         self.prompt = prompt
         self.metadata = MappingProxyType(cast(dict[str, Any], canonical_data(dict(metadata or {}))))
-        self.module_id = module_id
 
     def _resolve_data(self, resolution: Mapping[str, Any]) -> ApprovalDecision:
         decision = resolution.get("decision")
@@ -185,9 +180,6 @@ class Input[InputT, ResponseT](_InteractionModule[InputT, ResponseT]):
         Human-readable request shown by the application.
     metadata
         Optional canonical, non-sensitive presentation data.
-    module_id
-        Optional stable semantic identity.
-
     Notes
     -----
     Payload schema is validated before a command makes the task ready and is
@@ -195,6 +187,7 @@ class Input[InputT, ResponseT](_InteractionModule[InputT, ResponseT]):
     """
 
     interaction_kind = "input"
+    module_id = "maida.interaction.input"
 
     def __init__(
         self,
@@ -203,7 +196,6 @@ class Input[InputT, ResponseT](_InteractionModule[InputT, ResponseT]):
         *,
         prompt: str,
         metadata: Mapping[str, Any] | None = None,
-        module_id: str | None = None,
     ) -> None:
         if not prompt.strip():
             raise ValueError("input prompt must be non-empty")
@@ -211,7 +203,6 @@ class Input[InputT, ResponseT](_InteractionModule[InputT, ResponseT]):
         self.output_type = response_type
         self.prompt = prompt
         self.metadata = MappingProxyType(cast(dict[str, Any], canonical_data(dict(metadata or {}))))
-        self.module_id = module_id
 
     def _resolve_data(self, resolution: Mapping[str, Any]) -> ResponseT:
         value = _rehydrate_value(resolution.get("value"), self.output_type)
@@ -236,9 +227,6 @@ class WaitForSignal[InputT, PayloadT](_InteractionModule[InputT, PayloadT]):
         ``name`` when omitted.
     metadata
         Optional canonical, non-sensitive presentation data.
-    module_id
-        Optional stable semantic identity.
-
     Notes
     -----
     Provider webhook state remains outside the workflow runtime. Integrations
@@ -246,6 +234,7 @@ class WaitForSignal[InputT, PayloadT](_InteractionModule[InputT, PayloadT]):
     """
 
     interaction_kind = "signal"
+    module_id = "maida.interaction.signal"
 
     def __init__(
         self,
@@ -255,7 +244,6 @@ class WaitForSignal[InputT, PayloadT](_InteractionModule[InputT, PayloadT]):
         name: str,
         prompt: str | None = None,
         metadata: Mapping[str, Any] | None = None,
-        module_id: str | None = None,
     ) -> None:
         if not name.strip():
             raise ValueError("signal name must be non-empty")
@@ -264,7 +252,6 @@ class WaitForSignal[InputT, PayloadT](_InteractionModule[InputT, PayloadT]):
         self.signal_name = name
         self.prompt = prompt or f"Wait for signal {name}"
         self.metadata = MappingProxyType(cast(dict[str, Any], canonical_data(dict(metadata or {}))))
-        self.module_id = module_id
 
     def _resolve_data(self, resolution: Mapping[str, Any]) -> PayloadT:
         if resolution.get("name") != self.signal_name:

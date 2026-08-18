@@ -81,6 +81,7 @@ def test_type_schemas_and_runtime_type_checks_cover_boundary_shapes() -> None:
 
 
 class Identity(Module[int, int]):
+    module_id = "contracts.identity"
     input_type = int
     output_type = int
 
@@ -169,6 +170,10 @@ def test_graph_diff_reports_resolvable_schema_and_digest_changes() -> None:
 def test_imported_plan_rejects_unknown_versions_duplicate_keys_and_broken_topology() -> None:
     source = compile_workflow(PairWorkflow())
     data = source.to_dict()
+
+    legacy_identity = {**data, "version": "0.5.0"}
+    with pytest.raises(ValueError, match="graph-independent module identity"):
+        type(source).from_dict(legacy_identity)
 
     unsupported = {**data, "version": "9.9.9"}
     with pytest.raises(ValueError, match="unsupported Workflow IR"):

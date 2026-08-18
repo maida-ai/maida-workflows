@@ -7,6 +7,7 @@ from maida.workflows.persistence import InvalidRunStateError, PostgresStore
 
 
 class Echo(Module[int, int]):
+    module_id = "idempotent.echo"
     input_type = int
     output_type = int
 

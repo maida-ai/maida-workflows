@@ -13,7 +13,7 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Self, cast, get_args, get_origin
+from typing import Any, cast, get_args, get_origin
 
 from ._canonical import (
     _rehydrate_value,
@@ -24,15 +24,9 @@ from ._canonical import (
     type_schema,
     value_matches_type,
 )
-from .authoring import Module
+from .authoring import Module, _declared_module_id
 from .budget import Budget
-from .ir import (
-    PlanIR,
-    ReplayKey,
-    _access_contract,
-    _validated_access_declarations,
-    module_digest,
-)
+from .ir import _access_contract, _validated_access_declarations, module_digest
 from .model import _model_contract
 from .models import ExecutionSpec
 
@@ -130,6 +124,7 @@ class ModuleTemplate[ConfigT]:
         module = self.factory(cast(ConfigT, restored))
         if not isinstance(module, Module):
             raise TypeError("module template factory must return a Module instance")
+        _declared_module_id(module)
         canonical_config = canonical_data(restored)
         if not isinstance(canonical_config, dict):
             raise ValueError("module template config must encode as an object")
@@ -249,7 +244,7 @@ def _catalog_entry(
 class _Registration:
     factory: ModuleFactory | None = None
     template: ModuleTemplate[Any] | None = None
-    descriptor: _CatalogEntry | None = None
+    entry: _CatalogEntry | None = None
 
 
 class ModuleRegistry:
@@ -294,7 +289,7 @@ class ModuleRegistry:
             _require_stable("module alias", alias)
             if not callable(factory):
                 raise TypeError(f"fixed module factory {alias!r} must be callable")
-            registrations[alias] = _Registration(factory=factory)
+            registrations[alias] = _fixed_registration(alias, factory)
         for alias, template in (templates or {}).items():
             _require_stable("module alias", alias)
             if not isinstance(template, ModuleTemplate):
@@ -303,70 +298,6 @@ class ModuleRegistry:
                 raise ValueError(f"module alias {alias!r} is registered twice")
             registrations[alias] = _Registration(template=template)
         self._registrations = MappingProxyType(registrations)
-
-    @classmethod
-    def _from_registrations(cls, registrations: Mapping[str, _Registration]) -> Self:
-        registry = cls()
-        registry._registrations = MappingProxyType(dict(registrations))
-        return registry
-
-    def allow(
-        self,
-        alias: str,
-        *,
-        module_id: str,
-        module_digest: str,
-        input_schema_digests: tuple[str, ...],
-        output_schema_digest: str,
-        execution: Mapping[str, Any],
-        budget: Budget,
-        capabilities: tuple[Mapping[str, Any], ...] = (),
-        effects: tuple[Mapping[str, Any], ...] = (),
-    ) -> Self:
-        """Return a registry with one trusted validation-only descriptor added."""
-        _require_stable("module alias", alias)
-        if not isinstance(budget, Budget):
-            raise TypeError("budget must be a Budget")
-        if alias in self._registrations:
-            raise ValueError(f"module alias {alias!r} is already registered")
-        entry = _catalog_entry(
-            module_id=module_id,
-            module_digest=module_digest,
-            input_schema_digests=input_schema_digests,
-            output_schema_digest=output_schema_digest,
-            execution=execution,
-            budget=budget,
-            capabilities=capabilities,
-            effects=effects,
-        )
-        return self._from_registrations(
-            {**self._registrations, alias: _Registration(descriptor=entry)}
-        )
-
-    @classmethod
-    def from_plan(cls, plan: PlanIR, aliases: Mapping[str, ReplayKey]) -> Self:
-        """Build validation descriptors from selected executable plan steps."""
-        by_key = {step.replay_key: step for step in plan.executable_steps}
-        registry = cls()
-        for alias in sorted(aliases):
-            replay_key = aliases[alias]
-            if not isinstance(replay_key, ReplayKey) or replay_key not in by_key:
-                raise ValueError(f"replay key for alias {alias!r} is not in the plan")
-            step = by_key[replay_key]
-            if step.module_id is None or step.module_digest is None or step.input_binding is None:
-                raise ValueError(f"replay key for alias {alias!r} is not executable")
-            registry = registry.allow(
-                alias,
-                module_id=step.module_id,
-                module_digest=step.module_digest,
-                input_schema_digests=(step.input_binding.schema_digest,),
-                output_schema_digest=step.output_schema_digest,
-                execution=step.execution or ExecutionSpec().to_data(),
-                budget=Budget.from_data(step.budget) if step.budget is not None else Budget(),
-                capabilities=step.capabilities,
-                effects=step.effects,
-            )
-        return registry
 
     @property
     def aliases(self) -> tuple[str, ...]:
@@ -486,11 +417,7 @@ class ModuleRegistry:
         descriptions: list[dict[str, Any]] = []
         for alias in self.aliases:
             registration = self._registrations[alias]
-            if registration.descriptor is not None:
-                descriptions.append(
-                    {"alias": alias, "kind": "trusted", **registration.descriptor.to_dict()}
-                )
-            elif registration.template is not None:
+            if registration.template is not None:
                 template = registration.template
                 descriptions.append(
                     {
@@ -501,14 +428,17 @@ class ModuleRegistry:
                     }
                 )
             else:
-                module, _ = self._resolve(alias, None)
+                entry = registration.entry
+                if entry is None:  # pragma: no cover - registration invariant
+                    raise TypeError("fixed module registration has no derived contract")
                 descriptions.append(
                     {
                         "alias": alias,
                         "kind": "fixed",
-                        "module_digest": module_digest(module),
-                        "input_schema": type_schema(module.input_type),
-                        "output_schema": type_schema(module.output_type),
+                        "module_digest": entry.module_digest,
+                        "module_id": entry.module_id,
+                        "input_schema_digests": entry.input_schema_digests,
+                        "output_schema_digest": entry.output_schema_digest,
                     }
                 )
         return tuple(descriptions)
@@ -517,27 +447,11 @@ class ModuleRegistry:
         registration = self._registrations.get(alias)
         if registration is None:
             raise KeyError(f"module alias {alias!r} is not allowlisted")
-        if registration.descriptor is not None:
-            return registration.descriptor
+        if registration.entry is not None:
+            return registration.entry
         if registration.template is not None:
             raise ValueError("generated plan aliases cannot require author-supplied config")
-        module, _ = self._resolve(alias, None)
-        module_id = module.module_id
-        if not isinstance(module_id, str) or not module_id.strip():
-            raise ValueError(
-                f"generated module alias {alias!r} must resolve to a self-declared module_id"
-            )
-        access = _access_contract(module)
-        return _catalog_entry(
-            module_id=module_id,
-            module_digest=module_digest(module),
-            input_schema_digests=_input_schema_digests(module.input_type),
-            output_schema_digest=schema_digest(module.output_type),
-            execution=module.execution.to_data(),
-            budget=module.budget,
-            capabilities=access["capabilities"],
-            effects=access["effects"],
-        )
+        raise TypeError("fixed module registration has no derived contract")
 
     def _resolve(
         self,
@@ -549,8 +463,6 @@ class ModuleRegistry:
             raise KeyError(f"module alias {alias!r} is not registered")
         if registration.template is not None:
             return registration.template.create(config or {})
-        if registration.descriptor is not None:
-            raise TypeError(f"module alias {alias!r} has no executable factory")
         if config:
             raise ValueError(f"fixed module alias {alias!r} does not accept config")
         factory = registration.factory
@@ -559,7 +471,29 @@ class ModuleRegistry:
         module = factory()
         if not isinstance(module, Module):
             raise TypeError(f"fixed module factory {alias!r} must return a Module instance")
+        _declared_module_id(module)
         return module, {}
+
+
+def _fixed_registration(alias: str, factory: ModuleFactory) -> _Registration:
+    module = factory()
+    if not isinstance(module, Module):
+        raise TypeError(f"fixed module factory {alias!r} must return a Module instance")
+    module_id = _declared_module_id(module)
+    access = _access_contract(module)
+    return _Registration(
+        factory=factory,
+        entry=_catalog_entry(
+            module_id=module_id,
+            module_digest=module_digest(module),
+            input_schema_digests=_input_schema_digests(module.input_type),
+            output_schema_digest=schema_digest(module.output_type),
+            execution=module.execution.to_data(),
+            budget=module.budget,
+            capabilities=access["capabilities"],
+            effects=access["effects"],
+        ),
+    )
 
 
 def _require_stable(label: str, value: str) -> None:

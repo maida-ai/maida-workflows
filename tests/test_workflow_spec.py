@@ -16,10 +16,12 @@ from maida.workflows import (
     compile_workflow_spec,
 )
 from maida.workflows._canonical import type_schema
+from maida.workflows.ir import IR_VERSION
 from maida.workflows.persistence import PostgresStore
 
 
 class Normalize(Module[int, int]):
+    module_id = "math.normalize"
     input_type = int
     output_type = int
 
@@ -34,6 +36,7 @@ class MessageInput:
 
 
 class Message(Module[MessageInput, str]):
+    module_id = "text.message"
     input_type = MessageInput
     output_type = str
 
@@ -42,6 +45,7 @@ class Message(Module[MessageInput, str]):
 
 
 class IsUrgent(Module[dict[str, object], bool]):
+    module_id = "routing.is-urgent"
     input_type = dict[str, object]
     output_type = bool
 
@@ -50,6 +54,7 @@ class IsUrgent(Module[dict[str, object], bool]):
 
 
 class Urgent(Module[dict[str, object], str]):
+    module_id = "routing.urgent"
     input_type = dict[str, object]
     output_type = str
 
@@ -63,6 +68,7 @@ class Normal(Urgent):
 
 
 class ReadItem(Module[dict[str, object], str]):
+    module_id = "items.read"
     input_type = dict[str, object]
     output_type = str
 
@@ -124,7 +130,7 @@ def test_workflow_spec_round_trip_schema_and_explanation_are_deterministic() -> 
     assert WorkflowSpec.json_schema()["properties"]["nodes"]["type"] == "array"
     assert compilation.ok
     assert compilation.plan is not None
-    assert compilation.plan.version == "0.4.0"
+    assert compilation.plan.version == IR_VERSION
     assert PlanIR.from_dict(compilation.plan.to_dict()) == compilation.plan
     assert compilation.explanation.node_count == 2
     assert compilation.explanation.edges == (

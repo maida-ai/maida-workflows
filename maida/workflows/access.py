@@ -1474,7 +1474,8 @@ class Connector[RequestT, ResponseT](Module[RequestT, ResponseT]):
     capability
         Stable typed access declaration compiled into the workflow definition.
     module_id
-        Optional replay-stable semantic identity.
+        Optional semantic identity override. By default the trusted capability
+        name identifies the connector module.
     """
 
     effectful = False
@@ -1485,9 +1486,11 @@ class Connector[RequestT, ResponseT](Module[RequestT, ResponseT]):
         *,
         module_id: str | None = None,
     ) -> None:
+        if module_id is not None and not module_id.strip():
+            raise ValueError("module_id must be non-empty when supplied")
         self.input_type = capability.input_type
         self.output_type = capability.output_type
-        self.module_id = module_id
+        self.module_id = capability.name if module_id is None else module_id
         self.capabilities = (capability,)
         self.effects: tuple[EffectSpec[Any, Any], ...] = ()
 
@@ -1536,7 +1539,8 @@ class Effect[RequestT, ResponseT](Module[RequestT, ResponseT]):
     effect
         Stable typed effect declaration compiled into the workflow definition.
     module_id
-        Optional replay-stable semantic identity.
+        Optional semantic identity override. By default the trusted effect name
+        identifies the effect module.
 
     Notes
     -----
@@ -1552,9 +1556,11 @@ class Effect[RequestT, ResponseT](Module[RequestT, ResponseT]):
         *,
         module_id: str | None = None,
     ) -> None:
+        if module_id is not None and not module_id.strip():
+            raise ValueError("module_id must be non-empty when supplied")
         self.input_type = effect.input_type
         self.output_type = effect.output_type
-        self.module_id = module_id
+        self.module_id = effect.name if module_id is None else module_id
         self.capabilities: tuple[Capability[Any, Any], ...] = ()
         self.effects = (effect,)
 

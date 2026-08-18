@@ -58,6 +58,7 @@ class Decision:
 class Prepare(Module[Ticket, Draft]):
     """Normalize ticket text while counting live handler calls."""
 
+    module_id = "demo.ticket.prepare"
     input_type = Ticket
     output_type = Draft
 
@@ -72,6 +73,7 @@ class Prepare(Module[Ticket, Draft]):
 class DecideV1(Module[Draft, Decision]):
     """Historical decision behavior that always selects the standard queue."""
 
+    module_id = "demo.ticket.decide"
     input_type = Draft
     output_type = Decision
 
@@ -95,6 +97,7 @@ class DecideV2(DecideV1):
 class ProductionNotification(Module[Decision, Decision]):
     """Effect-classified sentinel that records every real invocation."""
 
+    module_id = "demo.ticket.notify"
     input_type = Decision
     output_type = Decision
     effectful = True
@@ -174,7 +177,7 @@ async def run_demo(
         ReplayCase(
             fixture,
             ReplayMode.SELECTIVE,
-            (ReplayKey("native-replay-demo.decide", "decide"),),
+            (ReplayKey(DecideV1.module_id, "decide"),),
         ),
     )
     return {

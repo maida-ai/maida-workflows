@@ -44,6 +44,7 @@ class NoTraceBridge:
 
 
 class Good(Module[int, int]):
+    module_id = "replay-edges.boundary"
     input_type = int
     output_type = int
 
@@ -237,7 +238,7 @@ async def test_each_compile_run_or_replay_operation_builds_the_symbolic_graph_on
         ReplayCase(
             fixture,
             ReplayMode.SELECTIVE,
-            (ReplayKey("replay-edges.boundary", "only"),),
+            (ReplayKey(Good.module_id, "only"),),
         ),
     )
     assert selective.build_calls == 1
@@ -250,7 +251,7 @@ async def test_replay_mode_and_selector_errors_fail_before_execution(
 ) -> None:
     fixture = await captured(postgres_store)
     engine = ReplayEngine(trace_bridge=NoTraceBridge())
-    key = ReplayKey("replay-edges.boundary", "only")
+    key = ReplayKey(Good.module_id, "only")
     with pytest.raises(ReplaySelectorError, match="does not accept"):
         await engine.replay(SingleWorkflow(), ReplayCase(fixture, ReplayMode.FULL_STUB, (key,)))
     with pytest.raises(ReplaySelectorError, match="requires"):
@@ -273,7 +274,7 @@ async def test_selective_live_failures_and_bad_outputs_are_hard_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = await captured(postgres_store)
-    key = ReplayKey("replay-edges.boundary", "only")
+    key = ReplayKey(Good.module_id, "only")
     engine = ReplayEngine(trace_bridge=NoTraceBridge())
     failed = await engine.replay(
         SingleWorkflow(Fails()), ReplayCase(fixture, ReplayMode.SELECTIVE, (key,))

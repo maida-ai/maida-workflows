@@ -18,11 +18,12 @@ from typing import Any, cast
 
 from ._canonical import canonical_data, canonical_json, digest_data, type_schema
 from ._schema import schema_at_path, schemas_compatible, value_matches_schema
-from .authoring import Module
+from .authoring import Module, _declared_module_id
 from .budget import Budget
 from .definitions import BoundWorkflow
 from .interactions import Approval, Input, WaitForSignal, _SchemaAnnotation
 from .ir import (
+    IR_VERSION,
     BindingIR,
     PlanIR,
     ReplayKey,
@@ -33,7 +34,7 @@ from .ir import (
 from .model import _model_contract
 from .registry import ModuleRegistry
 
-SPEC_VERSION = "0.1.0"
+SPEC_VERSION = "0.2.0"
 _KEY_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
 _SENSITIVE_PARTS = frozenset(
     {"api_key", "credential", "credentials", "password", "secret", "token"}
@@ -230,7 +231,6 @@ class NodeSpec:
     input: BindingSpec | None = None
     config: Mapping[str, Any] = field(default_factory=dict)
     after: tuple[str, ...] = ()
-    module_id: str | None = None
     logical_step: str | None = None
     item_key: str | None = None
     condition: str | None = None
@@ -266,8 +266,6 @@ class NodeSpec:
         for dependency in self.after:
             _require_key("order-only dependency", dependency)
         object.__setattr__(self, "after", tuple(sorted(set(self.after))))
-        if self.module_id is not None:
-            _require_key("module_id", self.module_id)
         if self.logical_step is not None and not self.logical_step.strip():
             raise ValueError("logical_step must be non-empty")
         if self.kind in {"module", "map"}:
@@ -293,7 +291,7 @@ class NodeSpec:
         elif self.kind == "branch":
             if any(value is not None for value in (self.module, self.input, self.item_key)):
                 raise ValueError("branch node cannot declare module fields")
-            if self.config or self.after or self.module_id or self.logical_step:
+            if self.config or self.after or self.logical_step:
                 raise ValueError("branch node cannot declare module configuration")
             for label, value in (
                 ("condition", self.condition),
@@ -324,7 +322,6 @@ class NodeSpec:
                     self.condition,
                     self.then,
                     self.otherwise,
-                    self.module_id,
                     self.logical_step,
                 )
             ):
@@ -379,7 +376,6 @@ class NodeSpec:
         *,
         config: Mapping[str, Any] | None = None,
         after: Sequence[str] = (),
-        module_id: str | None = None,
         logical_step: str | None = None,
     ) -> NodeSpec:
         """Create one ordinary distributed module task node."""
@@ -390,7 +386,6 @@ class NodeSpec:
             input=input,
             config=config or {},
             after=tuple(after),
-            module_id=module_id,
             logical_step=logical_step,
         )
 
@@ -404,7 +399,6 @@ class NodeSpec:
         item_key: str,
         config: Mapping[str, Any] | None = None,
         after: Sequence[str] = (),
-        module_id: str | None = None,
         logical_step: str | None = None,
     ) -> NodeSpec:
         """Create stable-key distributed fan-out over a runtime sequence."""
@@ -415,7 +409,6 @@ class NodeSpec:
             input=input,
             config=config or {},
             after=tuple(after),
-            module_id=module_id,
             logical_step=logical_step,
             item_key=item_key,
         )
@@ -458,7 +451,6 @@ class NodeSpec:
         prompt: str,
         metadata: Mapping[str, Any] | None = None,
         after: Sequence[str] = (),
-        module_id: str | None = None,
         logical_step: str | None = None,
     ) -> NodeSpec:
         """Create a durable approval boundary with an explicit graph result."""
@@ -469,7 +461,6 @@ class NodeSpec:
             prompt=prompt,
             metadata=metadata or {},
             after=tuple(after),
-            module_id=module_id,
             logical_step=logical_step,
         )
 
@@ -483,7 +474,6 @@ class NodeSpec:
         prompt: str,
         metadata: Mapping[str, Any] | None = None,
         after: Sequence[str] = (),
-        module_id: str | None = None,
         logical_step: str | None = None,
     ) -> NodeSpec:
         """Create a durable schema-validated application input boundary."""
@@ -495,7 +485,6 @@ class NodeSpec:
             response_schema=response_schema,
             metadata=metadata or {},
             after=tuple(after),
-            module_id=module_id,
             logical_step=logical_step,
         )
 
@@ -510,7 +499,6 @@ class NodeSpec:
         prompt: str | None = None,
         metadata: Mapping[str, Any] | None = None,
         after: Sequence[str] = (),
-        module_id: str | None = None,
         logical_step: str | None = None,
     ) -> NodeSpec:
         """Create a durable named external-signal boundary."""
@@ -523,7 +511,6 @@ class NodeSpec:
             signal_name=name,
             metadata=metadata or {},
             after=tuple(after),
-            module_id=module_id,
             logical_step=logical_step,
         )
 
@@ -545,7 +532,6 @@ class NodeSpec:
             "input": self.input.to_dict() if self.input is not None else None,
             "config": canonical_data(dict(self.config)),
             "after": list(self.after),
-            "module_id": self.module_id,
             "logical_step": self.logical_step,
             "item_key": self.item_key,
             "condition": self.condition,
@@ -570,7 +556,6 @@ class NodeSpec:
             "input",
             "config",
             "after",
-            "module_id",
             "logical_step",
             "item_key",
             "condition",
@@ -609,7 +594,6 @@ class NodeSpec:
             input=(BindingSpec.from_dict(raw_input) if raw_input is not None else None),
             config=raw_config,
             after=tuple(raw_after),
-            module_id=data["module_id"],
             logical_step=data["logical_step"],
             item_key=data["item_key"],
             condition=data["condition"],
@@ -645,7 +629,7 @@ class WorkflowSpec:
         Maximum stable access names the workflow author permits. Resolved
         module declarations must be subsets.
     version
-        Authoring contract version, currently ``0.1.0``.
+        Authoring contract version.
 
     Notes
     -----
@@ -950,7 +934,7 @@ class _SpecCompiler:
                 explanation,
             )
         plan = PlanIR(
-            version=("0.5.0" if any(step.models for step in self.steps) else "0.4.0"),
+            version=IR_VERSION,
             workflow_id=self.spec.workflow_id,
             input_schema=canonical_data(self.spec.input_schema),
             output_schema=canonical_data(self.spec.output_schema),
@@ -1119,7 +1103,7 @@ class _SpecCompiler:
         dependencies = tuple(
             key if key == "input" else self.node_ids[key] for key in dependency_keys
         )
-        module_id = node.module_id or f"{self.spec.workflow_id}.{node.key}"
+        module_id = _declared_module_id(module)
         logical_step = node.logical_step or f"nodes/{node.key}"
         key = ReplayKey(module_id, logical_step)
         if key in self.modules:
@@ -1191,7 +1175,6 @@ class _SpecCompiler:
                 input_annotation,
                 prompt=node.prompt,
                 metadata=node.metadata,
-                module_id=node.module_id,
             )
         else:
             output_annotation = cast(
@@ -1203,7 +1186,6 @@ class _SpecCompiler:
                     output_annotation,
                     prompt=node.prompt,
                     metadata=node.metadata,
-                    module_id=node.module_id,
                 )
             else:
                 module = WaitForSignal(
@@ -1212,7 +1194,6 @@ class _SpecCompiler:
                     name=cast(str, node.signal_name),
                     prompt=node.prompt,
                     metadata=node.metadata,
-                    module_id=node.module_id,
                 )
         return module, {
             "kind": "builtin",

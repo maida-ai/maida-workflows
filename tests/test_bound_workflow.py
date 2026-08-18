@@ -26,6 +26,7 @@ from maida.workflows.persistence import PostgresStore
 
 
 class IsPositive(Module[int, bool]):
+    module_id = "number.is-positive"
     input_type = int
     output_type = bool
 
@@ -34,6 +35,7 @@ class IsPositive(Module[int, bool]):
 
 
 class Offset(Module[int, int]):
+    module_id = "number.offset"
     input_type = int
     output_type = int
 
@@ -57,7 +59,11 @@ class CountingWorkflow(Workflow[int, int]):
 
     def build(self, value: RuntimeValue[int]) -> RuntimeValue[int]:
         type(self).builds += 1
-        return when(self.check(value), self.positive(value), self.negative(value))
+        return when(
+            self.check.at("check")(value),
+            self.positive.at("positive")(value),
+            self.negative.at("negative")(value),
+        )
 
 
 def test_bind_workflow_compiles_once_and_freezes_exact_modules() -> None:
@@ -91,7 +97,7 @@ async def test_bound_workflow_executes_compiled_graph_without_rebuilding(
 def test_bound_workflow_rejects_a_module_that_no_longer_matches_the_plan() -> None:
     bound = bind_workflow(CountingWorkflow())
     modules = dict(bound.modules)
-    key = next(key for key in modules if key.module_id.endswith("positive"))
+    key = next(key for key in modules if key.logical_step == "positive")
     modules[key] = Offset(11)
 
     with pytest.raises(ValueError, match="module digest"):
@@ -169,6 +175,7 @@ def test_schema_bound_workflow_validates_values_without_python_root_types() -> N
     assert bound is None
 
     class Echo(Module[str, str]):
+        module_id = "text.echo"
         input_type = str
         output_type = str
 

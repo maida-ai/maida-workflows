@@ -26,6 +26,7 @@ from maida.workflows.persistence import PostgresStore
 class Greeting(Module[str, str]):
     """Create a deterministic greeting for the supplied display name."""
 
+    module_id = "demo.greeting"
     input_type = str
     output_type = str
 

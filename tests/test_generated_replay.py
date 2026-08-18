@@ -29,6 +29,7 @@ from maida.workflows import (
 )
 from maida.workflows._canonical import canonical_json, schema_digest
 from maida.workflows.fixture import (
+    FIXTURE_VERSION,
     FixtureErrorCode,
     ReplayFixture,
     ReplayFixtureError,
@@ -67,6 +68,7 @@ def _fragment(*, include_double: bool = True) -> PlanFragmentIR:
 
 
 class Planner(Module[int, dict[str, Any]]):
+    module_id = "planner.generated-replay"
     input_type = int
     output_type = dict[str, Any]
 
@@ -249,7 +251,7 @@ async def test_generated_fixture_round_trips_and_full_stub_invokes_nothing(
 ) -> None:
     fixture = await _capture(postgres_store, tmp_path / "generated")
     loaded = load_fixture(tmp_path / "generated")
-    assert loaded.version == "0.3.0"
+    assert loaded.version == FIXTURE_VERSION
     assert loaded.digest == fixture.digest
     assert len(loaded.generated_plans) == 1
     assert {key for key, _instance in loaded.generated_plans[0].node_instances} == {
@@ -294,7 +296,7 @@ async def test_generated_fixture_rejects_pre_realign_version(
     await _capture(postgres_store, bundle)
     manifest_path = bundle / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    manifest["version"] = "0.2.0"
+    manifest["version"] = "0.3.0"
     manifest_path.write_text(canonical_json(manifest))
 
     with pytest.raises(ReplayFixtureError) as captured:
@@ -364,7 +366,7 @@ async def test_selective_planner_reports_generated_topology_divergence(
         ReplayCase(
             fixture,
             ReplayMode.SELECTIVE,
-            (ReplayKey("generated-replay.planner", "root"),),
+            (ReplayKey(Planner.module_id, "root"),),
         ),
     )
 

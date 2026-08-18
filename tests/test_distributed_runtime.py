@@ -43,6 +43,7 @@ VM_CAPABILITIES = ExecutorCapabilities(
 
 
 class AddOne(Module[int, int]):
+    module_id = "distributed.add-one"
     input_type = int
     output_type = int
     execution = VM_EXECUTION
@@ -56,6 +57,7 @@ class AddOne(Module[int, int]):
 
 
 class AddTwo(Module[int, int]):
+    module_id = "distributed.add-two"
     input_type = int
     output_type = int
     execution = VM_EXECUTION
@@ -69,6 +71,7 @@ class AddTwo(Module[int, int]):
 
 
 class Sum(Module[tuple[int, int], int]):
+    module_id = "distributed.sum"
     input_type = tuple[int, int]
     output_type = int
     execution = VM_EXECUTION
@@ -96,6 +99,7 @@ class FanOutFanIn(Workflow[int, int]):
 
 
 class ReadValue(Module[dict[str, int | str], int]):
+    module_id = "distributed.read-value"
     input_type = dict[str, int | str]
     output_type = int
 

@@ -29,6 +29,7 @@ from maida.workflows.persistence import PostgresStore
 
 
 class Upper(Module[str, str]):
+    module_id = "text.upper"
     input_type = str
     output_type = str
 

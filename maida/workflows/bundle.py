@@ -26,7 +26,7 @@ from .ir import PlanIR
 from .registry import ModuleRegistry
 from .spec import WorkflowSpec, compile_workflow_spec
 
-BUNDLE_VERSION = "0.1.0"
+BUNDLE_VERSION = "0.2.0"
 DEFAULT_MAX_BUNDLE_BYTES = 16 * 1024 * 1024
 
 
@@ -61,7 +61,7 @@ class WorkflowBundle:
         Small credential-free source metadata. Runtime payloads and identities
         never belong here.
     version
-        Bundle format version, currently ``0.1.0``.
+        Bundle format version.
 
     Notes
     -----

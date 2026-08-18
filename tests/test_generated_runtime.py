@@ -104,13 +104,13 @@ class Audit(Module[tuple[str, str], str]):
 
 
 def context_module() -> Module[Any, Any]:
-    module = Connector(CONTEXT, module_id="demo.context")
+    module = Connector(CONTEXT)
     module.budget = TOOL_BUDGET
     return module
 
 
 def deliver_module() -> Module[Any, Any]:
-    module = Effect(DELIVER, module_id="demo.deliver")
+    module = Effect(DELIVER)
     module.budget = TOOL_BUDGET
     return module
 
@@ -264,6 +264,19 @@ class LocalAdapter:
 def signature(history: Any) -> PlanSignature:
     event = next(event for event in history.events if event.event_type == "PLAN_MATERIALIZED")
     return PlanSignature.from_dict(event.payload["signature"])
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_standalone_modules_execute_from_a_generated_plan(
+    postgres_store: PostgresStore,
+) -> None:
+    result = await WorkflowRunner(postgres_store).run_generated(Planner(), "brief request")
+    history = postgres_store.load_run_history(result.run_id, tenant_id="local")
+    generated_ids = {task.module_id for task in history.tasks if task.plan_provenance is not None}
+
+    assert result.output == "draft:BRIEF REQUEST"
+    assert generated_ids == {Normalize.module_id, Draft.module_id}
 
 
 @pytest.mark.postgres
@@ -494,7 +507,7 @@ async def test_generated_runner_requires_trusted_marker_input_and_identity() -> 
         await runner.run_generated(MissingBoundaryPlanner(), "request")
     with pytest.raises(RuntimeContractError, match="input contract"):
         await runner.run_generated(Planner(), cast(Any, 1))
-    with pytest.raises(RuntimeContractError, match="requires module_id"):
+    with pytest.raises(RuntimeContractError, match="declare a non-empty module_id"):
         await runner.run_generated(BlankIdPlanner(), "request")
 
 

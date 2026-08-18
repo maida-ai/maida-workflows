@@ -28,6 +28,7 @@ from maida.workflows.persistence import PostgresStore
 
 
 class _Prepare(Module[str, dict[str, str]]):
+    module_id = "demo.change.prepare"
     input_type = str
     output_type = dict[str, str]
 
@@ -36,6 +37,7 @@ class _Prepare(Module[str, dict[str, str]]):
 
 
 class _Approved(Module[ApprovalDecision, str]):
+    module_id = "demo.change.approved"
     input_type = ApprovalDecision
     output_type = str
 
@@ -44,6 +46,7 @@ class _Approved(Module[ApprovalDecision, str]):
 
 
 class _Rejected(Module[ApprovalDecision, str]):
+    module_id = "demo.change.rejected"
     input_type = ApprovalDecision
     output_type = str
 

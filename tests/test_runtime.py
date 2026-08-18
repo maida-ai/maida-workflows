@@ -25,6 +25,7 @@ from maida.workflows.runtime import (
 
 
 class FlakyIncrement(Module[int, int]):
+    module_id = "runtime.flaky-increment"
     input_type = int
     output_type = int
 
@@ -78,6 +79,7 @@ class Item:
 
 
 class ReadItem(Module[Item, int]):
+    module_id = "runtime.read-item"
     input_type = Item
     output_type = int
 
@@ -119,6 +121,7 @@ async def test_mapped_step_instances_follow_item_keys_not_positions(
 
 
 class IsPositive(Module[int, bool]):
+    module_id = "number.is-positive"
     input_type = int
     output_type = bool
 
@@ -127,6 +130,7 @@ class IsPositive(Module[int, bool]):
 
 
 class CountingBranch(Module[int, int]):
+    module_id = "number.offset"
     input_type = int
     output_type = int
 
@@ -148,7 +152,11 @@ class BranchWorkflow(Workflow[int, int]):
     negative = CountingBranch(-10)
 
     def build(self, value: RuntimeValue[int]) -> RuntimeValue[int]:
-        return when(self.check(value), self.positive(value), self.negative(value))
+        return when(
+            self.check.at("check")(value),
+            self.positive.at("positive")(value),
+            self.negative.at("negative")(value),
+        )
 
 
 @pytest.mark.postgres
@@ -165,9 +173,7 @@ async def test_runtime_records_selected_branch_and_never_runs_the_other(
     assert workflow.negative.calls == 0
     assert len(history.accepted_boundaries) == 2
     chosen = next(
-        boundary
-        for boundary in history.accepted_boundaries
-        if boundary.module_id.endswith("positive")
+        boundary for boundary in history.accepted_boundaries if boundary.logical_step == "positive"
     )
     assert chosen.branch_decisions == ({"control_node": "root", "selected": "true"},)
 
@@ -181,9 +187,7 @@ async def test_recovery_worker_uses_persisted_input_without_replay_resolution(
     plan = compile_workflow(workflow)
     value = postgres_store.values.encode(1, schema_digest=schema_digest(int))
     run = postgres_store.create_run(plan, tenant_id="local", root_input=value)
-    step = next(
-        item for item in plan.executable_steps if item.module_id == "branch-runtime.positive"
-    )
+    step = next(item for item in plan.executable_steps if item.logical_step == "positive")
     task = postgres_store.enqueue_task(
         run.run_id,
         step,
@@ -259,9 +263,7 @@ async def test_worker_fails_closed_for_missing_modules_and_invalid_persisted_val
     postgres_store: PostgresStore,
 ) -> None:
     plan = compile_workflow(BranchWorkflow())
-    step = next(
-        item for item in plan.executable_steps if item.module_id == "branch-runtime.positive"
-    )
+    step = next(item for item in plan.executable_steps if item.logical_step == "positive")
     valid = postgres_store.values.encode(1, schema_digest=schema_digest(int))
     run = postgres_store.create_run(plan, tenant_id="local", root_input=valid)
     missing_task = postgres_store.enqueue_task(
@@ -306,9 +308,7 @@ async def test_worker_rejects_code_that_does_not_match_the_pinned_module_digest(
 ) -> None:
     workflow = BranchWorkflow()
     plan = compile_workflow(workflow)
-    step = next(
-        item for item in plan.executable_steps if item.module_id == "branch-runtime.positive"
-    )
+    step = next(item for item in plan.executable_steps if item.logical_step == "positive")
     value = postgres_store.values.encode(1, schema_digest=schema_digest(int))
     run = postgres_store.create_run(plan, tenant_id="local", root_input=value)
     task = postgres_store.enqueue_task(

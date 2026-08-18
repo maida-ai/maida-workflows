@@ -9,6 +9,7 @@ Examples
 --------
 >>> from maida.workflows import ExecutionContext, Module, RuntimeValue, Workflow
 >>> class Upper(Module[str, str]):
+...     module_id = "example.upper"
 ...     input_type = str
 ...     output_type = str
 ...     async def execute(self, value: str, ctx: ExecutionContext) -> str:

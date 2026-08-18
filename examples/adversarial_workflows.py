@@ -23,6 +23,7 @@ from maida.workflows import (
 class IsEscalated(Module[dict[str, object], bool]):
     """Read an escalation flag from a request mapping."""
 
+    module_id = "demo.is-escalated"
     input_type = dict[str, object]
     output_type = bool
 
@@ -33,6 +34,7 @@ class IsEscalated(Module[dict[str, object], bool]):
 class Route(Module[dict[str, object], str]):
     """Return the queue configured for one explicit branch occurrence."""
 
+    module_id = "demo.route"
     input_type = dict[str, object]
     output_type = str
 
@@ -72,6 +74,7 @@ class BatchItem:
 class NormalizeItem(Module[BatchItem, str]):
     """Normalize the payload of one stable mapped item."""
 
+    module_id = "demo.normalize-item"
     input_type = BatchItem
     output_type = str
 
@@ -98,6 +101,7 @@ class AdversarialMapWorkflow(Workflow[list[BatchItem], list[str]]):
 class Review(Module[str, str]):
     """Produce a deterministic review marker for an input string."""
 
+    module_id = "demo.review"
     input_type = str
     output_type = str
 
@@ -120,6 +124,7 @@ class ChildReviewWorkflow(Workflow[str, str]):
 class AuditEffect(Module[str, str]):
     """Effect-classified boundary used to prove replay never invokes effects."""
 
+    module_id = "demo.audit-effect"
     input_type = str
     output_type = str
     effectful = True

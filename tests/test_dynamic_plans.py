@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import traceback
+import types
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import replace
 from datetime import timedelta
@@ -15,6 +17,7 @@ from maida.workflows import (
     Connector,
     EffectSpec,
     ExecutionContext,
+    ExecutionSpec,
     Module,
     ModuleRegistry,
     PlanFragmentIR,
@@ -26,6 +29,7 @@ from maida.workflows import (
     RuntimeValue,
     Workflow,
     compile_workflow,
+    module_digest,
 )
 from maida.workflows._canonical import digest_data, schema_digest
 
@@ -75,6 +79,23 @@ class TextWorkflow(Workflow[str, str]):
         return self.text.at("text")(value)
 
 
+class _SyntheticModule(Module[Any, Any]):
+    behavior_marker: str
+
+    async def execute(self, value: Any, ctx: ExecutionContext) -> Any:
+        return value
+
+
+def _factory_for(
+    catalog: ModuleRegistry,
+    alias: str,
+) -> Callable[[], Module[Any, Any]]:
+    def factory() -> Module[Any, Any]:
+        return catalog.resolve(alias)
+
+    return factory
+
+
 def _allow(
     catalog: ModuleRegistry,
     alias: str,
@@ -84,20 +105,39 @@ def _allow(
     output_schema: str,
     *,
     budget: Budget = NODE_BUDGET,
-    capabilities: tuple[dict[str, Any], ...] = (),
-    effects: tuple[dict[str, Any], ...] = (),
+    capabilities: tuple[Capability[Any, Any], ...] = (),
+    effects: tuple[EffectSpec[Any, Any], ...] = (),
+    execution: dict[str, Any] | None = None,
 ) -> ModuleRegistry:
-    return catalog.allow(
-        alias,
-        module_id=module_id,
-        module_digest=digest_character * 64,
-        input_schema_digests=input_schemas,
-        output_schema_digest=output_schema,
-        execution=PROCESS_EXECUTION,
-        budget=budget,
-        capabilities=capabilities,
-        effects=effects,
+    if alias in catalog.aliases:
+        raise ValueError(f"module alias {alias!r} is already registered")
+    schema_types = {TEXT: str, NUMBER: int, FLAG: bool}
+    input_type: Any = (
+        schema_types[input_schemas[0]]
+        if len(input_schemas) == 1
+        else types.GenericAlias(tuple, tuple(schema_types[item] for item in input_schemas))
     )
+    output_type = schema_types[output_schema]
+
+    def factory() -> Module[Any, Any]:
+        module = _SyntheticModule()
+        module.module_id = module_id
+        module.input_type = input_type
+        module.output_type = output_type
+        module.behavior_marker = digest_character
+        module.execution = ExecutionSpec.from_data(execution or PROCESS_EXECUTION)
+        module.budget = budget
+        module.capabilities = capabilities
+        module.effects = effects
+        module.effectful = bool(effects)
+        return module
+
+    modules: dict[str, Callable[[], Module[Any, Any]]] = {
+        registered_alias: _factory_for(catalog, registered_alias)
+        for registered_alias in catalog.aliases
+    }
+    modules[alias] = factory
+    return ModuleRegistry(modules=modules)
 
 
 def _catalog() -> ModuleRegistry:
@@ -175,18 +215,23 @@ def test_valid_fragment_is_minimal_canonical_and_resolved_by_trusted_validation(
     assert signature.node_count == 4
     assert signature.max_depth == 3
     assert signature.max_fanout == 2
-    assert signature.module_composition == (
-        ("modules.join", "4" * 64, 1),
-        ("modules.left", "2" * 64, 1),
-        ("modules.right", "3" * 64, 1),
-        ("modules.source", "1" * 64, 1),
+    catalog = _catalog()
+    assert signature.module_composition == tuple(
+        sorted(
+            (
+                catalog.descriptor(alias)["module_id"],
+                catalog.descriptor(alias)["module_digest"],
+                1,
+            )
+            for alias in catalog.aliases
+        )
     )
     assert signature.outputs == ("join",)
     assert len(signature.topology_digest) == 64
     assert len(signature.digest) == 64
     resolved_source = next(node for node in signature.resolved_nodes if node["key"] == "source")
     assert resolved_source["module_id"] == "modules.source"
-    assert resolved_source["module_digest"] == "1" * 64
+    assert resolved_source["module_digest"] == catalog.descriptor("source")["module_digest"]
     assert resolved_source["input_schema_digests"] == (TEXT,)
     assert resolved_source["output_schema_digest"] == TEXT
 
@@ -272,7 +317,7 @@ def test_catalog_is_the_only_source_of_module_pins_schemas_and_execution_metadat
         "effects": [],
         "execution": PROCESS_EXECUTION,
         "input_schema_digests": [TEXT],
-        "module_digest": "a" * 64,
+        "module_digest": module_digest(allowed.resolve("text")),
         "module_id": "modules.text",
         "output_schema_digest": TEXT,
     }
@@ -288,12 +333,13 @@ def test_catalog_defensively_copies_and_freezes_trusted_descriptors() -> None:
     execution = dict(PROCESS_EXECUTION)
     capabilities = ["local"]
     execution["capabilities"] = capabilities
-    catalog = ModuleRegistry().allow(
+    catalog = _allow(
+        ModuleRegistry(),
         "text",
-        module_id="modules.text",
-        module_digest="a" * 64,
-        input_schema_digests=(TEXT,),
-        output_schema_digest=TEXT,
+        "modules.text",
+        "a",
+        (TEXT,),
+        TEXT,
         execution=execution,
         budget=NODE_BUDGET,
     )
@@ -308,35 +354,7 @@ def test_catalog_defensively_copies_and_freezes_trusted_descriptors() -> None:
     assert catalog.digest == original_digest
 
 
-@pytest.mark.parametrize(
-    ("kwargs", "message"),
-    (
-        ({"module_id": ""}, "module_id"),
-        ({"input_schema_digests": TEXT}, "ordered sequence"),
-        ({"execution": "process"}, "ExecutionSpec mapping"),
-        ({"execution": {**PROCESS_EXECUTION, "unknown": True}}, "ExecutionSpec contract"),
-        ({"execution": {**PROCESS_EXECUTION, "cpu": True}}, "ExecutionSpec contract"),
-    ),
-)
-def test_catalog_rejects_invalid_trusted_descriptors(
-    kwargs: dict[str, Any],
-    message: str,
-) -> None:
-    descriptor: dict[str, Any] = {
-        "module_id": "modules.text",
-        "module_digest": "a" * 64,
-        "input_schema_digests": (TEXT,),
-        "output_schema_digest": TEXT,
-        "execution": PROCESS_EXECUTION,
-        "budget": NODE_BUDGET,
-    }
-    descriptor.update(kwargs)
-
-    with pytest.raises(ValueError, match=message):
-        ModuleRegistry().allow("text", **descriptor)
-
-
-def test_catalog_projects_static_steps_and_retains_credential_free_access_contracts() -> None:
+def test_registry_derives_credential_free_access_contracts_from_factory() -> None:
     lookup = Capability(
         "records.lookup",
         connector="records",
@@ -358,7 +376,9 @@ def test_catalog_projects_static_steps_and_retains_credential_free_access_contra
     plan = compile_workflow(AccessWorkflow())
     replay_key = plan.executable_steps[0].replay_key
     assert replay_key is not None
-    catalog = ModuleRegistry.from_plan(plan, {"lookup": replay_key})
+    catalog = ModuleRegistry(
+        modules={"lookup": lambda: Connector(lookup, module_id="modules.records")}
+    )
     descriptor = catalog.descriptor("lookup")
 
     assert descriptor["module_id"] == "modules.records"
@@ -368,8 +388,7 @@ def test_catalog_projects_static_steps_and_retains_credential_free_access_contra
     assert descriptor["budget"] == Budget().to_data()
     assert "credentials" not in descriptor
     assert "grants" not in descriptor
-    with pytest.raises(ValueError, match="replay key"):
-        ModuleRegistry.from_plan(plan, {"missing": None})  # type: ignore[dict-item]
+    assert descriptor["module_digest"] == plan.executable_steps[0].module_digest
 
 
 def test_validator_rejects_unknown_alias_and_trusted_contract_mismatches() -> None:
@@ -716,8 +735,8 @@ def _single_catalog(
     alias: str = "unit",
     digest_character: str = "a",
     budget: Budget = NODE_BUDGET,
-    capabilities: tuple[dict[str, Any], ...] = (),
-    effects: tuple[dict[str, Any], ...] = (),
+    capabilities: tuple[Capability[Any, Any], ...] = (),
+    effects: tuple[EffectSpec[Any, Any], ...] = (),
 ) -> ModuleRegistry:
     return _allow(
         ModuleRegistry(),
@@ -739,7 +758,7 @@ def test_every_node_must_be_reverse_reachable_from_an_output() -> None:
         operation="write",
         input_type=str,
         output_type=str,
-    ).to_data()
+    )
     catalog = _allow(
         _catalog(),
         "hidden",
@@ -796,20 +815,12 @@ def test_alias_renames_preserve_resolved_behavior_and_digest() -> None:
         "join": "decide",
     }
     original_catalog = _catalog()
-    renamed_catalog = ModuleRegistry()
-    for original_alias, renamed_alias in sorted(aliases.items()):
-        descriptor = original_catalog.descriptor(original_alias)
-        renamed_catalog = renamed_catalog.allow(
-            renamed_alias,
-            module_id=descriptor["module_id"],
-            module_digest=descriptor["module_digest"],
-            input_schema_digests=tuple(descriptor["input_schema_digests"]),
-            output_schema_digest=descriptor["output_schema_digest"],
-            execution=descriptor["execution"],
-            budget=Budget.from_data(descriptor["budget"]),
-            capabilities=tuple(descriptor["capabilities"]),
-            effects=tuple(descriptor["effects"]),
-        )
+    renamed_catalog = ModuleRegistry(
+        modules={
+            renamed_alias: _factory_for(original_catalog, original_alias)
+            for original_alias, renamed_alias in aliases.items()
+        }
+    )
     renamed_fragment = replace(
         _fragment(),
         nodes=tuple(
@@ -883,7 +894,11 @@ def test_budget_aggregation_counts_occurrences_and_uses_dag_critical_path() -> N
         _validator(catalog=catalog, limits=replace(limits, budget=REGION_BUDGET)),
         repeated,
     )
-    assert ("modules.source", "1" * 64, 2) in repeated_signature.module_composition
+    assert (
+        "modules.source",
+        catalog.descriptor("source")["module_digest"],
+        2,
+    ) in repeated_signature.module_composition
     assert repeated_signature.aggregate_budget.model_tokens == 90
 
 
@@ -996,20 +1011,21 @@ def test_exact_child_grants_are_derived_and_region_escalation_is_rejected() -> N
         operation="read",
         input_type=str,
         output_type=str,
-    ).to_data()
+    )
     write = EffectSpec(
         "messages.send",
         connector="messages",
         operation="send",
         input_type=str,
         output_type=str,
-    ).to_data()
-    catalog = ModuleRegistry().allow(
+    )
+    catalog = _allow(
+        ModuleRegistry(),
         "unit",
-        module_id="modules.unit",
-        module_digest="a" * 64,
-        input_schema_digests=(TEXT,),
-        output_schema_digest=TEXT,
+        "modules.unit",
+        "a",
+        (TEXT,),
+        TEXT,
         execution={**PROCESS_EXECUTION, "capabilities": ["gpu-placement"]},
         budget=NODE_BUDGET,
         capabilities=(read,),
@@ -1046,7 +1062,7 @@ def test_approval_required_effects_need_trusted_policy_eligibility_check() -> No
         input_type=str,
         output_type=str,
         approval_required=True,
-    ).to_data()
+    )
     catalog = _single_catalog(effects=(effect,))
     grant = CapabilityGrant(effects=("messages.send",))
     with pytest.raises(PlanValidationError, match="trusted approval policy") as rejected:
@@ -1113,7 +1129,10 @@ def test_signature_revalidation_rebuilds_pins_instead_of_trusting_imported_data(
 
     assert imported.source_fragment_digest == trusted.source_fragment_digest
     assert imported.catalog_digest == trusted.catalog_digest
-    assert imported.resolved_nodes[0]["module_digest"] == "f" * 64
+    assert (
+        imported.resolved_nodes[0]["module_digest"]
+        == _single_catalog(digest_character="f").descriptor("unit")["module_digest"]
+    )
     assert (
         trusted_validator.revalidate(
             trusted,
@@ -1141,7 +1160,7 @@ def test_signature_import_requires_canonical_nested_access_and_grant_data() -> N
             operation=name,
             input_type=str,
             output_type=str,
-        ).to_data()
+        )
         for name in ("alpha", "zeta")
     )
     effects = tuple(
@@ -1151,7 +1170,7 @@ def test_signature_import_requires_canonical_nested_access_and_grant_data() -> N
             operation=name,
             input_type=str,
             output_type=str,
-        ).to_data()
+        )
         for name in ("archive", "send")
     )
     grant = CapabilityGrant(
@@ -1190,17 +1209,13 @@ def test_signature_import_requires_canonical_nested_access_and_grant_data() -> N
         PlanSignature.from_dict(encoded)
 
 
-def test_public_catalog_rejects_wire_budget_in_place_of_budget_object() -> None:
-    descriptor = {
-        "module_id": "modules.unit",
-        "module_digest": "a" * 64,
-        "input_schema_digests": (TEXT,),
-        "output_schema_digest": TEXT,
-        "execution": PROCESS_EXECUTION,
-        "budget": NODE_BUDGET.to_data(),
-    }
-    with pytest.raises(TypeError, match="budget must be a Budget"):
-        ModuleRegistry().allow("unit", **descriptor)  # type: ignore[arg-type]
+def test_registry_rejects_wire_budget_in_place_of_module_declaration() -> None:
+    class WireBudget(TextModule):
+        module_id = "modules.unit"
+        budget = NODE_BUDGET.to_data()  # type: ignore[assignment]
+
+    with pytest.raises(ValueError, match="module budget must be a Budget"):
+        ModuleRegistry(modules={"unit": WireBudget})
 
 
 def test_region_identity_and_limit_budget_types_fail_closed() -> None:

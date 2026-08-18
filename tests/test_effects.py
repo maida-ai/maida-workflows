@@ -147,6 +147,7 @@ class EffectWorkflow(Workflow[str, str]):
 
 
 class CommitThenFail(Module[str, str]):
+    module_id = "effects.commit-then-fail"
     input_type = str
     output_type = str
     effectful = True
@@ -181,6 +182,7 @@ class CommitThenFailWorkflow(Workflow[str, str]):
 
 
 class NestedCommitThenFail(Module[str, dict[str, Receipt]]):
+    module_id = "effects.nested-commit-then-fail"
     input_type = str
     output_type = dict[str, Receipt]
     effectful = True
@@ -219,6 +221,7 @@ class NestedCommitThenFailWorkflow(Workflow[str, dict[str, Receipt]]):
 
 
 class ConflictingRetry(Module[str, str]):
+    module_id = "effects.conflicting-retry"
     input_type = str
     output_type = str
     effectful = True
@@ -580,6 +583,7 @@ async def test_caught_retry_conflict_keeps_committed_ledger_effect_in_boundary(
     postgres_store: PostgresStore,
 ) -> None:
     class CatchConflictingRetry(Module[str, str]):
+        module_id = "effects.catch-conflicting-retry"
         input_type = str
         output_type = str
         effectful = True
@@ -722,6 +726,7 @@ async def test_caught_broker_denial_does_not_create_legacy_synthetic_effects(
     postgres_store: PostgresStore,
 ) -> None:
     class CatchDeniedEffect(Module[str, str]):
+        module_id = "effects.catch-denied"
         input_type = str
         output_type = str
         effectful = True
@@ -770,6 +775,7 @@ async def test_declared_effect_module_that_skips_access_has_no_synthetic_effect(
     postgres_store: PostgresStore,
 ) -> None:
     class SkipDeclaredEffect(Module[str, str]):
+        module_id = "effects.skip-declared"
         input_type = str
         output_type = str
         effectful = True
@@ -810,6 +816,7 @@ async def test_store_discards_forged_managed_effects_without_a_ledger_row(
     narrow_grant: bool,
 ) -> None:
     class SkipEffect(Module[str, str]):
+        module_id = "effects.skip"
         input_type = str
         output_type = str
         effectful = True
@@ -885,6 +892,7 @@ async def test_caught_undeclared_broker_effect_has_no_legacy_synthetic_commit(
     postgres_store: PostgresStore,
 ) -> None:
     class LegacyModuleCatchingDenial(Module[str, str]):
+        module_id = "effects.legacy-catch"
         input_type = str
         output_type = str
         effectful = True
@@ -925,6 +933,7 @@ async def test_caught_attempt_failure_cannot_accept_a_task_boundary(
     postgres_store: PostgresStore,
 ) -> None:
     class CatchAttemptFailure(Module[str, str]):
+        module_id = "effects.catch-attempt-failure"
         input_type = str
         output_type = str
         effectful = True
@@ -983,6 +992,7 @@ async def test_boundary_effect_history_is_not_mutable_module_metadata(
     postgres_store: PostgresStore,
 ) -> None:
     class TamperWithMetadata(Module[str, str]):
+        module_id = "effects.tamper-metadata"
         input_type = str
         output_type = str
         effectful = True
@@ -1078,6 +1088,7 @@ async def test_boundary_preserves_cross_effect_reservation_order(
             return f"{operation}-receipt"
 
     class OrderedEffects(Module[str, str]):
+        module_id = "effects.ordered"
         input_type = str
         output_type = str
         effectful = True
@@ -1444,6 +1455,7 @@ async def test_broker_audit_sink_cannot_forge_approval_control_events(
     )
 
     class AttemptApprovalForgery(Module[str, str]):
+        module_id = "effects.approval-forgery"
         input_type = str
         output_type = str
         effectful = True
@@ -1527,6 +1539,7 @@ async def test_missing_effect_adapter_and_request_schema_fail_before_reservation
         ).run(EffectWorkflow(), "private-message", tenant_id="tenant-a")
 
     class WrongRequest(Module[int, str]):
+        module_id = "effects.wrong-request"
         input_type = int
         output_type = str
         effectful = True

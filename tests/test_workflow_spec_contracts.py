@@ -24,6 +24,7 @@ from maida.workflows._canonical import type_schema
 
 
 class Echo(Module[str, str]):
+    module_id = "text.echo"
     input_type = str
     output_type = str
 
@@ -32,6 +33,7 @@ class Echo(Module[str, str]):
 
 
 class Length(Module[str, int]):
+    module_id = "text.length"
     input_type = str
     output_type = int
 
@@ -40,6 +42,7 @@ class Length(Module[str, int]):
 
 
 class Positive(Module[int, bool]):
+    module_id = "number.positive"
     input_type = int
     output_type = bool
 
@@ -55,6 +58,7 @@ class StructuredInput:
 
 
 class Structured(Module[StructuredInput, str]):
+    module_id = "text.structured"
     input_type = StructuredInput
     output_type = str
 
@@ -455,6 +459,11 @@ def test_node_import_rejects_unknown_and_noncanonical_fields() -> None:
     with pytest.raises(ValueError, match="fields"):
         NodeSpec.from_dict({"key": "step"})
 
+    generated_identity = deepcopy(data)
+    generated_identity["module_id"] = "untrusted.identity"
+    with pytest.raises(ValueError, match="fields"):
+        NodeSpec.from_dict(generated_identity)
+
     data["after"] = ["b", "a"]
     with pytest.raises(ValueError, match="not canonical"):
         NodeSpec.from_dict(data)
@@ -581,14 +590,12 @@ def test_workflow_compilation_enforces_access_and_replay_identity() -> None:
                 "first",
                 "text.echo",
                 BindingSpec.root(),
-                module_id="same.module",
                 logical_step="same-step",
             ),
             NodeSpec.task(
                 "second",
                 "text.echo",
                 BindingSpec.node("first"),
-                module_id="same.module",
                 logical_step="same-step",
             ),
         ),

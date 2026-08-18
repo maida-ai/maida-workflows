@@ -11,6 +11,7 @@ from examples.adversarial_workflows import AdversarialBranchWorkflow
 from maida.workflows import compile_workflow
 from maida.workflows._canonical import schema_digest
 from maida.workflows.cli import app
+from maida.workflows.ir import IR_VERSION
 from maida.workflows.persistence import PostgresStore
 from maida.workflows.runtime import WorkflowRunner
 
@@ -42,7 +43,7 @@ def test_cli_help_and_compile_surface() -> None:
         ],
     )
     assert compiled.exit_code == 0
-    assert json.loads(compiled.stdout)["version"] == "0.2.0"
+    assert json.loads(compiled.stdout)["version"] == IR_VERSION
 
 
 def test_cli_rejects_non_workflow_objects() -> None:

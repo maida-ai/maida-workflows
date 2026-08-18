@@ -184,16 +184,15 @@ class RuntimeValue[OutputT]:
 class Module[InputT, OutputT](ABC):
     """Typed unit of workflow execution.
 
-    Subclasses declare ``input_type`` and ``output_type`` and implement
-    :meth:`execute`. Assign module instances to workflow attributes so the
-    compiler can derive stable identities. Reused instances must use
-    :meth:`at` for every occurrence.
+    Subclasses declare a stable ``module_id``, ``input_type``, and
+    ``output_type`` and implement :meth:`execute`. The identity belongs to the
+    module, independent of any workflow or generated plan that uses it. Reused
+    instances must use :meth:`at` for every occurrence.
 
     Attributes
     ----------
     module_id
-        Optional stable component identity. If omitted, the workflow attribute
-        path supplies a default.
+        Required stable semantic component identity.
     input_type
         Python type accepted by the module.
     output_type
@@ -215,7 +214,7 @@ class Module[InputT, OutputT](ABC):
         Typed model declarations resolved through the runtime model broker.
     """
 
-    module_id: str | None = None
+    module_id: str
     input_type: type[InputT]
     output_type: type[OutputT]
     effectful: bool = False
@@ -311,6 +310,17 @@ class Module[InputT, OutputT](ABC):
         OutputT
             Concrete output matching :attr:`output_type`.
         """
+
+
+def _declared_module_id(module: Module[Any, Any]) -> str:
+    """Return a module's required graph-independent semantic identity."""
+    module_id = getattr(module, "module_id", None)
+    if not isinstance(module_id, str) or not module_id.strip():
+        raise ValueError(
+            f"{type(module).__qualname__} must declare a non-empty module_id, "
+            f'e.g. module_id = "application.component"'
+        )
+    return module_id
 
 
 @dataclass(frozen=True)

@@ -17,6 +17,7 @@ from maida.workflows import (
 )
 from maida.workflows.alignment import DiffKind, GraphAligner
 from maida.workflows.fixture import ReplayFixtureExporter
+from maida.workflows.ir import IR_VERSION
 from maida.workflows.persistence import PostgresStore
 from maida.workflows.replay import ReplayCase, ReplayEngine, ReplayMode, ReplayStatus
 
@@ -42,6 +43,7 @@ class GreetingInput:
 
 
 class Normalize(Module[int, int]):
+    module_id = "number.normalize"
     input_type = int
     output_type = int
 
@@ -50,6 +52,7 @@ class Normalize(Module[int, int]):
 
 
 class Greet(Module[GreetingInput, str]):
+    module_id = "text.greet"
     input_type = GreetingInput
     output_type = str
 
@@ -83,6 +86,7 @@ class RoutedRequest:
 
 
 class CopyMessage(Module[str, str]):
+    module_id = "text.copy"
     input_type = str
     output_type = str
 
@@ -103,8 +107,8 @@ class ProjectedConditionWorkflow(Workflow[RoutedRequest, str]):
     def build(self, value: RuntimeValue[RoutedRequest]) -> RuntimeValue[str]:
         return when(
             value.field(self.condition_field),
-            self.approved(value.message),
-            self.rejected(value.message),
+            self.approved.at("approved")(value.message),
+            self.rejected.at("rejected")(value.message),
         )
 
 
@@ -126,7 +130,7 @@ def test_keyword_bindings_compile_to_canonical_reconstructable_ir() -> None:
         if step.module_id is not None and step.module_id.endswith("normalize")
     )
 
-    assert plan.version == "0.4.0"
+    assert plan.version == IR_VERSION
     assert restored.canonical_json() == plan.canonical_json()
     assert greet.input_binding is not None
     assert greet.input_binding.kind == "object"
@@ -208,9 +212,7 @@ async def test_projected_condition_routes_across_durable_task_handoffs(
 
     plan = compile_workflow(ProjectedConditionWorkflow())
     history = postgres_store.load_run_history(result.run_id, tenant_id="local")
-    rejected_step = next(
-        step for step in plan.executable_steps if step.module_id == "projected-condition.rejected"
-    )
+    rejected_step = next(step for step in plan.executable_steps if step.logical_step == "rejected")
     task = next(task for task in history.tasks if task.logical_step == rejected_step.logical_step)
     assert task.status.value == "SUCCEEDED"
 

@@ -97,13 +97,13 @@ class _Audit(Module[tuple[str, str], str]):
 
 
 def _context_module() -> Module[Any, Any]:
-    module = Connector(CONTEXT, module_id="demo.context")
+    module = Connector(CONTEXT)
     module.budget = TOOL_BUDGET
     return module
 
 
 def _deliver_module() -> Module[Any, Any]:
-    module = Effect(DELIVER, module_id="demo.deliver")
+    module = Effect(DELIVER)
     module.budget = TOOL_BUDGET
     return module
 

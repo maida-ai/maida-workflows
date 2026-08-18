@@ -21,6 +21,7 @@ from maida.workflows.persistence import (
 
 
 class Increment(Module[int, int]):
+    module_id = "persistence.increment"
     input_type = int
     output_type = int
 

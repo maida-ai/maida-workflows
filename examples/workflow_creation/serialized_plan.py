@@ -28,6 +28,7 @@ from maida.workflows.persistence import PostgresStore
 
 
 class _Title(Module[str, str]):
+    module_id = "demo.title"
     input_type = str
     output_type = str
 
@@ -41,6 +42,7 @@ class _PrefixConfig:
 
 
 class _Prefix(Module[str, str]):
+    module_id = "demo.prefix"
     input_type = str
     output_type = str
 

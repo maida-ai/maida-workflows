@@ -23,6 +23,7 @@ ADD_CALLS: list[int] = []
 
 
 class AddOne(Module[int, int]):
+    module_id = "coordination.add-one"
     input_type = int
     output_type = int
 
@@ -45,6 +46,7 @@ class TwoSteps(Workflow[int, int]):
 
 
 class SlowAdd(Module[int, int]):
+    module_id = "coordination.slow-add"
     input_type = int
     output_type = int
 

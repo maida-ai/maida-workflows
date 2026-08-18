@@ -55,6 +55,7 @@ def fragment() -> PlanFragmentIR:
 
 
 class Planner(Module[int, dict[str, Any]]):
+    module_id = "planner.dynamic-materialization"
     input_type = int
     output_type = dict[str, Any]
 

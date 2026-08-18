@@ -34,6 +34,7 @@ class PrefixConfig:
 
 
 class Prefix(Module[str, str]):
+    module_id = "text.prefix"
     input_type = str
     output_type = str
 
@@ -123,24 +124,23 @@ def test_registry_rejects_ambiguous_or_unstable_aliases() -> None:
 
 
 def test_merged_registry_rejects_nonexecutable_and_unidentified_generated_bindings() -> None:
-    descriptor_only = ModuleRegistry().allow(
-        "trusted.only",
-        module_id="trusted.only",
-        module_digest="a" * 64,
-        input_schema_digests=(schema_digest(str),),
-        output_schema_digest=schema_digest(str),
-        execution=ExecutionSpec().to_data(),
-        budget=Budget(),
-    )
-    assert descriptor_only.describe()[0]["kind"] == "trusted"
-    with pytest.raises(TypeError, match="no executable factory"):
-        descriptor_only.resolve("trusted.only")
+    assert not hasattr(ModuleRegistry, "allow")
+    assert not hasattr(ModuleRegistry, "from_plan")
 
-    unidentified = ModuleRegistry(modules={"text.prefix": lambda: Prefix(PrefixConfig(prefix=">"))})
-    with pytest.raises(ValueError, match="self-declared module_id"):
-        unidentified.descriptor("text.prefix")
+    class Anonymous(Module[str, str]):
+        input_type = str
+        output_type = str
+
+        async def execute(self, value: str, ctx: ExecutionContext) -> str:
+            return value
+
+    def broken_factory() -> Module[Any, Any]:
+        return object()  # type: ignore[return-value]
+
+    with pytest.raises(ValueError, match=r"Anonymous.*module_id"):
+        ModuleRegistry(modules={"anonymous": Anonymous})
     with pytest.raises(TypeError, match="return a Module"):
-        ModuleRegistry(modules={"broken": lambda: object()}).resolve("broken")  # type: ignore[dict-item, return-value]
+        ModuleRegistry(modules={"broken": broken_factory})
 
 
 def test_template_and_descriptor_failures_are_explicit() -> None:

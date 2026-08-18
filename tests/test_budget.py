@@ -27,12 +27,13 @@ from maida.workflows import (
 )
 from maida.workflows._canonical import digest_data, schema_digest
 from maida.workflows.alignment import DiffKind, GraphAligner
-from maida.workflows.ir import PlanIR
+from maida.workflows.ir import IR_VERSION, PlanIR
 from maida.workflows.persistence import InvalidRunStateError, PersistenceError, PostgresStore
 from maida.workflows.replay import build_module_registry
 
 
 class BudgetedIdentity(Module[int, int]):
+    module_id = "budget.identity"
     input_type = int
     output_type = int
 
@@ -56,6 +57,7 @@ class BudgetedWorkflow(Workflow[int, int]):
 
 
 class UnbudgetedIdentity(Module[int, int]):
+    module_id = "budget.unbudgeted-identity"
     input_type = int
     output_type = int
 
@@ -92,6 +94,7 @@ RESOURCE_EFFECT = EffectSpec(
 
 
 class ResourceBoundIdentity(Module[int, int]):
+    module_id = "budget.resource-bound-identity"
     input_type = int
     output_type = int
     effectful = True
@@ -219,10 +222,10 @@ def test_unbounded_workflow_keeps_the_exact_access_ir_definition_contract() -> N
         }
     )
 
-    assert plan.version == "0.2.0"
-    assert step.budget is None
+    assert plan.version == IR_VERSION
+    assert step.budget == Budget().to_data()
     assert step.definition_digest == expected_definition_digest
-    assert "budget" not in plan.to_dict()["steps"][0]
+    assert plan.to_dict()["steps"][0]["budget"] == Budget().to_data()
     assert PlanIR.from_dict(plan.to_dict()).digest == plan.digest
 
 
@@ -232,7 +235,7 @@ def test_budget_changes_content_identity_and_has_a_specific_structural_diff() ->
     source_step = source.executable_steps[0]
     current_step = current.executable_steps[0]
 
-    assert source.version == "0.3.0"
+    assert source.version == IR_VERSION
     assert source_step.replay_key == current_step.replay_key
     assert source_step.budget == Budget(model_tokens=1_000).to_data()
     assert source_step.module_digest != current_step.module_digest
@@ -260,101 +263,10 @@ def test_current_budget_ir_round_trips_and_rejects_missing_or_extra_usage_fields
         PlanIR.from_dict(usage_in_declaration)
 
 
-def test_legacy_missing_budget_aligns_with_the_current_unbounded_default() -> None:
-    current = compile_workflow(BudgetedWorkflow(Budget()))
-    legacy = PlanIR.from_dict(current.to_dict())
-
-    assert current.version == "0.2.0"
-    assert GraphAligner().align(legacy, current).diff.changes == ()
-
-
-LEGACY_STEP = {
-    "control": None,
-    "definition_digest": "definition",
-    "dependencies": ["input"],
-    "execution": None,
-    "input_binding": {"schema_digest": "input-schema", "source": "input"},
-    "kind": "module",
-    "logical_step": "root",
-    "module_digest": "module",
-    "module_id": "legacy.step",
-    "node_id": "root",
-    "output_schema_digest": "output-schema",
-}
-
-
-@pytest.mark.parametrize(
-    ("version", "step_fields", "expected_json", "expected_digest"),
-    (
-        (
-            "0.1.0",
-            {},
-            '{"input_schema":{"type":"integer"},"output_node":"root",'
-            '"output_schema":{"type":"integer"},"steps":[{"control":null,'
-            '"definition_digest":"definition","dependencies":["input"],'
-            '"execution":null,"input_binding":{"schema_digest":"input-schema",'
-            '"source":"input"},"kind":"module","logical_step":"root",'
-            '"module_digest":"module","module_id":"legacy.step","node_id":"root",'
-            '"output_schema_digest":"output-schema"}],"version":"0.1.0",'
-            '"workflow_id":"legacy"}',
-            "515ac63d7b3088397ce0bbd0b07f85bebd1703aa3d2928f0f6d7478ba07cf155",
-        ),
-        (
-            "0.2.0",
-            {"capabilities": [], "effects": []},
-            '{"input_schema":{"type":"integer"},"output_node":"root",'
-            '"output_schema":{"type":"integer"},"steps":[{"capabilities":[],'
-            '"control":null,"definition_digest":"definition","dependencies":["input"],'
-            '"effects":[],"execution":null,"input_binding":{'
-            '"schema_digest":"input-schema","source":"input"},"kind":"module",'
-            '"logical_step":"root","module_digest":"module",'
-            '"module_id":"legacy.step","node_id":"root",'
-            '"output_schema_digest":"output-schema"}],"version":"0.2.0",'
-            '"workflow_id":"legacy"}',
-            "d1bd918214343fa05536269bbd3bdf5d992b7f9ed6b40100d450256a38120c55",
-        ),
-    ),
-)
-def test_legacy_workflow_ir_keeps_exact_bytes_and_digests(
-    version: str,
-    step_fields: dict[str, Any],
-    expected_json: str,
-    expected_digest: str,
-) -> None:
-    data = {
-        "version": version,
-        "workflow_id": "legacy",
-        "input_schema": {"type": "integer"},
-        "output_schema": {"type": "integer"},
-        "steps": [{**LEGACY_STEP, **step_fields}],
-        "output_node": "root",
-    }
-
-    loaded = PlanIR.from_dict(data)
-
-    assert loaded.to_dict() == data
-    assert loaded.canonical_json() == expected_json
-    assert loaded.digest == expected_digest == digest_data(data)
-    assert loaded.executable_steps[0].budget is None
-
-
-@pytest.mark.parametrize("version", ("0.1.0", "0.2.0"))
-def test_legacy_workflow_ir_rejects_budget_fields(version: str) -> None:
-    step: dict[str, Any] = dict(LEGACY_STEP)
-    if version == "0.2.0":
-        step.update(capabilities=[], effects=[])
-    step["budget"] = Budget().to_data()
-    data = {
-        "version": version,
-        "workflow_id": "legacy",
-        "input_schema": {"type": "integer"},
-        "output_schema": {"type": "integer"},
-        "steps": [step],
-        "output_node": "root",
-    }
-
-    with pytest.raises(ValueError, match="does not define budget"):
-        PlanIR.from_dict(data)
+@pytest.mark.parametrize("version", ("0.1.0", "0.2.0", "0.3.0", "0.4.0", "0.5.0"))
+def test_graph_derived_identity_ir_versions_fail_loudly(version: str) -> None:
+    with pytest.raises(ValueError, match="predates graph-independent module identity"):
+        PlanIR.from_dict({"version": version})
 
 
 @pytest.mark.postgres
@@ -478,7 +390,7 @@ async def test_populated_access_ir_run_resumes_after_budget_schema_upgrade(
         1,
         tenant_id="tenant-a",
     )
-    assert scheduler.plan.version == "0.2.0"
+    assert scheduler.plan.version == IR_VERSION
 
     with postgres_store.connect() as connection, connection.cursor() as cursor:
         cursor.execute("ALTER TABLE workflow_tasks DROP COLUMN budget_declaration")

@@ -999,7 +999,7 @@ class PlanSignature:
 
 def _plan_from_signature(signature: PlanSignature) -> PlanIR:
     """Project one resolved generated signature into the shared graph model."""
-    from .ir import BindingIR, PlanIR, StepIR
+    from .ir import IR_VERSION, BindingIR, PlanIR, StepIR
 
     steps: list[StepIR] = []
     by_key = {cast(str, descriptor["key"]): descriptor for descriptor in signature.resolved_nodes}
@@ -1072,7 +1072,7 @@ def _plan_from_signature(signature: PlanSignature) -> PlanIR:
         )
     )
     return PlanIR(
-        version="0.4.0",
+        version=IR_VERSION,
         workflow_id=f"dynamic:{signature.region_id}",
         input_schema={"digest": signature.region_input_schema_digest},
         output_schema={"digests": list(signature.output_schema_digests)},

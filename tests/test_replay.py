@@ -55,6 +55,7 @@ class FakeTraceBridge:
 
 
 class First(Module[int, int]):
+    module_id = "chain.first"
     input_type = int
     output_type = int
 
@@ -67,6 +68,7 @@ class First(Module[int, int]):
 
 
 class Second(Module[int, int]):
+    module_id = "chain.second"
     input_type = int
     output_type = int
 
@@ -166,7 +168,7 @@ async def test_full_stub_and_selective_replay_are_isolated(postgres_store: Postg
     assert full.output == 4
     assert current.first.calls == current.second.calls == bridge.calls == 0
 
-    key = ReplayKey("chain.second", "second")
+    key = ReplayKey(Second.module_id, "second")
     selective = await engine.replay(
         current,
         ReplayCase(fixture, ReplayMode.SELECTIVE, (key,)),
@@ -193,7 +195,7 @@ async def test_selective_replay_classifies_usage_drift_with_unchanged_output(
         ReplayCase(
             fixture,
             ReplayMode.SELECTIVE,
-            (ReplayKey("chain.second", "second"),),
+            (ReplayKey(Second.module_id, "second"),),
         ),
     )
 
@@ -216,7 +218,7 @@ async def test_selective_budget_counts_only_live_usage(postgres_store: PostgresS
         ReplayCase(
             fixture,
             ReplayMode.SELECTIVE,
-            (ReplayKey("chain.second", "second"),),
+            (ReplayKey(Second.module_id, "second"),),
             ReplayBudget(max_cost_usd=0.1),
         ),
     )
@@ -246,6 +248,7 @@ async def test_fixture_exports_are_deterministic_private_and_integrity_checked(
 
 
 class Echo(Module[str, str]):
+    module_id = "echo.echo"
     input_type = str
     output_type = str
 
@@ -312,6 +315,7 @@ async def test_failed_incomplete_and_generic_traces_are_rejected(
 
 
 class Added(Module[int, int]):
+    module_id = "historical-path.added"
     input_type = int
     output_type = int
 
@@ -329,6 +333,7 @@ class InsertedChain(ChangedChain):
 
 
 class IsPositive(Module[int, bool]):
+    module_id = "historical-path.condition"
     input_type = int
     output_type = bool
 
@@ -337,6 +342,7 @@ class IsPositive(Module[int, bool]):
 
 
 class Offset(Module[int, int]):
+    module_id = "historical-path.offset"
     input_type = int
     output_type = int
 
@@ -425,6 +431,7 @@ async def test_replay_alignment_projects_only_the_historical_executed_branch(
 
 
 class StringSecond(Module[int, str]):
+    module_id = "chain.second"
     input_type = int
     output_type = str
 
@@ -456,6 +463,7 @@ async def test_contract_invalid_injection_is_a_hard_error(postgres_store: Postgr
 
 
 class SentinelEffect(Module[int, int]):
+    module_id = "effect.effect"
     input_type = int
     output_type = int
     effectful = True
@@ -497,7 +505,7 @@ async def test_targeted_effect_module_is_stubbed_and_production_adapter_never_ru
         ReplayCase(
             fixture,
             ReplayMode.SELECTIVE,
-            (ReplayKey("effect.effect", "root"),),
+            (ReplayKey(SentinelEffect.module_id, "root"),),
         ),
     )
     assert full.output == selective.output == 8
@@ -506,6 +514,7 @@ async def test_targeted_effect_module_is_stubbed_and_production_adapter_never_ru
 
 
 class Safe(Module[int, int]):
+    module_id = "broker.boundary"
     input_type = int
     output_type = int
 
@@ -549,7 +558,7 @@ async def test_any_broker_effect_attempt_is_a_hard_violation(
         ReplayCase(
             fixture,
             ReplayMode.SELECTIVE,
-            (ReplayKey("broker.boundary", "root"),),
+            (ReplayKey(Safe.module_id, "root"),),
         ),
     )
     assert result.status is ReplayStatus.REPLAY_EFFECT_VIOLATION
@@ -560,7 +569,7 @@ async def test_any_broker_effect_attempt_is_a_hard_violation(
         ReplayCase(
             fixture,
             ReplayMode.SELECTIVE,
-            (ReplayKey("broker.boundary", "root"),),
+            (ReplayKey(Safe.module_id, "root"),),
         ),
     )
     assert suppressed.status is ReplayStatus.REPLAY_EFFECT_VIOLATION
@@ -580,12 +589,12 @@ class ReusedWorkflow(Workflow[int, int]):
 def test_ambiguous_and_invalid_selectors_are_rejected() -> None:
     plan = compile_workflow(ReusedWorkflow())
     with pytest.raises(ReplaySelectorError, match="ambiguous"):
-        resolve_selectors(plan, ["module:reused-selector.shared"])
+        resolve_selectors(plan, [f"module:{First.module_id}"])
     with pytest.raises(ReplaySelectorError, match="module:ID"):
         resolve_selectors(plan, ["bad"])
     assert resolve_selectors(plan, ["step:first", "step:second"]) == (
-        ReplayKey("reused-selector.shared", "first"),
-        ReplayKey("reused-selector.shared", "second"),
+        ReplayKey(First.module_id, "first"),
+        ReplayKey(First.module_id, "second"),
     )
 
 

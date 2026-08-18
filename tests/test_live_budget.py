@@ -24,6 +24,7 @@ from maida.workflows import (
     WorkflowRunner,
     compile_workflow,
 )
+from maida.workflows.ir import IR_VERSION
 from maida.workflows.persistence import PostgresStore
 
 
@@ -65,6 +66,7 @@ class FakeModelAdapter:
 
 
 class ModelModule(Module[str, str]):
+    module_id = "budget.model"
     input_type = str
     output_type = str
     models = (MODEL,)
@@ -90,6 +92,7 @@ class ModelWorkflow(Workflow[str, str]):
 
 
 class SlowModule(Module[int, int]):
+    module_id = "budget.slow"
     input_type = int
     output_type = int
     budget = Budget(wall_time=timedelta(milliseconds=10))
@@ -174,7 +177,7 @@ def test_declared_models_are_canonical_behavior_bearing_ir() -> None:
     second_workflow.model.models = (changed_model,)
     second = compile_workflow(second_workflow)
 
-    assert first.version == "0.5.0"
+    assert first.version == IR_VERSION
     assert first.executable_steps[0].models == (MODEL.to_data(),)
     assert first.executable_steps[0].replay_key == second.executable_steps[0].replay_key
     assert first.executable_steps[0].module_digest != second.executable_steps[0].module_digest

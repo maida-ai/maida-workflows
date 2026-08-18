@@ -13,7 +13,7 @@ import marshal
 import re
 from collections import Counter
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from typing import Any, cast
 
 from ._canonical import (
@@ -29,6 +29,7 @@ from .authoring import (
     Module,
     RuntimeValue,
     Workflow,
+    _declared_module_id,
     _FieldBinding,
     _MapBinding,
     _ModuleBinding,
@@ -38,12 +39,9 @@ from .authoring import (
 from .budget import Budget
 from .model import _model_contract, _validated_model_contract
 
-IR_VERSION = "0.5.0"
-SUPPORTED_IR_VERSIONS = frozenset({"0.1.0", "0.2.0", "0.3.0", "0.4.0", IR_VERSION})
-_ACCESS_IR_VERSIONS = frozenset({"0.2.0", "0.3.0", "0.4.0", IR_VERSION})
-_BUDGET_IR_VERSIONS = frozenset({"0.3.0", "0.4.0", IR_VERSION})
-_STRUCTURED_IR_VERSIONS = frozenset({"0.4.0", IR_VERSION})
-_MODEL_IR_VERSIONS = frozenset({IR_VERSION})
+IR_VERSION = "0.6.0"
+SUPPORTED_IR_VERSIONS = frozenset({IR_VERSION})
+_GRAPH_DERIVED_IDENTITY_IR_VERSIONS = frozenset({"0.1.0", "0.2.0", "0.3.0", "0.4.0", "0.5.0"})
 
 
 class CompileError(ValueError):
@@ -59,15 +57,15 @@ class ReplayKey:
     module_id
         Stable identity of the semantic component.
     logical_step
-        Stable position of this occurrence in the workflow definition.
+        Stable position of this occurrence in the plan instance.
     """
 
     module_id: str
     logical_step: str
 
     def as_string(self) -> str:
-        """Return the canonical ``module_id@logical_step`` representation."""
-        return f"{self.module_id}@{self.logical_step}"
+        """Return the versioned canonical replay-address representation."""
+        return f"replay-v1:{self.module_id}@{self.logical_step}"
 
 
 @dataclass(frozen=True)
@@ -98,12 +96,8 @@ class BindingIR:
     fields: tuple[tuple[str, BindingIR], ...] = ()
     items: tuple[BindingIR, ...] = ()
 
-    def to_data(self, *, legacy: bool = False) -> dict[str, Any]:
+    def to_data(self) -> dict[str, Any]:
         """Return the canonical recursive wire representation."""
-        if legacy:
-            if self.kind != "source" or self.source is None:
-                raise ValueError("legacy Workflow IR supports only source bindings")
-            return {"source": self.source, "schema_digest": self.schema_digest}
         data: dict[str, Any] = {"kind": self.kind, "schema_digest": self.schema_digest}
         if self.kind in {"source", "field"}:
             data["source"] = self.source
@@ -122,14 +116,10 @@ class BindingIR:
         return data
 
     @classmethod
-    def from_data(cls, data: Any, *, legacy: bool = False) -> BindingIR:
+    def from_data(cls, data: Any) -> BindingIR:
         """Validate and restore a recursive binding from canonical data."""
         if not isinstance(data, Mapping):
             raise ValueError("Workflow IR input binding must be an object")
-        if legacy:
-            if set(data) != {"source", "schema_digest"}:
-                raise ValueError("legacy Workflow IR input binding fields are invalid")
-            return cls(source=str(data["source"]), schema_digest=str(data["schema_digest"]))
         kind = data.get("kind")
         expected_fields = {
             "source": {"kind", "schema_digest", "source"},
@@ -286,22 +276,12 @@ class PlanIR:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a deterministic JSON-compatible representation of the plan."""
+        if self.version != IR_VERSION:
+            raise ValueError(f"cannot serialize unsupported Workflow IR version {self.version!r}")
         encoded = cast(dict[str, Any], canonical_data(asdict(self)))
         for raw_step, step in zip(encoded["steps"], self.steps, strict=True):
             if step.input_binding is not None:
-                raw_step["input_binding"] = step.input_binding.to_data(
-                    legacy=self.version not in _STRUCTURED_IR_VERSIONS
-                )
-        if self.version not in _MODEL_IR_VERSIONS:
-            for step in encoded["steps"]:
-                step.pop("models", None)
-        if self.version in {"0.1.0", "0.2.0"}:
-            for step in encoded["steps"]:
-                step.pop("budget", None)
-        if self.version == "0.1.0":
-            for step in encoded["steps"]:
-                step.pop("capabilities", None)
-                step.pop("effects", None)
+                raw_step["input_binding"] = step.input_binding.to_data()
         return encoded
 
     @classmethod
@@ -325,62 +305,51 @@ class PlanIR:
             invalid.
         """
         version = data.get("version")
+        if version in _GRAPH_DERIVED_IDENTITY_IR_VERSIONS:
+            raise ValueError(
+                f"Workflow IR {version} predates graph-independent module identity; "
+                "recompile the plan"
+            )
         if version not in SUPPORTED_IR_VERSIONS:
             raise ValueError(
                 f"unsupported Workflow IR version {data.get('version')!r}; "
                 f"expected one of {sorted(SUPPORTED_IR_VERSIONS)}"
             )
-        if version == "0.1.0" and any(
-            "capabilities" in step or "effects" in step for step in data["steps"]
-        ):
-            raise ValueError("Workflow IR 0.1.0 does not define external access fields")
-        if version in {"0.1.0", "0.2.0"} and any("budget" in step for step in data["steps"]):
-            raise ValueError(f"Workflow IR {version} does not define budget fields")
-        if version not in _MODEL_IR_VERSIONS and any("models" in step for step in data["steps"]):
-            raise ValueError(f"Workflow IR {version} does not define model fields")
         steps = []
         for raw in data["steps"]:
             binding = raw.get("input_binding")
-            if version in _ACCESS_IR_VERSIONS and (
-                "capabilities" not in raw or "effects" not in raw
-            ):
+            if "capabilities" not in raw or "effects" not in raw:
                 raise ValueError(f"Workflow IR {version} steps require external access fields")
-            if version in _BUDGET_IR_VERSIONS and "budget" not in raw:
+            if "budget" not in raw:
                 raise ValueError(f"Workflow IR {version} steps require a budget field")
-            if version in _MODEL_IR_VERSIONS and "models" not in raw:
+            if "models" not in raw:
                 raise ValueError(f"Workflow IR {version} steps require a models field")
             budget: dict[str, int | float | None] | None = None
-            if version in _BUDGET_IR_VERSIONS:
-                raw_budget = raw["budget"]
-                if raw.get("module_id") is None:
-                    if raw_budget is not None:
-                        raise ValueError(
-                            f"control Workflow IR node {raw.get('node_id')!r} "
-                            "cannot declare a budget"
-                        )
-                else:
-                    if not isinstance(raw_budget, Mapping):
-                        raise ValueError(
-                            f"Workflow IR node {raw.get('node_id')!r} budget must be an object"
-                        )
-                    try:
-                        restored_budget = Budget.from_data(raw_budget)
-                    except (TypeError, ValueError) as exc:
-                        raise ValueError(
-                            f"Workflow IR node {raw.get('node_id')!r} budget is invalid: {exc}"
-                        ) from exc
-                    budget = restored_budget.to_data()
-                    if canonical_json(budget) != canonical_json(raw_budget):
-                        raise ValueError(
-                            f"Workflow IR node {raw.get('node_id')!r} budget is not canonical"
-                        )
-            restored_binding = (
-                BindingIR.from_data(binding, legacy=version not in _STRUCTURED_IR_VERSIONS)
-                if binding
-                else None
-            )
+            raw_budget = raw["budget"]
+            if raw.get("module_id") is None:
+                if raw_budget is not None:
+                    raise ValueError(
+                        f"control Workflow IR node {raw.get('node_id')!r} cannot declare a budget"
+                    )
+            else:
+                if not isinstance(raw_budget, Mapping):
+                    raise ValueError(
+                        f"Workflow IR node {raw.get('node_id')!r} budget must be an object"
+                    )
+                try:
+                    restored_budget = Budget.from_data(raw_budget)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"Workflow IR node {raw.get('node_id')!r} budget is invalid: {exc}"
+                    ) from exc
+                budget = restored_budget.to_data()
+                if canonical_json(budget) != canonical_json(raw_budget):
+                    raise ValueError(
+                        f"Workflow IR node {raw.get('node_id')!r} budget is not canonical"
+                    )
+            restored_binding = BindingIR.from_data(binding) if binding else None
             if restored_binding is not None and canonical_json(
-                restored_binding.to_data(legacy=version not in _STRUCTURED_IR_VERSIONS)
+                restored_binding.to_data()
             ) != canonical_json(binding):
                 raise ValueError("Workflow IR input binding is not canonical")
             steps.append(
@@ -399,19 +368,19 @@ class PlanIR:
                         raw.get("capabilities", ()),
                         expected_kind="capability",
                         location=f"Workflow IR node {raw.get('node_id')!r} capabilities",
-                        require_canonical=version in _ACCESS_IR_VERSIONS,
+                        require_canonical=True,
                         error_type=ValueError,
                     ),
                     effects=_validated_access_declarations(
                         raw.get("effects", ()),
                         expected_kind="effect",
                         location=f"Workflow IR node {raw.get('node_id')!r} effects",
-                        require_canonical=version in _ACCESS_IR_VERSIONS,
+                        require_canonical=True,
                         error_type=ValueError,
                     ),
                     models=_validated_model_contract(
                         raw.get("models", ()),
-                        require_canonical=version in _MODEL_IR_VERSIONS,
+                        require_canonical=True,
                     ),
                     budget=budget,
                     control=raw.get("control"),
@@ -702,24 +671,6 @@ def _callback_identity(callback: Callable[[Any], str]) -> str:
     return f"{qualified_name(callback)}:{digest_bytes(content)}"
 
 
-def _module_paths(workflow: Workflow[Any, Any]) -> dict[int, str]:
-    found: dict[int, list[str]] = {}
-    for name in sorted(dir(workflow)):
-        if name.startswith("_"):
-            continue
-        try:
-            value = getattr(workflow, name)
-        except Exception as exc:  # pragma: no cover - hostile descriptors are invalid definitions
-            raise CompileError(f"cannot inspect workflow attribute {name!r}: {exc}") from exc
-        if isinstance(value, Module):
-            found.setdefault(id(value), []).append(name)
-    ambiguous = [paths for paths in found.values() if len(paths) > 1]
-    if ambiguous:
-        joined = ", ".join("/".join(paths) for paths in ambiguous)
-        raise CompileError(f"the same module is assigned to multiple workflow attributes: {joined}")
-    return {module_id: paths[0] for module_id, paths in found.items()}
-
-
 class _Compiler:
     def __init__(self, workflow: Workflow[Any, Any]) -> None:
         self.root_workflow = workflow
@@ -730,8 +681,6 @@ class _Compiler:
         self.keys: set[ReplayKey] = set()
         self.modules: dict[ReplayKey, Module[Any, Any]] = {}
         self.map_item_keys: dict[str, str | Callable[[Any], str]] = {}
-        self.requires_structured_bindings = False
-        self.module_paths_by_workflow: dict[int, dict[int, str]] = {}
 
     def compile(self) -> PlanIR:
         return self.compile_graph().plan
@@ -751,22 +700,10 @@ class _Compiler:
             workflow=self.root_workflow,
             external_input="input",
         )
-        has_models = any(step.models for step in self.steps)
-        version = (
-            IR_VERSION if has_models else "0.4.0" if self.requires_structured_bindings else "0.3.0"
-        )
         steps = tuple(self.steps)
-        if not self.requires_structured_bindings and all(
-            step.budget == Budget().to_data() for step in steps if step.replay_key is not None
-        ):
-            version = "0.2.0"
-            steps = tuple(
-                replace(step, budget=None) if step.replay_key is not None else step
-                for step in steps
-            )
         return _CompiledWorkflowGraph(
             PlanIR(
-                version=version,
+                version=IR_VERSION,
                 workflow_id=self.root_workflow.workflow_id,
                 input_schema=type_schema(self.root_workflow.input_type),
                 output_schema=type_schema(self.root_workflow.output_type),
@@ -781,7 +718,6 @@ class _Compiler:
     def _validate_workflow(self, workflow: Workflow[Any, Any]) -> None:
         if not getattr(workflow, "workflow_id", ""):
             raise CompileError("workflow_id must be a non-empty stable identifier")
-        self.module_paths_by_workflow[id(workflow)] = _module_paths(workflow)
 
     def _visit(
         self,
@@ -811,7 +747,7 @@ class _Compiler:
             )
             node_id = self._visit(
                 binding.output,
-                path=f"{path}.nested[{nested.workflow_id}]",
+                path=f"{path}.nested",
                 workflow=nested,
                 external_input=source,
             )
@@ -834,9 +770,7 @@ class _Compiler:
                 binding.logical_step,
                 binding.explicit,
                 path,
-                workflow,
                 dependencies,
-                value,
                 input_binding=input_binding,
                 control=None,
             )
@@ -864,9 +798,7 @@ class _Compiler:
                 binding.logical_step,
                 binding.explicit,
                 path,
-                workflow,
                 dependencies,
-                value,
                 input_binding=BindingIR(
                     source=dependencies[0],
                     schema_digest=schema_digest(binding.module.input_type),
@@ -936,14 +868,12 @@ class _Compiler:
         expression = value._expression
         value_digest = schema_digest(value.value_type)
         if expression.kind == "literal":
-            self.requires_structured_bindings = True
             return BindingIR(
                 schema_digest=value_digest,
                 kind="literal",
                 value=canonical_data(expression.payload),
             )
         if expression.kind == "field":
-            self.requires_structured_bindings = True
             root, projected_path = self._field_root(value)
             source = self._visit(
                 root,
@@ -958,7 +888,6 @@ class _Compiler:
                 path=projected_path,
             )
         if expression.kind == "object":
-            self.requires_structured_bindings = True
             structured = expression.payload
             if not isinstance(structured, _StructuredBinding) or structured.kind != "object":
                 raise CompileError("invalid structured module input")
@@ -1001,9 +930,7 @@ class _Compiler:
         explicit_logical_step: str | None,
         explicit: bool,
         path: str,
-        workflow: Workflow[Any, Any],
         dependencies: tuple[str, ...],
-        value: RuntimeValue[Any],
         input_binding: BindingIR,
         control: Mapping[str, Any] | None,
     ) -> StepIR:
@@ -1017,14 +944,10 @@ class _Compiler:
                 "a reused module requires an explicit .at(logical_step) identity "
                 "for every occurrence"
             )
-        attr_path = self.module_paths_by_workflow[id(workflow)].get(id(module))
-        module_id = module.module_id
-        if module_id is None:
-            if attr_path is None:
-                raise CompileError(
-                    "a module without module_id must be assigned to a named workflow attribute"
-                )
-            module_id = f"{workflow.workflow_id}.{attr_path}"
+        try:
+            module_id = _declared_module_id(module)
+        except ValueError as exc:
+            raise CompileError(str(exc)) from exc
         logical_step = explicit_logical_step if explicit else path
         if logical_step is None:  # defensive: explicit bindings always carry a step
             raise CompileError("module occurrence has no logical_step")
@@ -1096,10 +1019,8 @@ def compile_workflow(workflow: Workflow[Any, Any]) -> PlanIR:
 
     Notes
     -----
-    Workflows whose modules all use the unbounded default resource envelope
-    retain the exact ``0.2.0`` representation and digest. Declaring any finite
-    :class:`~maida.workflows.Budget` selects the budget-capable ``0.3.0``
-    representation.
+    All workflows emit the current IR format. Older graph-derived identity
+    formats must be recompiled rather than imported under changed semantics.
 
     Examples
     --------
@@ -1136,7 +1057,7 @@ def _validate_imported_plan(plan: PlanIR) -> None:
                 step.module_digest is None
                 or step.definition_digest is None
                 or step.input_binding is None
-                or (plan.version in _BUDGET_IR_VERSIONS and step.budget is None)
+                or step.budget is None
             ):
                 raise ValueError(
                     f"executable Workflow IR node {step.node_id!r} has an incomplete definition"

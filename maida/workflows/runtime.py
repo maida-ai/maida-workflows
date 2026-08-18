@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -40,6 +39,7 @@ from .authoring import (
     ExecutionContext,
     Module,
     Workflow,
+    _declared_module_id,
 )
 from .budget import BudgetExceededError, BudgetUsage, _LiveBudgetMeter
 from .definitions import BoundWorkflow, bind_workflow
@@ -72,7 +72,6 @@ from .models import (
 from .persistence import ClaimedTask
 
 _rehydrate = _rehydrate_value
-_NESTED_SCOPE_PATTERN = re.compile(r"\.nested\[([^\]]+)\]")
 
 
 class RuntimeExecutionError(RuntimeError):
@@ -1103,7 +1102,6 @@ class WorkflowScheduler:
                 return
             seen.add(node_id)
             step = self.steps[node_id]
-            scope = _with_nested_scope(node_id, scope)
             if step.kind == "when":
                 visit(step.dependencies[0], scope)
                 return
@@ -1143,7 +1141,7 @@ class WorkflowScheduler:
         result = self._evaluate_step(
             self.steps[node_id],
             external=external,
-            scope=_with_nested_scope(node_id, scope),
+            scope=scope,
         )
         self._cache[node_id] = result
         return result
@@ -1481,9 +1479,10 @@ class WorkflowScheduler:
 
 
 def _bootstrap_plan(planner: Module[Any, Any]) -> PlanIR:
-    module_id = planner.module_id
-    if not isinstance(module_id, str) or not module_id.strip():
-        raise RuntimeContractError("a generated-plan bootstrap planner requires module_id")
+    try:
+        module_id = _declared_module_id(planner)
+    except ValueError as exc:
+        raise RuntimeContractError(str(exc)) from exc
     logical_step = "bootstrap/planner"
     digest = module_digest(planner)
     access = _access_contract(planner)
@@ -1860,8 +1859,3 @@ class WorkflowRunner:
 
 def _unique(values: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
-
-
-def _with_nested_scope(node_id: str, scope: tuple[str, ...]) -> tuple[str, ...]:
-    nested = tuple(f"workflow:{name}" for name in _NESTED_SCOPE_PATTERN.findall(node_id))
-    return (*scope, *(item for item in nested if item not in scope))
