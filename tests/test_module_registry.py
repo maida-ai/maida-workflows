@@ -143,6 +143,33 @@ def test_merged_registry_rejects_nonexecutable_and_unidentified_generated_bindin
         ModuleRegistry(modules={"broken": broken_factory})
 
 
+def test_registry_revalidates_factory_contract_on_each_resolution() -> None:
+    class Anonymous(Module[str, str]):
+        input_type = str
+        output_type = str
+
+        async def execute(self, value: str, ctx: ExecutionContext) -> str:
+            return value
+
+    invalid_type_results = iter((Upper(), object()))
+
+    def changing_type_factory() -> Any:
+        return next(invalid_type_results)
+
+    changed_type = ModuleRegistry(modules={"text.upper": changing_type_factory})
+    with pytest.raises(TypeError, match="return a Module"):
+        changed_type.resolve("text.upper")
+
+    missing_identity_results = iter((Upper(), Anonymous()))
+
+    def changing_identity_factory() -> Any:
+        return next(missing_identity_results)
+
+    changed_identity = ModuleRegistry(modules={"text.upper": changing_identity_factory})
+    with pytest.raises(ValueError, match=r"Anonymous.*module_id"):
+        changed_identity.resolve("text.upper")
+
+
 def test_template_and_descriptor_failures_are_explicit() -> None:
     with pytest.raises(ValueError, match="version"):
         ModuleTemplate("example.prefix", "", PrefixConfig, Prefix)

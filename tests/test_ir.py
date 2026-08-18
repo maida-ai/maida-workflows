@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 
@@ -20,7 +20,7 @@ from maida.workflows import (
     when,
 )
 from maida.workflows.alignment import DiffKind, GraphAligner
-from maida.workflows.ir import IR_VERSION
+from maida.workflows.ir import IR_VERSION, PlanIR
 
 
 class AddOne(Module[int, int]):
@@ -124,6 +124,46 @@ def test_declared_identity_and_canonical_ir_are_stable() -> None:
     assert step.module_id == AddOne.module_id
     assert step.logical_step == "root"
     assert step.replay_key is not None
+
+
+def test_plan_ir_refuses_to_serialize_an_unsupported_version() -> None:
+    plan = replace(compile_workflow(Simple()), version=f"legacy-{IR_VERSION}")
+
+    with pytest.raises(ValueError, match="cannot serialize unsupported Workflow IR version"):
+        plan.to_dict()
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    (
+        ("capabilities", "external access fields"),
+        ("effects", "external access fields"),
+        ("models", "models field"),
+    ),
+)
+def test_current_plan_ir_requires_identity_contract_fields(field: str, message: str) -> None:
+    data = compile_workflow(Simple()).to_dict()
+    data["steps"][0].pop(field)
+
+    with pytest.raises(ValueError, match=message):
+        PlanIR.from_dict(data)
+
+
+def test_imported_plan_rejects_incomplete_replay_identity() -> None:
+    partial_identity = compile_workflow(Simple()).to_dict()
+    partial_identity["steps"][0]["logical_step"] = None
+    with pytest.raises(ValueError, match="partial replay identity"):
+        PlanIR.from_dict(partial_identity)
+
+    incomplete_definition = compile_workflow(Simple()).to_dict()
+    incomplete_definition["steps"][0]["definition_digest"] = None
+    with pytest.raises(ValueError, match="incomplete definition"):
+        PlanIR.from_dict(incomplete_definition)
+
+    detached_binding = compile_workflow(Simple()).to_dict()
+    detached_binding["steps"][0]["dependencies"] = []
+    with pytest.raises(ValueError, match="omits a binding dependency"):
+        PlanIR.from_dict(detached_binding)
 
 
 def test_explicit_identity_is_stable_while_behavior_digest_changes() -> None:

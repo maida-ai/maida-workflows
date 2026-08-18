@@ -107,6 +107,14 @@ class PlainModule(Module[str, str]):
         return value
 
 
+@pytest.mark.parametrize("module_id", ("", " \t "))
+def test_access_modules_reject_blank_explicit_module_identity(module_id: str) -> None:
+    with pytest.raises(ValueError, match="module_id must be non-empty when supplied"):
+        Connector(GET_CUSTOMER, module_id=module_id)
+    with pytest.raises(ValueError, match="module_id must be non-empty when supplied"):
+        Effect(SEND_EMAIL, module_id=module_id)
+
+
 def test_external_access_contracts_are_typed_canonical_and_strict() -> None:
     assert GET_CUSTOMER.to_data() == {
         "connector": "crm",
