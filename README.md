@@ -23,6 +23,48 @@ closed before generated child insertion.
 Python 3.12 and 3.13 are supported. Install the package as the
 `maida.workflows` namespace subpackage (`from maida import workflows`).
 
+## Execution backends: bring your own engine
+
+**Maida Workflows is not a workflow engine, and is not trying to become one.**
+Temporal, Prefect, Celery, LangGraph, Airflow, and Composio are good at running
+work. We are not competing with them; the intent is to run *on* them.
+
+The model we are building toward is the one PyTorch has with compute backends:
+you write against a single programming model, and the engine underneath is a
+choice rather than a rewrite. A tensor means the same thing on CPU and on CUDA.
+A Maida plan should mean the same thing on the bundled runner and on Temporal —
+same identity, same pre-execution refusal, same verifiable boundaries.
+
+What is meant to be portable is **the guarantees, not the code**:
+
+- plan identity and content-addressed artifacts;
+- the pre-execution gate — a plan refused here is refused everywhere;
+- idempotency and dependency contracts at module boundaries;
+- replay-complete evidence of what actually ran.
+
+And the point of an adapter is that **you should not have to learn the backend
+to get its durability**. Declaring modules and letting a planner emit a graph is
+the whole user-facing surface; decomposing that into a particular engine's
+workflow/activity/task vocabulary is the adapter's job, not yours.
+
+**Status: this is direction, not a shipped feature.** Today there is one
+reference runner — offline, standalone, deliberately boring — and **no
+third-party backend adapter ships yet**. The first one lands after the current
+realignment, because building adapters before the plan representation settles
+would produce exactly the patchwork this project is being corrected away from.
+
+What is already true is the part that makes it possible: the pre-execution gate
+does not depend on the bundled runner. `PlanGuardrail` needs a resolved plan and
+nothing else — no scheduler, no database, no executor — so the verification
+surface is already separable from execution rather than entangled with it.
+
+One honest caveat. Compute backends agree on what a matrix multiply is; workflow
+engines disagree about far more — determinism models, retry semantics, and
+failure boundaries genuinely differ. So the promise is not that every backend
+behaves identically. It is that a **named, checked set of guarantees** holds
+across them, and that where a backend cannot honor one, the gap is explicit
+rather than silently absorbed.
+
 ## Run the real path
 
 The command above is the shortest gate demonstration. To execute accepted
