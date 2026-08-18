@@ -22,6 +22,7 @@ from maida.workflows import (
     WorkflowPortability,
     WorkflowRunner,
     WorkflowSpec,
+    compile_workflow,
 )
 from maida.workflows._canonical import canonical_json, digest_data, type_schema
 from maida.workflows.bundle import _fixed_aliases_by_digest
@@ -254,6 +255,24 @@ def test_factory_bound_python_workflow_requires_its_exact_catalog() -> None:
 
     with pytest.raises(WorkflowBundleError, match="cannot rebind"):
         bundle.bind(workflow_catalog=WorkflowCatalog())
+
+
+def test_canonical_plan_bundle_requires_complete_trusted_module_identity() -> None:
+    plan = compile_workflow(UpperWorkflow())
+    bundle = WorkflowBundle.from_plan(plan, registry())
+
+    assert bundle.bind(module_registry=registry()).plan.canonical_json() == plan.canonical_json()
+    with pytest.raises(TypeError, match="PlanIR"):
+        WorkflowBundle.from_plan(cast(Any, {}), registry())
+    with pytest.raises(WorkflowBundleError, match="cannot bind"):
+        WorkflowBundle.from_plan(plan, ModuleRegistry())
+    with pytest.raises(WorkflowBundleError, match="trusted module registry"):
+        bundle.bind()
+
+    step = plan.executable_steps[0]
+    incomplete = replace(plan, steps=(replace(step, module_digest=None),))
+    with pytest.raises(WorkflowBundleError, match="incomplete module identity"):
+        WorkflowBundle.from_plan(incomplete, registry())
 
 
 def test_factory_bound_bundle_rejects_catalog_definition_drift() -> None:

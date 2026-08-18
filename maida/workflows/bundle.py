@@ -22,7 +22,7 @@ from ._canonical import canonical_data, canonical_json, digest_data
 from .authoring import Workflow
 from .coordination import WorkflowCatalog
 from .definitions import BoundWorkflow, bind_workflow
-from .ir import PlanIR
+from .ir import PlanIR, ReplayKey
 from .registry import ModuleRegistry
 from .spec import WorkflowSpec, compile_workflow_spec
 
@@ -192,6 +192,36 @@ class WorkflowBundle:
         )
 
     @classmethod
+    def from_plan(cls, plan: PlanIR, registry: ModuleRegistry) -> WorkflowBundle:
+        """Bundle canonical PlanIR with exact trusted module requirements."""
+        if not isinstance(plan, PlanIR):
+            raise TypeError("plan must be PlanIR")
+        requirements: list[dict[str, Any]] = []
+        for step in plan.executable_steps:
+            if step.replay_key is None or step.module_digest is None:
+                raise WorkflowBundleError("canonical plan has incomplete module identity")
+            try:
+                registry.resolve_exact(step.replay_key.module_id, step.module_digest)
+            except (LookupError, TypeError, ValueError) as exc:
+                raise WorkflowBundleError(
+                    "canonical plan cannot bind through this module registry"
+                ) from exc
+            requirements.append(
+                {
+                    "logical_step": step.replay_key.logical_step,
+                    "module_digest": step.module_digest,
+                    "module_id": step.replay_key.module_id,
+                }
+            )
+        return cls(
+            plan=PlanIR.from_dict(plan.to_dict()),
+            spec=None,
+            binding_requirements=tuple(requirements),
+            portability=WorkflowPortability.FACTORY_BOUND,
+            provenance={"source": "canonical-plan"},
+        )
+
+    @classmethod
     def load(
         cls,
         path: Path,
@@ -328,6 +358,38 @@ class WorkflowBundle:
             If the appropriate trust registry is missing or current behavior
             no longer matches the serialized definition.
         """
+        if self.provenance.get("source") == "canonical-plan":
+            if module_registry is None:
+                raise WorkflowBundleError(
+                    "canonical plan bundle requires a trusted module registry"
+                )
+            modules = {}
+            map_item_keys: dict[str, str] = {}
+            try:
+                for step in self.plan.executable_steps:
+                    key = step.replay_key
+                    if key is None or step.module_digest is None:
+                        raise ValueError("canonical plan module identity is incomplete")
+                    modules[key] = module_registry.resolve_exact(key.module_id, step.module_digest)
+                    if step.kind == "map_module":
+                        control = step.control or {}
+                        item_key = control.get("item_key")
+                        if not isinstance(item_key, Mapping) or set(item_key) != {"field"}:
+                            raise ValueError(
+                                "serialized map plans require a field item-key contract"
+                            )
+                        map_item_keys[step.node_id] = cast(str, item_key["field"])
+                return BoundWorkflow(
+                    plan=self.plan,
+                    input_type=Any,
+                    output_type=Any,
+                    modules=cast(dict[ReplayKey, Any], modules),
+                    map_item_keys=map_item_keys,
+                )
+            except (LookupError, TypeError, ValueError) as exc:
+                raise WorkflowBundleError(
+                    "canonical plan bundle cannot rebind through this registry"
+                ) from exc
         if self.portability is WorkflowPortability.RECONSTRUCTABLE:
             if module_registry is None or self.spec is None:
                 raise WorkflowBundleError(

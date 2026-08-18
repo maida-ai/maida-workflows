@@ -1,9 +1,9 @@
-"""Author portable workflows with deterministic, explainable data contracts.
+"""Compatibility front-end that lowers WorkflowSpec into canonical PlanIR.
 
-``WorkflowSpec`` is the common authoring surface for humans, AI agents, and
-external builders.  It contains aliases, typed bindings, and topology only.
-Trusted application registries resolve aliases and the compiler emits the same
-canonical Workflow IR consumed by durable execution, diff, and replay.
+``WorkflowSpec`` is retained temporarily for existing callers. It is not a
+second plan representation or a generated-planner contract: its front-end
+resolves trusted modules and finalizes through the same canonical ``PlanIR``
+path used by native and generated authoring.
 """
 
 from __future__ import annotations
@@ -23,12 +23,12 @@ from .budget import Budget
 from .definitions import BoundWorkflow
 from .interactions import Approval, Input, WaitForSignal, _SchemaAnnotation
 from .ir import (
-    IR_VERSION,
     BindingIR,
     PlanIR,
     ReplayKey,
     StepIR,
     _access_contract,
+    _finalize_plan,
     module_digest,
 )
 from .model import _model_contract
@@ -868,8 +868,7 @@ def compile_workflow_spec(
     Parameters
     ----------
     spec
-        Canonical authoring specification from Python, JSON, an AI agent, or an
-        external builder.
+        Canonical compatibility specification from an existing caller.
     registry
         Trusted application registry that resolves every module alias and
         recomputes immutable contracts.
@@ -884,8 +883,8 @@ def compile_workflow_spec(
     -----
     Compilation never invokes module handlers and performs no connector access.
     """
-    compiler = _SpecCompiler(spec, registry)
-    return compiler.compile()
+    front_end = _SpecFrontEnd(spec, registry)
+    return front_end.compile()
 
 
 @dataclass(frozen=True)
@@ -895,7 +894,9 @@ class _ResolvedNode:
     requirement: dict[str, Any] | None = None
 
 
-class _SpecCompiler:
+class _SpecFrontEnd:
+    """Lower the temporary WorkflowSpec surface through canonical PlanIR finalization."""
+
     def __init__(self, spec: WorkflowSpec, registry: ModuleRegistry) -> None:
         self.spec = spec
         self.registry = registry
@@ -933,16 +934,13 @@ class _SpecCompiler:
                 tuple(sorted(self.issues, key=lambda item: (item.location, item.code))),
                 explanation,
             )
-        plan = PlanIR(
-            version=IR_VERSION,
+        plan = _finalize_plan(
             workflow_id=self.spec.workflow_id,
             input_schema=canonical_data(self.spec.input_schema),
             output_schema=canonical_data(self.spec.output_schema),
             steps=tuple(self.steps),
             output_node=self.node_ids[output_key],
         )
-        # Exercise the same strict importer used for untrusted bundles.
-        plan = PlanIR.from_dict(plan.to_dict())
         bound = BoundWorkflow(
             plan=plan,
             input_type=Any,

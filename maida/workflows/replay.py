@@ -34,11 +34,10 @@ from .authoring import (
 )
 from .budget import BudgetExceededError, BudgetUsage
 from .dynamic import (
-    PlanFragmentIR,
     PlanSignature,
     PlanValidationError,
     PlanValidator,
-    _plan_from_signature,
+    _decode_generated_plan,
 )
 from .fixture import ReplayFixture, _validate_loaded_integrity
 from .interactions import _InteractionModule
@@ -579,8 +578,8 @@ class ReplayEngine:
                     f"generated region {record.region_id!r} no longer satisfies policy: {exc.code}"
                 ) from exc
             alignment = self.aligner.align(
-                _plan_from_signature(record.signature),
-                _plan_from_signature(signature),
+                record.signature.plan,
+                signature.plan,
             )
             if alignment.diff.first_divergence is not None:
                 change = alignment.diff.first_divergence
@@ -900,7 +899,7 @@ class ReplayEngine:
         if not records:
             return None
         try:
-            fragment = PlanFragmentIR.from_dict(cast(Mapping[str, Any], output))
+            fragment = _decode_generated_plan(cast(Mapping[str, Any], output))
         except (TypeError, ValueError) as exc:
             raise ReplayContractError(
                 "selective planner output is not a canonical generated fragment"
@@ -918,9 +917,7 @@ class ReplayEngine:
                     f"selective planner output failed generated policy: {exc.code}"
                 ) from exc
             current = current_signatures[record.region_instance_id]
-            alignment = self.aligner.align(
-                _plan_from_signature(current), _plan_from_signature(proposed)
-            )
+            alignment = self.aligner.align(current.plan, proposed.plan)
             if alignment.diff.first_divergence is not None:
                 return ReplayDivergence(alignment.diff.first_divergence, alignment.diff)
         return None
@@ -942,10 +939,10 @@ def _boundary_by_instance(fixture: ReplayFixture, instance_key: str) -> Boundary
     return boundary
 
 
-def _decode_fragment(fixture: ReplayFixture, boundary: BoundaryRecord) -> PlanFragmentIR:
+def _decode_fragment(fixture: ReplayFixture, boundary: BoundaryRecord) -> Mapping[str, Any]:
     try:
         value = fixture.values.decode(boundary.output_value)
-        return PlanFragmentIR.from_dict(cast(Mapping[str, Any], value))
+        return _decode_generated_plan(cast(Mapping[str, Any], value))
     except (TypeError, ValueError) as exc:
         raise ReplayContractError(
             f"recorded planner boundary {boundary.instance_key} is not a canonical fragment"

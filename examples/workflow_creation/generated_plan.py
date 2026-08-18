@@ -27,9 +27,7 @@ from maida.workflows import (
     Module,
     ModuleRegistry,
     PlanBoundary,
-    PlanFragmentIR,
     PlanLimits,
-    PlanNode,
     RunResult,
     WorkflowRunner,
 )
@@ -139,28 +137,44 @@ boundary = PlanBoundary(
 )
 
 
-def _brief_plan() -> PlanFragmentIR:
-    return PlanFragmentIR(
+def _plan(
+    fragment_id: str,
+    nodes: list[tuple[str, str, list[str]]],
+    outputs: list[str],
+) -> dict[str, Any]:
+    return {
+        "fragment_id": fragment_id,
+        "nodes": [
+            {"dependencies": dependencies, "key": key, "module_alias": alias}
+            for key, alias, dependencies in sorted(nodes)
+        ],
+        "outputs": outputs,
+        "version": "0.2.0",
+    }
+
+
+def _brief_plan() -> dict[str, Any]:
+    return _plan(
         "brief-plan",
-        (
-            PlanNode("normalize", "text.normalize", ("$input",)),
-            PlanNode("draft", "text.draft", ("normalize",)),
-        ),
-        ("draft",),
+        [
+            ("normalize", "text.normalize", ["$input"]),
+            ("draft", "text.draft", ["normalize"]),
+        ],
+        ["draft"],
     )
 
 
-def _thorough_plan() -> PlanFragmentIR:
-    return PlanFragmentIR(
+def _thorough_plan() -> dict[str, Any]:
+    return _plan(
         "thorough-plan",
-        (
-            PlanNode("normalize", "text.normalize", ("$input",)),
-            PlanNode("context", "records.context", ("$input",)),
-            PlanNode("draft", "text.draft", ("normalize",)),
-            PlanNode("audit", "text.audit", ("draft", "context")),
-            PlanNode("deliver", "messages.deliver", ("audit",)),
-        ),
-        ("deliver",),
+        [
+            ("normalize", "text.normalize", ["$input"]),
+            ("context", "records.context", ["$input"]),
+            ("draft", "text.draft", ["normalize"]),
+            ("audit", "text.audit", ["draft", "context"]),
+            ("deliver", "messages.deliver", ["audit"]),
+        ],
+        ["deliver"],
     )
 
 
@@ -172,7 +186,7 @@ class _Planner(Module[str, dict[str, Any]]):
 
     async def execute(self, value: str, ctx: ExecutionContext) -> dict[str, Any]:
         selected = _thorough_plan() if "thorough" in value else _brief_plan()
-        return selected.to_dict()
+        return selected
 
 
 class _LocalAdapter:

@@ -1,29 +1,20 @@
-"""Author and serialize an editable workflow without Python import strings.
-
-This example is the data-first counterpart to the native ``Workflow.build``
-examples. A human, an AI agent, or a visual builder can produce the same
-``WorkflowSpec``. A trusted application registry resolves its aliases, and a
-``WorkflowBundle`` stores canonical source data plus exact compiled contracts.
-"""
+"""Serialize the canonical PlanIR emitted by ordinary workflow authoring."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 
 from maida.workflows import (
-    BindingSpec,
     ExecutionContext,
     Module,
     ModuleRegistry,
-    ModuleTemplate,
-    NodeSpec,
     RunResult,
+    RuntimeValue,
+    Workflow,
     WorkflowBundle,
     WorkflowRunner,
-    WorkflowSpec,
+    compile_workflow,
 )
-from maida.workflows._canonical import type_schema
 from maida.workflows.persistence import PostgresStore
 
 
@@ -36,52 +27,33 @@ class _Title(Module[str, str]):
         return value.strip().title()
 
 
-@dataclass(frozen=True)
-class _PrefixConfig:
-    text: str
-
-
 class _Prefix(Module[str, str]):
     module_id = "demo.prefix"
     input_type = str
     output_type = str
 
-    def __init__(self, config: _PrefixConfig) -> None:
-        self.text = config.text
-
     async def execute(self, value: str, ctx: ExecutionContext) -> str:
-        return f"{self.text}{value}"
+        return f"[portable] {value}"
 
 
 registry = ModuleRegistry(
-    modules={"text.title": _Title},
-    templates={
-        "text.prefix": ModuleTemplate(
-            "example.text.prefix",
-            "1",
-            _PrefixConfig,
-            _Prefix,
-        )
-    },
+    modules={"text.prefix": _Prefix, "text.title": _Title},
 )
 
-spec = WorkflowSpec(
-    workflow_id="onboarding-portable",
-    input_schema=type_schema(str),
-    output_schema=type_schema(str),
-    nodes=(
-        NodeSpec.task("title", "text.title", BindingSpec.root()),
-        NodeSpec.task(
-            "prefix",
-            "text.prefix",
-            BindingSpec.node("title"),
-            config={"text": "[portable] "},
-        ),
-    ),
-    output=BindingSpec.node("prefix"),
-)
 
-bundle = WorkflowBundle.from_spec(spec, registry)
+class _Onboarding(Workflow[str, str]):
+    workflow_id = "onboarding-portable"
+    input_type = str
+    output_type = str
+    title = _Title()
+    prefix = _Prefix()
+
+    def build(self, value: RuntimeValue[str]) -> RuntimeValue[str]:
+        return self.prefix.at("prefix")(self.title.at("title")(value))
+
+
+plan = compile_workflow(_Onboarding())
+bundle = WorkflowBundle.from_plan(plan, registry)
 workflow = bundle.bind(module_registry=registry)
 
 EXAMPLE_INPUT = "  hello ada  "

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import traceback
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import replace
 from datetime import timedelta
@@ -20,9 +20,7 @@ from maida.workflows import (
     ExecutionSpec,
     Module,
     ModuleRegistry,
-    PlanFragmentIR,
     PlanLimits,
-    PlanNode,
     PlanSignature,
     PlanValidationError,
     PlanValidator,
@@ -31,7 +29,9 @@ from maida.workflows import (
     compile_workflow,
     module_digest,
 )
-from maida.workflows._canonical import digest_data, schema_digest
+from maida.workflows._canonical import canonical_json, digest_data, schema_digest
+from maida.workflows.dynamic import _decode_generated_plan
+from tests.generated_plan_helpers import generated_plan, plan_digest, plan_node
 
 TEXT = schema_digest(str)
 NUMBER = schema_digest(int)
@@ -150,16 +150,16 @@ def _catalog() -> ModuleRegistry:
 def _fragment(
     *,
     fragment_id: str = "research-plan",
-) -> PlanFragmentIR:
+) -> dict[str, Any]:
     # Generated data contains only planner-controlled graph choices. Catalog
     # pins and type contracts are deliberately absent.
-    return PlanFragmentIR(
+    return generated_plan(
         fragment_id=fragment_id,
         nodes=(
-            PlanNode("join", "join", ("left", "right")),
-            PlanNode("right", "right", ("source",)),
-            PlanNode("source", "source", ("$input",)),
-            PlanNode("left", "left", ("source",)),
+            plan_node("join", "join", ("left", "right")),
+            plan_node("right", "right", ("source",)),
+            plan_node("source", "source", ("$input",)),
+            plan_node("left", "left", ("source",)),
         ),
         outputs=("join",),
     )
@@ -189,7 +189,7 @@ def _validator(
 
 def _validate(
     validator: PlanValidator,
-    fragment: PlanFragmentIR,
+    fragment: Mapping[str, Any],
     *,
     input_schema: str = TEXT,
     output_schemas: tuple[str, ...] = (FLAG,),
@@ -201,16 +201,32 @@ def _validate(
     )
 
 
+def _changed_plan(
+    plan: Mapping[str, Any],
+    *,
+    nodes: list[dict[str, Any]] | None = None,
+    outputs: list[str] | None = None,
+) -> dict[str, Any]:
+    changed = deepcopy(dict(plan))
+    if nodes is not None:
+        changed["nodes"] = nodes
+    if outputs is not None:
+        changed["outputs"] = outputs
+    return changed
+
+
+def _changed_node(node: Mapping[str, Any], **changes: Any) -> dict[str, Any]:
+    return {**dict(node), **changes}
+
+
 def test_valid_fragment_is_minimal_canonical_and_resolved_by_trusted_validation() -> None:
     fragment = _fragment()
     signature = _validate(_validator(), fragment)
 
-    assert fragment.version == "0.2.0"
-    assert [node.key for node in fragment.nodes] == ["join", "left", "right", "source"]
-    assert (
-        fragment.canonical_json() == PlanFragmentIR.from_dict(fragment.to_dict()).canonical_json()
-    )
-    assert fragment.digest == PlanFragmentIR.from_dict(fragment.to_dict()).digest
+    assert fragment["version"] == "0.2.0"
+    assert [node["key"] for node in fragment["nodes"]] == ["join", "left", "right", "source"]
+    assert canonical_json(fragment) == canonical_json(_decode_generated_plan(fragment))
+    assert plan_digest(fragment) == plan_digest(_decode_generated_plan(fragment))
     assert signature == PlanSignature.from_dict(signature.to_dict())
     assert signature.node_count == 4
     assert signature.max_depth == 3
@@ -235,7 +251,7 @@ def test_valid_fragment_is_minimal_canonical_and_resolved_by_trusted_validation(
     assert resolved_source["input_schema_digests"] == (TEXT,)
     assert resolved_source["output_schema_digest"] == TEXT
 
-    generated = fragment.to_dict()
+    generated = fragment
     assert set(generated) == {
         "fragment_id",
         "nodes",
@@ -246,10 +262,10 @@ def test_valid_fragment_is_minimal_canonical_and_resolved_by_trusted_validation(
 
 
 def test_pre_realign_generated_contract_versions_fail_closed() -> None:
-    fragment = _fragment().to_dict()
+    fragment = _fragment()
     fragment["version"] = "0.1.0"
     with pytest.raises(PlanValidationError) as fragment_error:
-        PlanFragmentIR.from_dict(fragment)
+        _decode_generated_plan(fragment)
     assert fragment_error.value.code == "PLAN_FRAGMENT_VERSION_UNSUPPORTED"
 
     signature = _validate(_validator(), _fragment()).to_dict()
@@ -266,16 +282,18 @@ def test_behavioral_signature_ignores_fragment_label_but_tracks_resolved_behavio
 
     original_signature = _validate(validator, original)
     relabeled_signature = _validate(validator, relabeled)
-    assert original.digest != relabeled.digest
+    assert plan_digest(original) != plan_digest(relabeled)
     assert original_signature == relabeled_signature
 
     changed_catalog = _allow(_catalog(), "changed-left", "modules.left", "9", (TEXT,), TEXT)
-    changed = replace(
+    changed = _changed_plan(
         original,
-        nodes=tuple(
-            replace(node, module_alias="changed-left") if node.key == "left" else node
-            for node in original.nodes
-        ),
+        nodes=[
+            _changed_node(node, module_alias="changed-left")
+            if node["key"] == "left"
+            else dict(node)
+            for node in original["nodes"]
+        ],
     )
     changed_validator = PlanValidator(
         changed_catalog,
@@ -317,6 +335,7 @@ def test_catalog_is_the_only_source_of_module_pins_schemas_and_execution_metadat
         "effects": [],
         "execution": PROCESS_EXECUTION,
         "input_schema_digests": [TEXT],
+        "models": [],
         "module_digest": module_digest(allowed.resolve("text")),
         "module_id": "modules.text",
         "output_schema_digest": TEXT,
@@ -393,13 +412,13 @@ def test_registry_derives_credential_free_access_contracts_from_factory() -> Non
 
 def test_validator_rejects_unknown_alias_and_trusted_contract_mismatches() -> None:
     fragment = _fragment()
-    source = next(node for node in fragment.nodes if node.key == "source")
-    unknown = replace(
+    source = next(node for node in fragment["nodes"] if node["key"] == "source")
+    unknown = _changed_plan(
         fragment,
-        nodes=tuple(
-            replace(source, module_alias="unknown") if node.key == "source" else node
-            for node in fragment.nodes
-        ),
+        nodes=[
+            _changed_node(source, module_alias="unknown") if node["key"] == "source" else dict(node)
+            for node in fragment["nodes"]
+        ],
     )
     with pytest.raises(PlanValidationError, match="not allowlisted"):
         _validate(_validator(), unknown)
@@ -413,27 +432,28 @@ def test_validator_rejects_unknown_alias_and_trusted_contract_mismatches() -> No
 
 def test_topology_requires_existing_unique_ordered_typed_dependencies() -> None:
     fragment = _fragment()
-    left = next(node for node in fragment.nodes if node.key == "left")
+    left = next(node for node in fragment["nodes"] if node["key"] == "left")
 
     for changed, message in (
-        (replace(left, dependencies=("missing",)), "does not exist"),
-        (replace(left, dependencies=("source", "source")), "duplicate dependency"),
-        (replace(left, dependencies=()), "input count"),
+        (_changed_node(left, dependencies=["missing"]), "does not exist"),
+        (_changed_node(left, dependencies=["source", "source"]), "duplicate dependency"),
+        (_changed_node(left, dependencies=[]), "input count"),
     ):
-        malformed = replace(
+        malformed = _changed_plan(
             fragment,
-            nodes=tuple(changed if node.key == "left" else node for node in fragment.nodes),
+            nodes=[changed if node["key"] == "left" else dict(node) for node in fragment["nodes"]],
         )
         with pytest.raises(PlanValidationError, match=message):
             _validate(_validator(), malformed)
 
-    join = next(node for node in fragment.nodes if node.key == "join")
-    reversed_dependencies = replace(join, dependencies=("right", "left"))
-    malformed = replace(
+    join = next(node for node in fragment["nodes"] if node["key"] == "join")
+    reversed_dependencies = _changed_node(join, dependencies=["right", "left"])
+    malformed = _changed_plan(
         fragment,
-        nodes=tuple(
-            reversed_dependencies if node.key == "join" else node for node in fragment.nodes
-        ),
+        nodes=[
+            reversed_dependencies if node["key"] == "join" else dict(node)
+            for node in fragment["nodes"]
+        ],
     )
     with pytest.raises(PlanValidationError, match="edge schema"):
         _validate(_validator(), malformed)
@@ -441,26 +461,31 @@ def test_topology_requires_existing_unique_ordered_typed_dependencies() -> None:
 
 def test_topology_rejects_cycles_duplicate_keys_and_invalid_outputs() -> None:
     fragment = _fragment()
-    source = next(node for node in fragment.nodes if node.key == "source")
-    cycle_source = replace(source, dependencies=("left",))
-    cyclic = replace(
+    source = next(node for node in fragment["nodes"] if node["key"] == "source")
+    cycle_source = _changed_node(source, dependencies=["left"])
+    cyclic = _changed_plan(
         fragment,
-        nodes=tuple(cycle_source if node.key == "source" else node for node in fragment.nodes),
+        nodes=[
+            cycle_source if node["key"] == "source" else dict(node) for node in fragment["nodes"]
+        ],
     )
     with pytest.raises(PlanValidationError, match="acyclic"):
         _validate(_validator(), cyclic)
 
-    duplicate = replace(fragment, nodes=(*fragment.nodes, fragment.nodes[0]))
+    duplicate = _changed_plan(
+        fragment,
+        nodes=sorted([*fragment["nodes"], fragment["nodes"][0]], key=lambda node: node["key"]),
+    )
     with pytest.raises(PlanValidationError, match="duplicate node key"):
         _validate(_validator(), duplicate)
     with pytest.raises(PlanValidationError, match=r"output.*does not exist"):
-        _validate(_validator(), replace(fragment, outputs=("missing",)))
+        _validate(_validator(), _changed_plan(fragment, outputs=["missing"]))
     with pytest.raises(PlanValidationError, match="duplicate output"):
-        _validate(_validator(), replace(fragment, outputs=("join", "join")))
+        _validate(_validator(), _changed_plan(fragment, outputs=["join", "join"]))
     with pytest.raises(PlanValidationError, match="at least one output"):
-        _validate(_validator(), replace(fragment, outputs=()))
+        _validate(_validator(), _changed_plan(fragment, outputs=[]))
     with pytest.raises(PlanValidationError, match="at least one node"):
-        _validate(_validator(), replace(fragment, nodes=()))
+        _validate(_validator(), _changed_plan(fragment, nodes=[]))
 
 
 @pytest.mark.parametrize(
@@ -525,47 +550,67 @@ def test_budget_and_region_authority_are_explicit_trusted_inputs() -> None:
     ),
 )
 def test_strict_import_rejects_trusted_or_executable_node_fields(forbidden_field: str) -> None:
-    encoded = _fragment().to_dict()
+    encoded = deepcopy(_fragment())
     encoded["nodes"][0][forbidden_field] = "forbidden"
 
     with pytest.raises(PlanValidationError, match="fields"):
-        PlanFragmentIR.from_dict(encoded)
+        _decode_generated_plan(encoded)
 
 
 def test_strict_import_rejects_versions_shapes_and_noncanonical_node_order() -> None:
-    encoded = _fragment().to_dict()
+    encoded = _fragment()
     with pytest.raises(PlanValidationError, match="unsupported"):
-        PlanFragmentIR.from_dict(dict(encoded, version="9.0.0"))
+        _decode_generated_plan(dict(encoded, version="9.0.0"))
     with pytest.raises(PlanValidationError, match="fields"):
-        PlanFragmentIR.from_dict(dict(encoded, runtime={}))
+        _decode_generated_plan(dict(encoded, runtime={}))
     with pytest.raises(PlanValidationError, match="nodes must be an array"):
-        PlanFragmentIR.from_dict(dict(encoded, nodes="not-an-array"))
+        _decode_generated_plan(dict(encoded, nodes="not-an-array"))
 
-    reordered = _fragment().to_dict()
+    reordered = deepcopy(_fragment())
     reordered["nodes"] = list(reversed(reordered["nodes"]))
     with pytest.raises(PlanValidationError, match="canonical key order"):
-        PlanFragmentIR.from_dict(reordered)
+        _decode_generated_plan(reordered)
 
     with pytest.raises(PlanValidationError, match="unsupported"):
-        replace(_fragment(), version="9.0.0")
-    with pytest.raises(PlanValidationError, match="PlanNode"):
-        replace(_fragment(), nodes=("not-a-node",))  # type: ignore[arg-type]
-    with pytest.raises(PlanValidationError, match="ordered sequence"):
-        PlanNode("unsafe", "source", "source")  # type: ignore[arg-type]
+        _decode_generated_plan(dict(_fragment(), version="9.0.0"))
+    with pytest.raises(PlanValidationError, match="node must be an object"):
+        _decode_generated_plan(dict(_fragment(), nodes=["not-a-node"]))
+    with pytest.raises(PlanValidationError, match="dependencies must be an array"):
+        _decode_generated_plan(
+            generated_plan(
+                "unsafe",
+                [{"dependencies": "source", "key": "unsafe", "module_alias": "source"}],
+                ["unsafe"],
+            )
+        )
 
 
 def test_strict_fragment_import_rejects_malformed_generated_values() -> None:
-    encoded = _fragment().to_dict()
-    with pytest.raises(PlanValidationError, match="PlanFragmentIR must be an object"):
-        PlanFragmentIR.from_dict([])  # type: ignore[arg-type]
-    with pytest.raises(PlanValidationError, match="PlanNode must be an object"):
-        PlanNode.from_dict([])  # type: ignore[arg-type]
+    encoded = _fragment()
+    with pytest.raises(PlanValidationError, match="generated plan must be an object"):
+        _decode_generated_plan([])  # type: ignore[arg-type]
+    with pytest.raises(PlanValidationError, match="node must be an object"):
+        _decode_generated_plan(dict(encoded, nodes=[[]]))
     with pytest.raises(PlanValidationError, match="dependencies must be an array"):
-        PlanNode.from_dict({"key": "node", "module_alias": "source", "dependencies": "$input"})
+        _decode_generated_plan(
+            dict(
+                encoded,
+                nodes=[{"key": "node", "module_alias": "source", "dependencies": "$input"}],
+                outputs=["node"],
+            )
+        )
     with pytest.raises(PlanValidationError, match="outputs must be an array"):
-        PlanFragmentIR.from_dict(dict(encoded, outputs="join"))
+        _decode_generated_plan(dict(encoded, outputs="join"))
     with pytest.raises(PlanValidationError, match="duplicate node key"):
-        PlanFragmentIR.from_dict(dict(encoded, nodes=[*encoded["nodes"], encoded["nodes"][-1]]))
+        _decode_generated_plan(
+            dict(
+                encoded,
+                nodes=sorted(
+                    [*encoded["nodes"], encoded["nodes"][-1]],
+                    key=lambda node: node["key"],
+                ),
+            )
+        )
 
 
 def test_signature_import_is_strict() -> None:
@@ -577,7 +622,7 @@ def test_signature_import_is_strict() -> None:
 
     noncanonical = signature.to_dict()
     noncanonical["module_composition"] = list(reversed(noncanonical["module_composition"]))
-    with pytest.raises(PlanValidationError, match="canonical"):
+    with pytest.raises(PlanValidationError, match="authoritative PlanIR"):
         PlanSignature.from_dict(noncanonical)
 
 
@@ -605,8 +650,9 @@ def test_signature_import_rejects_internally_inconsistent_behavior(
     encoded = _validate(_validator(), _fragment()).to_dict()
     encoded[field] = value
 
-    with pytest.raises(PlanValidationError, match=message):
+    with pytest.raises(PlanValidationError, match="authoritative PlanIR") as rejected:
         PlanSignature.from_dict(encoded)
+    assert rejected.value.code == "PLAN_SIGNATURE_INVALID"
 
 
 def test_signature_import_rejects_invalid_shapes_lineage_and_descriptors() -> None:
@@ -619,10 +665,11 @@ def test_signature_import_rejects_invalid_shapes_lineage_and_descriptors() -> No
         ("outputs", "join", "outputs must be an array"),
         ("output_schema_digests", FLAG, "output_schema_digests must be an array"),
     )
-    for field, value, message in cases:
+    for field, value, _message in cases:
         encoded = deepcopy(valid)
         encoded[field] = value
-        with pytest.raises(PlanValidationError, match=message) as rejected:
+        expected = "unsupported" if field == "version" else "authoritative PlanIR"
+        with pytest.raises(PlanValidationError, match=expected) as rejected:
             PlanSignature.from_dict(encoded)
         assert rejected.value.code in {
             "PLAN_SIGNATURE_INVALID",
@@ -631,12 +678,12 @@ def test_signature_import_rejects_invalid_shapes_lineage_and_descriptors() -> No
 
     malformed_composition = deepcopy(valid)
     malformed_composition["module_composition"] = [{"module_id": "modules.source"}]
-    with pytest.raises(PlanValidationError, match="composition fields"):
+    with pytest.raises(PlanValidationError, match="authoritative PlanIR"):
         PlanSignature.from_dict(malformed_composition)
 
     invalid_count = deepcopy(valid)
     invalid_count["module_composition"][0]["count"] = 0
-    with pytest.raises(PlanValidationError, match="positive integers"):
+    with pytest.raises(PlanValidationError, match="authoritative PlanIR"):
         PlanSignature.from_dict(invalid_count)
 
     duplicate_composition = deepcopy(valid)
@@ -644,27 +691,27 @@ def test_signature_import_rejects_invalid_shapes_lineage_and_descriptors() -> No
         duplicate_composition["module_composition"][0],
         duplicate_composition["module_composition"][0],
     ]
-    with pytest.raises(PlanValidationError, match="duplicate pins"):
+    with pytest.raises(PlanValidationError, match="authoritative PlanIR"):
         PlanSignature.from_dict(duplicate_composition)
 
     malformed_node = deepcopy(valid)
     malformed_node["resolved_nodes"][0] = "join"
-    with pytest.raises(PlanValidationError, match="string keys"):
+    with pytest.raises(PlanValidationError, match="authoritative PlanIR"):
         PlanSignature.from_dict(malformed_node)
 
     duplicate_node = deepcopy(valid)
     duplicate_node["resolved_nodes"].insert(0, deepcopy(duplicate_node["resolved_nodes"][0]))
-    with pytest.raises(PlanValidationError, match="duplicate keys"):
+    with pytest.raises(PlanValidationError, match="authoritative PlanIR"):
         PlanSignature.from_dict(duplicate_node)
 
     unknown_descriptor_field = deepcopy(valid)
     unknown_descriptor_field["resolved_nodes"][0]["credentials"] = {}
-    with pytest.raises(PlanValidationError, match="fields"):
+    with pytest.raises(PlanValidationError, match="authoritative PlanIR"):
         PlanSignature.from_dict(unknown_descriptor_field)
 
     invalid_descriptor = deepcopy(valid)
     invalid_descriptor["resolved_nodes"][0]["module_digest"] = "invalid"
-    with pytest.raises(PlanValidationError, match="sha256"):
+    with pytest.raises(PlanValidationError, match="authoritative PlanIR"):
         PlanSignature.from_dict(invalid_descriptor)
 
 
@@ -675,17 +722,17 @@ def test_signature_import_revalidates_resolved_graph_topology_and_schemas() -> N
     no_nodes["resolved_nodes"] = []
     no_nodes["node_count"] = 0
     no_nodes["module_composition"] = []
-    with pytest.raises(PlanValidationError, match="at least one node"):
+    with pytest.raises(PlanValidationError, match="authoritative PlanIR"):
         PlanSignature.from_dict(no_nodes)
 
-    for outputs, message in (
+    for outputs, _message in (
         ([], "at least one output"),
         (["join", "join"], "duplicate keys"),
         (["missing"], "does not exist"),
     ):
         encoded = deepcopy(valid)
         encoded["outputs"] = outputs
-        with pytest.raises(PlanValidationError, match=message):
+        with pytest.raises(PlanValidationError, match="authoritative PlanIR"):
             PlanSignature.from_dict(encoded)
 
     def node(encoded: dict[str, Any], key: str) -> dict[str, Any]:
@@ -693,39 +740,39 @@ def test_signature_import_revalidates_resolved_graph_topology_and_schemas() -> N
 
     duplicate_dependency = deepcopy(valid)
     node(duplicate_dependency, "left")["dependencies"] = ["source", "source"]
-    with pytest.raises(PlanValidationError, match="duplicate dependency"):
+    with pytest.raises(PlanValidationError, match="authoritative PlanIR"):
         PlanSignature.from_dict(duplicate_dependency)
 
     wrong_input_count = deepcopy(valid)
     node(wrong_input_count, "left")["dependencies"] = []
-    with pytest.raises(PlanValidationError, match="input count"):
+    with pytest.raises(PlanValidationError, match="authoritative PlanIR"):
         PlanSignature.from_dict(wrong_input_count)
 
     missing_dependency = deepcopy(valid)
     node(missing_dependency, "left")["dependencies"] = ["missing"]
-    with pytest.raises(PlanValidationError, match="does not exist"):
+    with pytest.raises(PlanValidationError, match="authoritative PlanIR"):
         PlanSignature.from_dict(missing_dependency)
 
     wrong_edge_order = deepcopy(valid)
     node(wrong_edge_order, "join")["dependencies"] = ["right", "left"]
-    with pytest.raises(PlanValidationError, match="edge schema"):
+    with pytest.raises(PlanValidationError, match="authoritative PlanIR"):
         PlanSignature.from_dict(wrong_edge_order)
 
     wrong_region_input = deepcopy(valid)
     wrong_region_input["region_input_schema_digest"] = NUMBER
-    with pytest.raises(PlanValidationError, match="edge schema"):
+    with pytest.raises(PlanValidationError, match="authoritative PlanIR"):
         PlanSignature.from_dict(wrong_region_input)
 
     cycle = deepcopy(valid)
     node(cycle, "source")["dependencies"] = ["left"]
-    with pytest.raises(PlanValidationError, match="acyclic"):
+    with pytest.raises(PlanValidationError, match="authoritative PlanIR"):
         PlanSignature.from_dict(cycle)
 
 
-def _single_fragment(alias: str = "unit") -> PlanFragmentIR:
-    return PlanFragmentIR(
+def _single_fragment(alias: str = "unit") -> dict[str, Any]:
+    return generated_plan(
         fragment_id="single-plan",
-        nodes=(PlanNode("unit", alias, ("$input",)),),
+        nodes=(plan_node("unit", alias, ("$input",)),),
         outputs=("unit",),
     )
 
@@ -768,9 +815,12 @@ def test_every_node_must_be_reverse_reachable_from_an_output() -> None:
         TEXT,
         effects=(hidden_effect,),
     )
-    fragment = replace(
+    fragment = _changed_plan(
         _fragment(),
-        nodes=(*_fragment().nodes, PlanNode("orphan", "hidden", ("$input",))),
+        nodes=sorted(
+            [*_fragment()["nodes"], plan_node("orphan", "hidden", ("$input",))],
+            key=lambda node: node["key"],
+        ),
     )
     with pytest.raises(PlanValidationError, match="unreachable from outputs") as rejected:
         _validate(
@@ -803,7 +853,7 @@ def test_every_node_must_be_reverse_reachable_from_an_output() -> None:
     encoded["topology_digest"] = digest_data(
         {"nodes": encoded["resolved_nodes"], "outputs": encoded["outputs"]}
     )
-    with pytest.raises(PlanValidationError, match="unreachable from outputs"):
+    with pytest.raises(PlanValidationError, match=r"alias provenance|authoritative PlanIR"):
         PlanSignature.from_dict(encoded)
 
 
@@ -821,11 +871,12 @@ def test_alias_renames_preserve_resolved_behavior_and_digest() -> None:
             for original_alias, renamed_alias in aliases.items()
         }
     )
-    renamed_fragment = replace(
+    renamed_fragment = _changed_plan(
         _fragment(),
-        nodes=tuple(
-            replace(node, module_alias=aliases[node.module_alias]) for node in _fragment().nodes
-        ),
+        nodes=[
+            _changed_node(node, module_alias=aliases[str(node["module_alias"])])
+            for node in _fragment()["nodes"]
+        ],
     )
     original = _validate(_validator(catalog=original_catalog), _fragment())
     renamed = _validate(_validator(catalog=renamed_catalog), renamed_fragment)
@@ -883,12 +934,12 @@ def test_budget_aggregation_counts_occurrences_and_uses_dag_critical_path() -> N
     assert signature.aggregate_budget == limits.budget
     assert signature.aggregate_budget.cost_usd == 0.3
 
-    repeated = replace(
+    repeated = _changed_plan(
         _fragment(),
-        nodes=tuple(
-            replace(node, module_alias="source") if node.key == "left" else node
-            for node in _fragment().nodes
-        ),
+        nodes=[
+            _changed_node(node, module_alias="source") if node["key"] == "left" else dict(node)
+            for node in _fragment()["nodes"]
+        ],
     )
     repeated_signature = _validate(
         _validator(catalog=catalog, limits=replace(limits, budget=REGION_BUDGET)),
@@ -979,11 +1030,11 @@ def test_budget_aggregation_overflow_is_a_typed_validation_failure() -> None:
             cost_usd=1e308,
         )
     )
-    fragment = PlanFragmentIR(
+    fragment = generated_plan(
         fragment_id="overflow-plan",
         nodes=(
-            PlanNode("first", "unit", ("$input",)),
-            PlanNode("second", "unit", ("first",)),
+            plan_node("first", "unit", ("$input",)),
+            plan_node("second", "unit", ("first",)),
         ),
         outputs=("second",),
     )
@@ -1188,7 +1239,7 @@ def test_signature_import_requires_canonical_nested_access_and_grant_data() -> N
     for field in ("capabilities", "effects"):
         encoded = signature.to_dict()
         encoded["resolved_nodes"][0][field] = list(reversed(encoded["resolved_nodes"][0][field]))
-        with pytest.raises(PlanValidationError, match="canonical order"):
+        with pytest.raises(PlanValidationError, match="authoritative PlanIR"):
             PlanSignature.from_dict(encoded)
 
     encoded = signature.to_dict()
@@ -1198,14 +1249,14 @@ def test_signature_import_requires_canonical_nested_access_and_grant_data() -> N
 
     encoded = signature.to_dict()
     encoded["resolved_nodes"][0]["capability_grant"] = []
-    with pytest.raises(PlanValidationError, match="node capability_grant must be an object"):
+    with pytest.raises(PlanValidationError, match="authoritative PlanIR"):
         PlanSignature.from_dict(encoded)
 
     encoded = signature.to_dict()
     encoded["resolved_nodes"][0]["capability_grant"]["capabilities"] = list(
         reversed(encoded["resolved_nodes"][0]["capability_grant"]["capabilities"])
     )
-    with pytest.raises(PlanValidationError, match="canonical"):
+    with pytest.raises(PlanValidationError, match="authoritative PlanIR"):
         PlanSignature.from_dict(encoded)
 
 
@@ -1250,14 +1301,14 @@ def test_deep_generated_chain_uses_iterative_graph_validation() -> None:
     )
     catalog = _single_catalog(budget=zero_budget)
     nodes = tuple(
-        PlanNode(
+        plan_node(
             f"n{index:04d}",
             "unit",
             ("$input",) if index == 0 else (f"n{index - 1:04d}",),
         )
         for index in range(node_count)
     )
-    fragment = PlanFragmentIR(
+    fragment = generated_plan(
         fragment_id="deep-chain",
         nodes=nodes,
         outputs=(f"n{node_count - 1:04d}",),

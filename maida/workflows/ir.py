@@ -420,6 +420,26 @@ class _CompiledWorkflowGraph:
     map_item_keys: Mapping[str, str | Callable[[Any], str]]
 
 
+def _finalize_plan(
+    *,
+    workflow_id: str,
+    input_schema: Mapping[str, Any],
+    output_schema: Mapping[str, Any],
+    steps: tuple[StepIR, ...],
+    output_node: str,
+) -> PlanIR:
+    """Build and strictly import the one canonical plan representation."""
+    plan = PlanIR(
+        version=IR_VERSION,
+        workflow_id=workflow_id,
+        input_schema=input_schema,
+        output_schema=output_schema,
+        steps=steps,
+        output_node=output_node,
+    )
+    return PlanIR.from_dict(plan.to_dict())
+
+
 def _behavior_bytes(module: Module[Any, Any]) -> bytes:
     artifacts: list[bytes] = []
     for module_class in reversed(module.__class__.mro()):
@@ -606,6 +626,39 @@ def _budget_contract(module: Module[Any, Any]) -> dict[str, int | float | None]:
     return budget.to_data()
 
 
+def _definition_digest(
+    *,
+    module_id: str,
+    logical_step: str,
+    module_digest: str,
+    input_schema_digest: str,
+    output_schema_digest: str,
+    execution: Mapping[str, Any],
+    capabilities: tuple[Mapping[str, Any], ...],
+    effects: tuple[Mapping[str, Any], ...],
+    models: tuple[Mapping[str, Any], ...],
+    budget: Mapping[str, int | float | None],
+    control: Mapping[str, Any] | None,
+) -> str:
+    """Return the one definition identity used by every plan authoring path."""
+    contract: dict[str, Any] = {
+        "module_id": module_id,
+        "logical_step": logical_step,
+        "module_digest": module_digest,
+        "input_schema_digest": input_schema_digest,
+        "output_schema_digest": output_schema_digest,
+        "execution": execution,
+        "capabilities": capabilities,
+        "effects": effects,
+        "control": control,
+    }
+    if models:
+        contract["models"] = models
+    if budget != Budget().to_data():
+        contract["budget"] = budget
+    return digest_data(contract)
+
+
 def _plan_boundary_contract(module: Module[Any, Any]) -> dict[str, Any] | None:
     marker = getattr(module, "plan_boundary", None)
     if marker is None:
@@ -702,8 +755,7 @@ class _Compiler:
         )
         steps = tuple(self.steps)
         return _CompiledWorkflowGraph(
-            PlanIR(
-                version=IR_VERSION,
+            _finalize_plan(
                 workflow_id=self.root_workflow.workflow_id,
                 input_schema=type_schema(self.root_workflow.input_type),
                 output_schema=type_schema(self.root_workflow.output_type),
@@ -962,22 +1014,19 @@ class _Compiler:
         budget = _budget_contract(module)
         input_digest = schema_digest(module.input_type)
         output_digest = schema_digest(module.output_type)
-        definition_contract = {
-            "module_id": module_id,
-            "logical_step": logical_step,
-            "module_digest": behavior_digest,
-            "input_schema_digest": input_digest,
-            "output_schema_digest": output_digest,
-            "execution": module.execution.to_data(),
-            "capabilities": access["capabilities"],
-            "effects": access["effects"],
-            "control": control,
-        }
-        if models:
-            definition_contract["models"] = models
-        if budget != Budget().to_data():
-            definition_contract["budget"] = budget
-        definition_digest = digest_data(definition_contract)
+        definition_digest = _definition_digest(
+            module_id=module_id,
+            logical_step=logical_step,
+            module_digest=behavior_digest,
+            input_schema_digest=input_digest,
+            output_schema_digest=output_digest,
+            execution=module.execution.to_data(),
+            capabilities=access["capabilities"],
+            effects=access["effects"],
+            models=models,
+            budget=budget,
+            control=control,
+        )
         return StepIR(
             node_id=path,
             kind="map_module" if control and control.get("region") == "map" else "module",

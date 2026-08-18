@@ -45,9 +45,7 @@ from .budget import BudgetExceededError, BudgetUsage, _LiveBudgetMeter
 from .definitions import BoundWorkflow, bind_workflow
 from .dynamic import (
     PlanBoundary,
-    PlanFragmentIR,
     PlanValidator,
-    _plan_from_signature,
 )
 from .interactions import _InteractionModule
 from .ir import IR_VERSION, BindingIR, PlanIR, ReplayKey, StepIR, _access_contract, module_digest
@@ -1719,7 +1717,9 @@ class WorkflowRunner:
             if source.status is not TaskStatus.SUCCEEDED or source.accepted_boundary is None:
                 raise RuntimeExecutionError("bootstrap planner did not produce an accepted result")
             raw_fragment = self.store.values.decode(source.accepted_boundary.output_value)
-            fragment = PlanFragmentIR.from_dict(cast(Mapping[str, Any], raw_fragment))
+            if not isinstance(raw_fragment, Mapping):
+                raise RuntimeExecutionError("bootstrap planner did not return a plan object")
+            fragment = cast(Mapping[str, Any], raw_fragment)
             validator = PlanValidator(
                 marker.registry,
                 marker.limits,
@@ -1750,7 +1750,7 @@ class WorkflowRunner:
                 evidence.to_dict(),
                 task_id=source.task_id,
             )
-            generated_plan = _plan_from_signature(signature)
+            generated_plan = signature.plan
             self.store.adopt_run_definition(
                 run.run_id,
                 generated_plan,

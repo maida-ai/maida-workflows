@@ -113,15 +113,12 @@ Change the import to `serialized_plan`, `approval_boundary`, or
 
 ## Canonical serialized plan
 
-`serialized_plan.py` shows plan data authored without Python import strings.
-A trusted `ModuleRegistry` resolves its aliases and configuration schemas;
-`WorkflowBundle` stores canonical source data and compiled contracts with an
-integrity digest and restrictive permissions. Loading parses no executable
-code, and rebinding recomputes trusted module and schema identity before the
-ordinary runner can execute the plan.
-
-This example is the current `WorkflowSpec` path. It does not claim that native,
-generated, and serialized authoring already share one plan representation.
+`serialized_plan.py` serializes the canonical `PlanIR` emitted by ordinary
+workflow authoring. `WorkflowBundle.from_plan()` stores that survivor directly
+with an integrity digest and restrictive permissions. Loading parses no
+executable code, and rebinding through the same trusted `ModuleRegistry`
+recomputes exact module identity before the ordinary runner can execute it.
+There is no separate serialized graph representation.
 
 ## Durable approval boundary
 

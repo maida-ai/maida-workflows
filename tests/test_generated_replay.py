@@ -14,9 +14,7 @@ from maida.workflows import (
     ExecutionContext,
     Module,
     ModuleRegistry,
-    PlanFragmentIR,
     PlanLimits,
-    PlanNode,
     PlanValidator,
     ReplayCase,
     ReplayKey,
@@ -39,6 +37,7 @@ from maida.workflows.fixture import (
 from maida.workflows.materialization import DynamicPlanScheduler, PlanMaterializer
 from maida.workflows.persistence import PostgresStore
 from maida.workflows.replay import ReplayContractError, ReplayEngine, ReplayStatus
+from tests.generated_plan_helpers import generated_plan, plan_node
 
 NODE_BUDGET = Budget(
     wall_time=timedelta(seconds=1),
@@ -48,19 +47,19 @@ NODE_BUDGET = Budget(
 )
 
 
-def _fragment(*, include_double: bool = True) -> PlanFragmentIR:
-    nodes = [PlanNode("increment", "math.increment", ("$input",))]
+def _fragment(*, include_double: bool = True) -> dict[str, Any]:
+    nodes = [plan_node("increment", "math.increment", ("$input",))]
     if include_double:
         nodes.extend(
             (
-                PlanNode("double", "math.double", ("$input",)),
-                PlanNode("join", "math.join", ("increment", "double")),
+                plan_node("double", "math.double", ("$input",)),
+                plan_node("join", "math.join", ("increment", "double")),
             )
         )
         outputs = ("join",)
     else:
         outputs = ("increment",)
-    return PlanFragmentIR(
+    return generated_plan(
         fragment_id="generated-math",
         nodes=tuple(nodes),
         outputs=outputs,
@@ -82,7 +81,7 @@ class Planner(Module[int, dict[str, Any]]):
 
     async def execute(self, value: int, ctx: ExecutionContext) -> dict[str, Any]:
         self._calls += 1
-        return _fragment(include_double=self.include_double).to_dict()
+        return _fragment(include_double=self.include_double)
 
 
 class GeneratedWorkflow(Workflow[int, dict[str, Any]]):

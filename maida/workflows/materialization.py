@@ -20,7 +20,7 @@ from psycopg.types.json import Jsonb
 from ._canonical import canonical_data, canonical_json, digest_data, schema_digest
 from .authoring import Module
 from .budget import Budget
-from .dynamic import PlanFragmentIR, PlanSignature, PlanValidator
+from .dynamic import PlanSignature, PlanValidator, _decode_generated_plan
 from .ir import ReplayKey, _access_contract, module_digest
 from .model import _model_contract
 from .models import (
@@ -80,7 +80,7 @@ class PlanMaterializer:
         tenant_id: str,
         source_task_id: str,
         region_instance_id: str,
-        fragment: PlanFragmentIR,
+        fragment: Mapping[str, Any],
         validator: PlanValidator,
         expected_output_schema_digests: tuple[str, ...],
     ) -> MaterializedPlan:
@@ -92,8 +92,8 @@ class PlanMaterializer:
         :class:`DynamicPlanScheduler` observes accepted upstream boundaries.
         Repeating the exact region and digest is idempotent.
         """
-        if not isinstance(fragment, PlanFragmentIR):
-            raise TypeError("fragment must be PlanFragmentIR")
+        fragment = _decode_generated_plan(fragment)
+        fragment_digest = digest_data(fragment)
         if not region_instance_id.strip():
             raise ValueError("region_instance_id must be non-empty")
         history = self.store.load_run_history(run_id, tenant_id=tenant_id)
@@ -104,10 +104,10 @@ class PlanMaterializer:
             raise PersistenceError("successful plan source has no accepted boundary")
         source_data = self.store.values.decode(source.accepted_boundary.output_value)
         try:
-            restored = PlanFragmentIR.from_dict(cast(Mapping[str, Any], source_data))
+            restored = _decode_generated_plan(cast(Mapping[str, Any], source_data))
         except (TypeError, ValueError) as exc:
             raise InvalidRunStateError("accepted plan source is not a canonical fragment") from exc
-        if restored.canonical_json() != fragment.canonical_json():
+        if canonical_json(restored) != canonical_json(fragment):
             raise InvalidRunStateError("fragment does not match the accepted planner output")
 
         existing_events = tuple(
@@ -118,7 +118,7 @@ class PlanMaterializer:
         )
         latest = existing_events[-1] if existing_events else None
         if latest is not None:
-            if latest.payload["plan_digest"] != fragment.digest:
+            if latest.payload["plan_digest"] != fragment_digest:
                 raise InvalidRunStateError("a different plan is already materialized for region")
             tasks = self._region_tasks(history.tasks, region_instance_id)
             signature = validator.validate(
@@ -129,7 +129,7 @@ class PlanMaterializer:
             return MaterializedPlan(
                 run_id,
                 region_instance_id,
-                fragment.digest,
+                fragment_digest,
                 signature,
                 tuple(task.task_id for task in tasks),
             )
@@ -150,7 +150,7 @@ class PlanMaterializer:
         return MaterializedPlan(
             run_id,
             region_instance_id,
-            fragment.digest,
+            fragment_digest,
             signature,
             tuple(task.task_id for task in tasks),
         )
@@ -171,7 +171,7 @@ class PlanMaterializer:
         self,
         source: Task,
         region_instance_id: str,
-        fragment: PlanFragmentIR,
+        fragment: Mapping[str, Any],
         signature: PlanSignature,
         modules: Mapping[str, Module[Any, Any]],
         *,
@@ -300,7 +300,7 @@ class PlanMaterializer:
                         signature.region_id,
                         region_instance_id,
                         node_key,
-                        fragment.digest,
+                        digest_data(fragment),
                     ),
                 )
                 row = cursor.fetchone()
@@ -312,13 +312,13 @@ class PlanMaterializer:
                 source.run_id,
                 "PLAN_MATERIALIZED",
                 {
-                    "fragment_id": fragment.fragment_id,
+                    "fragment_id": fragment["fragment_id"],
                     "node_task_ids": [
                         {"node_key": row["plan_node_key"], "task_id": str(row["task_id"])}
                         for row in rows
                     ],
-                    "outputs": list(fragment.outputs),
-                    "plan_digest": fragment.digest,
+                    "outputs": list(fragment["outputs"]),
+                    "plan_digest": digest_data(fragment),
                     "region_id": signature.region_id,
                     "region_instance_id": region_instance_id,
                     "signature": signature.to_dict(),

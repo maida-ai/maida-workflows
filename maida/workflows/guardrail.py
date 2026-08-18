@@ -123,7 +123,7 @@ class PlanGuardrail:
         """Return typed core evidence for one trusted resolved signature."""
         if not isinstance(signature, PlanSignature):
             raise TypeError("signature must be PlanSignature")
-        artifact = plan_artifact_from_resolved_signature(signature.to_dict())
+        artifact = plan_artifact_from_resolved_signature(signature.to_core_dict())
         reference = accepted or self._accepted_reference(artifact)
         changes = self.diff(reference, artifact) if reference is not None else ()
         issues = self._policy_issues(artifact)
@@ -298,7 +298,7 @@ class PlanGuardrail:
             signature = PlanSignature.from_dict(
                 _mapping(event.payload.get("signature"), "signature")
             )
-            materialized = plan_artifact_from_resolved_signature(signature.to_dict())
+            materialized = plan_artifact_from_resolved_signature(signature.to_core_dict())
         except (TypeError, ValueError) as exc:
             return (
                 _divergence(

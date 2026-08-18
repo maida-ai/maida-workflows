@@ -167,12 +167,12 @@ add authenticated plan lineage and concrete generated instances.
 
 ## Explainable authoring and serialization
 
-Native `Workflow.build()` remains the shortest authoring path for Python
-applications. `WorkflowSpec` provides the same reliability surface as canonical
-data for humans, authoring agents, visual builders, and import adapters. A
-trusted `ModuleRegistry` publishes aliases and configuration schemas; generated
-specs may select those aliases but cannot supply code, imports, credentials,
-grants, or execution providers.
+Native `Workflow.build()` is the shortest authoring path for Python
+applications and emits canonical `PlanIR`. Generated planners emit only a
+restricted graph-choice mapping, which a trusted `ModuleRegistry` resolves
+directly into that same `PlanIR`. `WorkflowSpec` remains only as a temporary
+compatibility front-end for existing callers; it has no independent plan
+compiler or extra runtime representation.
 
 ```python
 compilation = compile_workflow_spec(spec, registry)
@@ -181,8 +181,9 @@ print(compilation.explanation)
 workflow = compilation.raise_for_errors()
 ```
 
-`WorkflowBundle` saves specs and compiled contracts as canonical
-`.maida-workflow` data with integrity digests and restrictive permissions.
+`WorkflowBundle.from_plan()` saves canonical `PlanIR` as `.maida-workflow`
+data with integrity digests and restrictive permissions. Compatibility specs
+may still accompany older bundles until their follow-on deletion task.
 Loading parses no executable code. Rebinding through the trusted registry or an
 exact factory catalog recomputes all module, schema, execution, access, model,
 and budget identities before the definition can run. Pickle, bytecode, SDK
@@ -196,9 +197,12 @@ release their worker lease. Typed idempotent commands later resume the task on
 any compatible worker. API and trigger callers can also supply a tenant-scoped
 start idempotency key; exact retries reuse one run and task graph.
 
-Generated planners return a minimal `PlanFragmentIR`. A planner module declares
-a trusted `PlanBoundary` containing its `ModuleRegistry`, structural limits,
-root output contract, and maximum child grant. The common path is one call:
+Generated planners return a minimal mapping of node keys, allowlisted aliases,
+dependencies, and outputs. A planner module declares a trusted `PlanBoundary`
+containing its `ModuleRegistry`, structural limits, root output contract, and
+maximum child grant. Trusted validation resolves that mapping directly into
+the same canonical `PlanIR` used by static workflows. The common path is one
+call:
 
 ```python
 result = await WorkflowRunner(store, connectors=connectors).run_generated(planner, request)

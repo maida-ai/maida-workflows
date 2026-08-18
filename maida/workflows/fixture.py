@@ -19,7 +19,7 @@ from typing import Any, Never, cast
 from ._canonical import canonical_data, canonical_json, digest_data
 from .alignment import project_execution_path
 from .artifacts import ArtifactError, ArtifactStore, ValueCodec
-from .dynamic import PlanFragmentIR, PlanSignature, _plan_from_signature
+from .dynamic import PlanSignature, _decode_generated_plan
 from .ir import PlanIR
 from .models import (
     BoundaryRecord,
@@ -32,7 +32,7 @@ from .models import (
 )
 from .persistence import PostgresStore
 
-FIXTURE_VERSION = "0.4.0"
+FIXTURE_VERSION = "0.5.0"
 STATIC_FIXTURE_VERSION = "0.2.0"
 
 
@@ -468,7 +468,7 @@ class ReplayFixtureExporter:
         root_records = tuple(
             record
             for record in generated
-            if _plan_from_signature(record.signature).digest == history.definition.digest
+            if record.signature.plan.digest == history.definition.digest
         )
         if len(root_records) > 1:
             self._history_incomplete("multiple generated plans claim the run definition")
@@ -520,13 +520,14 @@ class ReplayFixtureExporter:
                 if source_boundary is None:
                     raise KeyError(source_task_id)
                 source_data = self.source_values.decode(source_boundary.output_value)
-                fragment = PlanFragmentIR.from_dict(cast(dict[str, Any], source_data))
-                if fragment.digest != payload["plan_digest"]:
+                fragment = _decode_generated_plan(cast(dict[str, Any], source_data))
+                fragment_digest = digest_data(fragment)
+                if fragment_digest != payload["plan_digest"]:
                     raise ValueError("accepted fragment digest changed")
                 if (
-                    signature.source_fragment_digest != fragment.digest
+                    signature.source_fragment_digest != fragment_digest
                     or signature.region_id != payload["region_id"]
-                    or signature.outputs != fragment.outputs
+                    or signature.outputs != tuple(fragment["outputs"])
                     or signature.digest != payload["signature_digest"]
                 ):
                     raise ValueError("resolved plan signature changed")
@@ -541,7 +542,7 @@ class ReplayFixtureExporter:
                     if (
                         provenance is None
                         or provenance.node_key != node_key
-                        or provenance.plan_digest != fragment.digest
+                        or provenance.plan_digest != fragment_digest
                         or task.accepted_boundary is None
                     ):
                         raise ValueError("generated task provenance is incomplete")
@@ -556,7 +557,7 @@ class ReplayFixtureExporter:
                         region_instance_id=str(payload["region_instance_id"]),
                         source_task_id=source_task_id,
                         source_instance_key=source_boundary.instance_key,
-                        plan_digest=fragment.digest,
+                        plan_digest=fragment_digest,
                         signature=signature,
                         outputs=tuple(payload["outputs"]),
                         node_instances=tuple(sorted(node_instances)),
@@ -727,16 +728,16 @@ def _validate_loaded_integrity(fixture: ReplayFixture) -> None:
             )
         try:
             source_data = fixture.values.decode(source.output_value)
-            fragment = PlanFragmentIR.from_dict(cast(dict[str, Any], source_data))
+            fragment = _decode_generated_plan(cast(dict[str, Any], source_data))
         except (TypeError, ValueError, ArtifactError) as exc:
             raise ReplayFixtureError(
                 FixtureErrorCode.FIXTURE_INVALID,
                 "generated plan source value is invalid",
             ) from exc
         if (
-            fragment.digest != record.plan_digest
+            digest_data(fragment) != record.plan_digest
             or record.signature.source_fragment_digest != record.plan_digest
-            or fragment.outputs != record.outputs
+            or tuple(fragment["outputs"]) != record.outputs
             or record.signature.outputs != record.outputs
             or record.signature.region_id != record.region_id
         ):

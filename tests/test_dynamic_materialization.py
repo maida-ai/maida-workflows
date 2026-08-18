@@ -13,10 +13,9 @@ from maida.workflows import (
     ExecutionContext,
     Module,
     ModuleRegistry,
-    PlanFragmentIR,
     PlanLimits,
-    PlanNode,
     PlanTaskProvenance,
+    PlanValidationError,
     PlanValidator,
     RuntimeValue,
     TaskStatus,
@@ -33,6 +32,7 @@ from maida.workflows.materialization import (
     _verify_descriptor,
 )
 from maida.workflows.persistence import InvalidRunStateError, PersistenceError, PostgresStore
+from tests.generated_plan_helpers import generated_plan, plan_node
 
 RESOURCE_BOUND = Budget(
     wall_time=timedelta(seconds=1),
@@ -42,13 +42,13 @@ RESOURCE_BOUND = Budget(
 )
 
 
-def fragment() -> PlanFragmentIR:
-    return PlanFragmentIR(
+def fragment() -> dict[str, Any]:
+    return generated_plan(
         fragment_id="generated-math",
         nodes=(
-            PlanNode("increment", "math.increment", ("$input",)),
-            PlanNode("double", "math.double", ("$input",)),
-            PlanNode("join", "math.join", ("increment", "double")),
+            plan_node("increment", "math.increment", ("$input",)),
+            plan_node("double", "math.double", ("$input",)),
+            plan_node("join", "math.join", ("increment", "double")),
         ),
         outputs=("join",),
     )
@@ -60,7 +60,7 @@ class Planner(Module[int, dict[str, Any]]):
     output_type = dict[str, Any]
 
     async def execute(self, value: int, ctx: ExecutionContext) -> dict[str, Any]:
-        return fragment().to_dict()
+        return fragment()
 
 
 class PlannerWorkflow(Workflow[int, dict[str, Any]]):
@@ -158,7 +158,7 @@ def test_materializer_fails_closed_before_inserting_untrusted_or_conflicting_pla
         "validator": object(),
         "expected_output_schema_digests": (schema_digest(int),),
     }
-    with pytest.raises(TypeError, match="PlanFragmentIR"):
+    with pytest.raises(PlanValidationError, match="generated plan"):
         materializer.materialize(**{**arguments, "fragment": object()})
     with pytest.raises(ValueError, match="region_instance_id"):
         materializer.materialize(**{**arguments, "region_instance_id": ""})
@@ -211,7 +211,7 @@ def test_materializer_fails_closed_before_inserting_untrusted_or_conflicting_pla
         PostgresStore,
         SimpleNamespace(
             load_run_history=lambda *args, **kwargs: conflicting_history,
-            values=SimpleNamespace(decode=lambda value: fragment().to_dict()),
+            values=SimpleNamespace(decode=lambda value: fragment()),
         ),
     )
     with pytest.raises(InvalidRunStateError, match="different plan"):

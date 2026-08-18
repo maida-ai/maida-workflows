@@ -27,7 +27,7 @@ from ._canonical import (
 from .authoring import Module, _declared_module_id
 from .budget import Budget
 from .ir import _access_contract, _validated_access_declarations, module_digest
-from .model import _model_contract
+from .model import _model_contract, _validated_model_contract
 from .models import ExecutionSpec
 
 _ALIAS_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
@@ -140,6 +140,7 @@ class _CatalogEntry:
     execution: Mapping[str, Any]
     capabilities: tuple[Mapping[str, Any], ...]
     effects: tuple[Mapping[str, Any], ...]
+    models: tuple[Mapping[str, Any], ...]
     budget: Budget
 
     def __post_init__(self) -> None:
@@ -154,6 +155,11 @@ class _CatalogEntry:
             "effects",
             tuple(cast(Mapping[str, Any], _freeze_json(item)) for item in self.effects),
         )
+        object.__setattr__(
+            self,
+            "models",
+            tuple(cast(Mapping[str, Any], _freeze_json(item)) for item in self.models),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return cast(
@@ -165,6 +171,7 @@ class _CatalogEntry:
                     "effects": self.effects,
                     "execution": self.execution,
                     "input_schema_digests": self.input_schema_digests,
+                    "models": self.models,
                     "module_digest": self.module_digest,
                     "module_id": self.module_id,
                     "output_schema_digest": self.output_schema_digest,
@@ -183,6 +190,7 @@ def _catalog_entry(
     capabilities: Any,
     effects: Any,
     budget: Any,
+    models: Any = (),
     require_canonical: bool = False,
 ) -> _CatalogEntry:
     if not isinstance(module_id, str) or not module_id.strip():
@@ -218,6 +226,7 @@ def _catalog_entry(
         require_canonical=require_canonical,
         error_type=ValueError,
     )
+    encoded_models = _validated_model_contract(models, require_canonical=require_canonical)
     if not isinstance(budget, Budget):
         if not isinstance(budget, Mapping):
             raise ValueError("budget must be a Budget or canonical budget mapping")
@@ -236,6 +245,7 @@ def _catalog_entry(
         execution=encoded_execution,
         capabilities=encoded_capabilities,
         effects=encoded_effects,
+        models=encoded_models,
         budget=budget,
     )
 
@@ -492,6 +502,7 @@ def _fixed_registration(alias: str, factory: ModuleFactory) -> _Registration:
             budget=module.budget,
             capabilities=access["capabilities"],
             effects=access["effects"],
+            models=_model_contract(module),
         ),
     )
 

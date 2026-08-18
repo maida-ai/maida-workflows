@@ -23,15 +23,14 @@ from maida.workflows import (
     Idempotency,
     Module,
     ModuleRegistry,
-    PlanFragmentIR,
     PlanLimits,
-    PlanNode,
     PlanValidator,
     TaskStatus,
 )
 from maida.workflows._canonical import schema_digest
 from maida.workflows.guardrail import PlanGuardrail, PlanGuardrailError
 from maida.workflows.models import CapabilityGrant as StoredCapabilityGrant
+from tests.generated_plan_helpers import generated_plan, plan_node
 
 BASE_BUDGET = Budget(
     wall_time=timedelta(seconds=1),
@@ -94,10 +93,10 @@ REGION_GRANT = CapabilityGrant(effects=(SEND.name,))
 
 
 def _signature(*, alias: str = "text.normalize", with_effect: bool = False) -> Any:
-    nodes = [PlanNode("normalize", alias, ("$input",))]
+    nodes = [plan_node("normalize", alias, ("$input",))]
     outputs = ("normalize",)
     if with_effect:
-        nodes.append(PlanNode("send", "messages.send", ("normalize",)))
+        nodes.append(plan_node("send", "messages.send", ("normalize",)))
         outputs = ("send",)
     return PlanValidator(
         REGISTRY,
@@ -105,7 +104,7 @@ def _signature(*, alias: str = "text.normalize", with_effect: bool = False) -> A
         region_id="request-plan",
         region_grant=REGION_GRANT,
     ).validate(
-        PlanFragmentIR("request", tuple(nodes), outputs),
+        generated_plan("request", nodes, outputs),
         region_input_schema_digest=schema_digest(str),
         expected_output_schema_digests=(schema_digest(str),),
     )

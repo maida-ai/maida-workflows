@@ -21,9 +21,7 @@ from maida.workflows import (
     Module,
     ModuleRegistry,
     PlanBoundary,
-    PlanFragmentIR,
     PlanLimits,
-    PlanNode,
     PlanSignature,
     PlanValidationError,
     PlanValidator,
@@ -31,7 +29,6 @@ from maida.workflows import (
     WorkflowRunner,
 )
 from maida.workflows._canonical import schema_digest
-from maida.workflows.dynamic import _plan_from_signature
 from maida.workflows.fixture import ReplayFixtureExporter, load_fixture
 from maida.workflows.guardrail import PlanGuardrailError
 from maida.workflows.persistence import (
@@ -41,6 +38,7 @@ from maida.workflows.persistence import (
     blank_boundary,
 )
 from maida.workflows.runtime import RuntimeContractError, _bootstrap_plan
+from tests.generated_plan_helpers import generated_plan, plan_node
 
 NODE_BUDGET = Budget(
     wall_time=timedelta(seconds=1),
@@ -146,26 +144,26 @@ BOUNDARY = PlanBoundary(
 )
 
 
-def brief_plan() -> PlanFragmentIR:
-    return PlanFragmentIR(
+def brief_plan() -> dict[str, Any]:
+    return generated_plan(
         "brief-plan",
         (
-            PlanNode("normalize", "text.normalize", ("$input",)),
-            PlanNode("draft", "text.draft", ("normalize",)),
+            plan_node("normalize", "text.normalize", ("$input",)),
+            plan_node("draft", "text.draft", ("normalize",)),
         ),
         ("draft",),
     )
 
 
-def thorough_plan() -> PlanFragmentIR:
-    return PlanFragmentIR(
+def thorough_plan() -> dict[str, Any]:
+    return generated_plan(
         "thorough-plan",
         (
-            PlanNode("normalize", "text.normalize", ("$input",)),
-            PlanNode("context", "records.context", ("$input",)),
-            PlanNode("draft", "text.draft", ("normalize",)),
-            PlanNode("audit", "text.audit", ("draft", "context")),
-            PlanNode("deliver", "messages.deliver", ("audit",)),
+            plan_node("normalize", "text.normalize", ("$input",)),
+            plan_node("context", "records.context", ("$input",)),
+            plan_node("draft", "text.draft", ("normalize",)),
+            plan_node("audit", "text.audit", ("draft", "context")),
+            plan_node("deliver", "messages.deliver", ("audit",)),
         ),
         ("deliver",),
     )
@@ -179,18 +177,18 @@ class Planner(Module[str, dict[str, Any]]):
 
     async def execute(self, value: str, ctx: ExecutionContext) -> dict[str, Any]:
         selected = thorough_plan() if "thorough" in value else brief_plan()
-        return selected.to_dict()
+        return selected
 
 
 class RejectedPlanner(Planner):
     module_id = "demo.rejected-planner"
 
     async def execute(self, value: str, ctx: ExecutionContext) -> dict[str, Any]:
-        return PlanFragmentIR(
+        return generated_plan(
             "rejected-plan",
-            (PlanNode("unsafe", "untrusted.shell", ("$input",)),),
+            (plan_node("unsafe", "untrusted.shell", ("$input",)),),
             ("unsafe",),
-        ).to_dict()
+        )
 
 
 class ExplodingPlanner(Planner):
@@ -224,11 +222,11 @@ class FailingChildPlanner(Planner):
     plan_boundary = FAIL_BOUNDARY
 
     async def execute(self, value: str, ctx: ExecutionContext) -> dict[str, Any]:
-        return PlanFragmentIR(
+        return generated_plan(
             "failing-child-plan",
-            (PlanNode("fail", "fail", ("$input",)),),
+            (plan_node("fail", "fail", ("$input",)),),
             ("fail",),
-        ).to_dict()
+        )
 
 
 class MissingBoundaryPlanner(Module[str, dict[str, Any]]):
@@ -237,7 +235,7 @@ class MissingBoundaryPlanner(Module[str, dict[str, Any]]):
     output_type = dict[str, Any]
 
     async def execute(self, value: str, ctx: ExecutionContext) -> dict[str, Any]:
-        return brief_plan().to_dict()
+        return brief_plan()
 
 
 class BlankIdPlanner(Planner):
@@ -491,7 +489,7 @@ def test_plan_boundary_rejects_untrusted_marker_configuration() -> None:
         region_id="region",
         region_grant=CapabilityGrant(),
     )
-    with pytest.raises(PlanValidationError, match="fragment must be PlanFragmentIR"):
+    with pytest.raises(PlanValidationError, match="fields do not match"):
         validator.validate(
             cast(Any, {}),
             region_input_schema_digest=schema_digest(str),
@@ -554,13 +552,11 @@ def test_generated_definition_adoption_requires_the_accepted_bootstrap(
         region_id=BOUNDARY.region_id,
         region_grant=BOUNDARY.region_grant,
     )
-    plan = _plan_from_signature(
-        validator.validate(
-            fragment,
-            region_input_schema_digest=schema_digest(str),
-            expected_output_schema_digests=(schema_digest(str),),
-        )
-    )
+    plan = validator.validate(
+        fragment,
+        region_input_schema_digest=schema_digest(str),
+        expected_output_schema_digests=(schema_digest(str),),
+    ).plan
 
     with pytest.raises(PersistenceError, match="was not found"):
         postgres_store.adopt_run_definition(
@@ -591,7 +587,7 @@ def test_generated_definition_adoption_requires_the_accepted_bootstrap(
     assert claim is not None
     claim = postgres_store.start_task(claim)
     encoded_fragment = postgres_store.values.encode(
-        fragment.to_dict(),
+        fragment,
         schema_digest=schema_digest(planner.output_type),
     )
     boundary = blank_boundary(

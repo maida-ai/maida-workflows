@@ -62,9 +62,7 @@ from .coordination import CoordinatorProgress, WorkflowCatalog, WorkflowCoordina
 from .definitions import BoundWorkflow, bind_workflow
 from .dynamic import (
     PlanBoundary,
-    PlanFragmentIR,
     PlanLimits,
-    PlanNode,
     PlanSignature,
     PlanValidationError,
     PlanValidator,
@@ -198,10 +196,8 @@ __all__ = [
     "NodeSpec",
     "PauseCommand",
     "PlanBoundary",
-    "PlanFragmentIR",
     "PlanIR",
     "PlanLimits",
-    "PlanNode",
     "PlanSignature",
     "PlanTaskProvenance",
     "PlanValidationError",

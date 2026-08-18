@@ -17,7 +17,7 @@ from maida.schema_versions import (  # type: ignore[import-untyped]
 from ._canonical import schema_digest
 from .authoring import ExecutionContext, Module
 from .budget import Budget
-from .dynamic import PlanBoundary, PlanFragmentIR, PlanLimits, PlanNode, PlanValidator
+from .dynamic import PlanBoundary, PlanLimits, PlanValidator
 from .guardrail import PlanGuardrail
 from .registry import ModuleRegistry
 
@@ -98,27 +98,43 @@ class _Planner(Module[str, dict[str, Any]]):
 
     async def execute(self, value: str, ctx: ExecutionContext) -> dict[str, Any]:
         if "release" not in value.lower():
-            return PlanFragmentIR(
+            return _generated_plan(
                 "brief-update",
-                (
-                    PlanNode("normalize", "text.normalize", ("$input",)),
-                    PlanNode("draft", "text.draft", ("normalize",)),
-                ),
-                ("draft",),
-            ).to_dict()
-        return PlanFragmentIR(
+                [
+                    ("normalize", "text.normalize", ["$input"]),
+                    ("draft", "text.draft", ["normalize"]),
+                ],
+                ["draft"],
+            )
+        return _generated_plan(
             "release-update",
-            (
-                PlanNode("normalize", "text.normalize", ("$input",)),
-                PlanNode("draft", "text.draft", ("normalize",)),
-                PlanNode("review", "text.review", ("normalize",)),
-                PlanNode("publish", "text.publish", ("draft", "review")),
-            ),
-            ("publish",),
-        ).to_dict()
+            [
+                ("normalize", "text.normalize", ["$input"]),
+                ("draft", "text.draft", ["normalize"]),
+                ("review", "text.review", ["normalize"]),
+                ("publish", "text.publish", ["draft", "review"]),
+            ],
+            ["publish"],
+        )
 
 
-async def _generate(request: str) -> PlanFragmentIR:
+def _generated_plan(
+    fragment_id: str,
+    nodes: list[tuple[str, str, list[str]]],
+    outputs: list[str],
+) -> dict[str, Any]:
+    return {
+        "fragment_id": fragment_id,
+        "nodes": [
+            {"dependencies": dependencies, "key": key, "module_alias": alias}
+            for key, alias, dependencies in sorted(nodes)
+        ],
+        "outputs": outputs,
+        "version": "0.2.0",
+    }
+
+
+async def _generate(request: str) -> dict[str, Any]:
     planner = _Planner()
     payload = await planner.execute(
         request,
@@ -128,7 +144,7 @@ async def _generate(request: str) -> PlanFragmentIR:
             step_instance_id="planner-1",
         ),
     )
-    return PlanFragmentIR.from_dict(payload)
+    return payload
 
 
 def run_plan_demo(
@@ -162,7 +178,7 @@ def run_plan_demo(
             "plan": PLAN_SCHEMA_VERSION,
         },
         "topology": (
-            _REVIEWED_TOPOLOGY if fragment.fragment_id == "release-update" else _BRIEF_TOPOLOGY
+            _REVIEWED_TOPOLOGY if fragment["fragment_id"] == "release-update" else _BRIEF_TOPOLOGY
         ),
         "rendered": guardrail.format(evidence),
     }
