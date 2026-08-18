@@ -171,3 +171,45 @@ def test_imported_signature_rejects_plan_tampering_with_a_stable_code() -> None:
         PlanSignature.from_dict(encoded)
 
     assert raised.value.code == "PLAN_SIGNATURE_INVALID"
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "generated-control",
+        "node-input-schemas",
+        "plan-input-schema",
+        "plan-output-schemas",
+        "output-control",
+        "workflow-identity",
+    ),
+)
+def test_imported_signature_rejects_authoritative_plan_contract_tampering(tamper: str) -> None:
+    encoded = (
+        validator()
+        .validate(
+            generated_plan(),
+            region_input_schema_digest=schema_digest(str),
+            expected_output_schema_digests=(schema_digest(str),),
+        )
+        .to_dict()
+    )
+    plan = encoded["plan"]
+
+    if tamper == "generated-control":
+        plan["steps"][0]["control"]["region"] = "when"
+    elif tamper == "node-input-schemas":
+        plan["steps"][0]["control"]["input_schema_digests"] = "not-an-array"
+    elif tamper == "plan-input-schema":
+        plan["input_schema"]["extra"] = "untrusted"
+    elif tamper == "plan-output-schemas":
+        plan["output_schema"]["digests"] = "not-an-array"
+    elif tamper == "output-control":
+        plan["steps"][-1]["control"]["outputs"] = "not-an-array"
+    else:
+        plan["workflow_id"] = "untrusted-static-plan"
+
+    with pytest.raises(PlanValidationError) as raised:
+        PlanSignature.from_dict(encoded)
+
+    assert raised.value.code == "PLAN_SIGNATURE_INVALID"

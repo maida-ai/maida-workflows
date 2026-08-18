@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import stat
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -23,6 +23,7 @@ from maida.workflows import (
     WorkflowRunner,
     WorkflowSpec,
     compile_workflow,
+    map_over,
 )
 from maida.workflows._canonical import canonical_json, digest_data, type_schema
 from maida.workflows.bundle import _fixed_aliases_by_digest
@@ -46,6 +47,41 @@ class UpperWorkflow(Workflow[str, str]):
 
     def build(self, value: RuntimeValue[str]) -> RuntimeValue[str]:
         return self.upper(value)
+
+
+@dataclass(frozen=True)
+class BundleItem:
+    item_id: str
+    value: str
+
+
+class ReadBundleItem(Module[BundleItem, str]):
+    module_id = "bundle.item.read"
+    input_type = BundleItem
+    output_type = str
+
+    async def execute(self, value: BundleItem, ctx: ExecutionContext) -> str:
+        return value.value
+
+
+class FieldMappedWorkflow(Workflow[list[BundleItem], list[str]]):
+    workflow_id = "bundle-field-map"
+    input_type = list[BundleItem]
+    output_type = list[str]
+    read = ReadBundleItem()
+
+    def build(self, value: RuntimeValue[list[BundleItem]]) -> RuntimeValue[list[str]]:
+        return map_over(value, self.read, item_key="item_id")
+
+
+class CallbackMappedWorkflow(Workflow[list[BundleItem], list[str]]):
+    workflow_id = "bundle-callback-map"
+    input_type = list[BundleItem]
+    output_type = list[str]
+    read = ReadBundleItem()
+
+    def build(self, value: RuntimeValue[list[BundleItem]]) -> RuntimeValue[list[str]]:
+        return map_over(value, self.read, item_key=lambda item: item.item_id)
 
 
 def registry() -> ModuleRegistry:
@@ -273,6 +309,28 @@ def test_canonical_plan_bundle_requires_complete_trusted_module_identity() -> No
     incomplete = replace(plan, steps=(replace(step, module_digest=None),))
     with pytest.raises(WorkflowBundleError, match="incomplete module identity"):
         WorkflowBundle.from_plan(incomplete, registry())
+
+
+def test_canonical_plan_bundle_rebinds_only_serializable_map_identity() -> None:
+    item_registry = ModuleRegistry(modules={"item.read": ReadBundleItem})
+    field_plan = compile_workflow(FieldMappedWorkflow())
+    field_bundle = WorkflowBundle.from_plan(field_plan, item_registry)
+
+    rebound = field_bundle.bind(module_registry=item_registry)
+    field_step = field_plan.executable_steps[0]
+    assert rebound.map_item_keys == {field_step.node_id: "item_id"}
+
+    callback_plan = compile_workflow(CallbackMappedWorkflow())
+    callback_bundle = WorkflowBundle.from_plan(callback_plan, item_registry)
+    with pytest.raises(WorkflowBundleError, match="cannot rebind") as callback_error:
+        callback_bundle.bind(module_registry=item_registry)
+    assert "field item-key" in str(callback_error.value.__cause__)
+
+    incomplete_step = replace(field_step, module_digest=None)
+    incomplete_bundle = replace(field_bundle, plan=replace(field_plan, steps=(incomplete_step,)))
+    with pytest.raises(WorkflowBundleError, match="cannot rebind") as identity_error:
+        incomplete_bundle.bind(module_registry=item_registry)
+    assert "module identity is incomplete" in str(identity_error.value.__cause__)
 
 
 def test_factory_bound_bundle_rejects_catalog_definition_drift() -> None:
