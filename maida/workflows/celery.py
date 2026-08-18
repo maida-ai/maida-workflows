@@ -13,9 +13,9 @@ from collections.abc import Callable, Mapping
 from typing import Any, Protocol
 
 from .runtime import (
+    BoundaryHarness,
     ExecutionRequest,
     RuntimeContractError,
-    TaskWorker,
 )
 
 
@@ -32,7 +32,7 @@ class _CeleryTask(Protocol):
     ) -> _CeleryResult: ...
 
 
-WorkerFactory = Callable[[ExecutionRequest], TaskWorker]
+HarnessFactory = Callable[[ExecutionRequest], BoundaryHarness]
 
 
 class CeleryBackend:
@@ -76,27 +76,27 @@ class CeleryBackend:
 
     @staticmethod
     def task_handler(
-        worker_for: WorkerFactory,
+        harness_for: HarnessFactory,
     ) -> Callable[[Mapping[str, Any]], dict[str, Any]]:
         """Build the synchronous function an application registers with Celery.
 
-        ``worker_for`` is application-owned trusted code. It resolves an exact
+        ``harness_for`` is application-owned trusted code. It resolves an exact
         definition and module set from the request identities; no import path,
         credential, queue, or capability grant arrives from generated data.
         """
-        if not callable(worker_for):
-            raise TypeError("Celery worker factory must be callable")
+        if not callable(harness_for):
+            raise TypeError("Celery harness factory must be callable")
 
         def handle(data: Mapping[str, Any]) -> dict[str, Any]:
             request = ExecutionRequest.from_data(data)
-            worker = worker_for(request)
-            if not isinstance(worker, TaskWorker):
-                raise TypeError("Celery worker factory must return a TaskWorker")
-            if worker.workflow_id != request.workflow_id:
-                raise RuntimeContractError("Celery worker resolved a different workflow")
-            if worker.definition_digest != request.definition_digest:
-                raise RuntimeContractError("Celery worker resolved a different definition")
-            accepted = asyncio.run(worker.run_request(request))
+            harness = harness_for(request)
+            if not isinstance(harness, BoundaryHarness):
+                raise TypeError("Celery harness factory must return a BoundaryHarness")
+            if harness.workflow_id != request.workflow_id:
+                raise RuntimeContractError("Celery harness resolved a different workflow")
+            if harness.definition_digest != request.definition_digest:
+                raise RuntimeContractError("Celery harness resolved a different definition")
+            accepted = asyncio.run(harness.run_request(request))
             return {
                 "accepted": accepted,
                 "execution_id": request.execution_id,

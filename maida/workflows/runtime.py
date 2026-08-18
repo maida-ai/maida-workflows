@@ -68,9 +68,10 @@ from .models import (
     Usage,
     _EffectOperation,
 )
-from .persistence import ClaimedTask
+from .persistence import ClaimedTask, ExternalExecution
 
 _rehydrate = _rehydrate_value
+_BoundaryExecution = ClaimedTask | ExternalExecution
 
 
 class RuntimeExecutionError(RuntimeError):
@@ -143,6 +144,16 @@ class DurableRuntimeStore(Protocol):
         """Transition a claimed attempt to running."""
         ...
 
+    def start_external_execution(
+        self,
+        task: Task,
+        *,
+        execution_id: str,
+        worker_id: str,
+    ) -> ExternalExecution | None:
+        """Reserve an already-delivered task without a local task lease."""
+        ...
+
     def heartbeat_task(
         self,
         claim: ClaimedTask,
@@ -158,7 +169,7 @@ class DurableRuntimeStore(Protocol):
 
     def _reserve_effect(
         self,
-        claim: ClaimedTask,
+        claim: _BoundaryExecution,
         *,
         effect_name: str,
         ordinal: int,
@@ -173,7 +184,7 @@ class DurableRuntimeStore(Protocol):
 
     def _lookup_effect(
         self,
-        claim: ClaimedTask,
+        claim: _BoundaryExecution,
         *,
         effect_name: str,
         ordinal: int,
@@ -187,7 +198,7 @@ class DurableRuntimeStore(Protocol):
 
     def _mark_effect_attempted(
         self,
-        claim: ClaimedTask,
+        claim: _BoundaryExecution,
         operation: _EffectOperation,
         *,
         policy_id: str,
@@ -199,7 +210,7 @@ class DurableRuntimeStore(Protocol):
 
     def _commit_effect(
         self,
-        claim: ClaimedTask,
+        claim: _BoundaryExecution,
         operation: _EffectOperation,
         result: StoredValue,
         *,
@@ -210,9 +221,17 @@ class DurableRuntimeStore(Protocol):
         """Accept and return the store-authoritative logical boundary."""
         ...
 
+    def complete_external_execution(
+        self,
+        execution: ExternalExecution,
+        boundary: BoundaryRecord,
+    ) -> BoundaryRecord:
+        """Accept a boundary under an external execution fence."""
+        ...
+
     def _reserve_budget_usage(
         self,
-        claim: ClaimedTask,
+        claim: _BoundaryExecution,
         *,
         charge_key: str,
         kind: str,
@@ -221,7 +240,7 @@ class DurableRuntimeStore(Protocol):
 
     def _commit_budget_usage(
         self,
-        claim: ClaimedTask,
+        claim: _BoundaryExecution,
         *,
         charge_key: str,
         usage: BudgetUsage,
@@ -237,13 +256,29 @@ class DurableRuntimeStore(Protocol):
         """Record a failed attempt and optionally make its task retryable."""
         ...
 
+    def record_external_failure(
+        self,
+        execution: ExternalExecution,
+        diagnostic: dict[str, Any],
+    ) -> None:
+        """Record failure evidence without selecting an external retry policy."""
+        ...
+
     def park_task(self, claim: ClaimedTask, request: dict[str, Any]) -> None:
         """Relinquish a running attempt while awaiting a durable command."""
         ...
 
+    def park_external_execution(
+        self,
+        execution: ExternalExecution,
+        request: dict[str, Any],
+    ) -> None:
+        """Park an externally delivered interaction boundary."""
+        ...
+
     def load_interaction_resolution(
         self,
-        claim: ClaimedTask,
+        claim: _BoundaryExecution,
         *,
         request_id: str,
         kind: str,
@@ -525,6 +560,301 @@ def _coerce_effect(value: dict[str, Any]) -> EffectRecord:
     )
 
 
+class BoundaryHarness:
+    """Validate and record one trusted module boundary on any substrate.
+
+    External runtimes invoke this harness after they have delivered a strict
+    :class:`ExecutionRequest`. It owns trusted module resolution, schemas,
+    budgets, grants, effects, usage, and accepted-boundary persistence. It does
+    not claim tasks, lease deliveries, heartbeat, match compute capabilities,
+    or choose retries.
+    """
+
+    def __init__(
+        self,
+        store: DurableRuntimeStore,
+        *,
+        workflow_id: str,
+        definition_digest: str,
+        modules: Mapping[ReplayKey, Module[Any, Any]],
+        worker_id: str,
+        connectors: ConnectorRegistry | None = None,
+        access_policy: AccessPolicy | None = None,
+        model_adapters: ModelAdapterRegistry | None = None,
+        _module_digests: Mapping[ReplayKey, str] | None = None,
+    ) -> None:
+        self.store = store
+        self.workflow_id = workflow_id
+        self.definition_digest = definition_digest
+        self.modules = modules
+        self.module_digests = (
+            dict(_module_digests)
+            if _module_digests is not None
+            else {key: module_digest(module) for key, module in modules.items()}
+        )
+        self.worker_id = worker_id
+        self.connectors = connectors or ConnectorRegistry()
+        self.access_policy = access_policy
+        self.model_adapters = model_adapters or ModelAdapterRegistry()
+
+    def validate_request(self, request: ExecutionRequest) -> Task:
+        """Resolve an exact transport request without crossing run or tenant scope."""
+        if request.workflow_id != self.workflow_id:
+            raise RuntimeContractError("execution request workflow does not match harness")
+        if request.definition_digest != self.definition_digest:
+            raise RuntimeContractError("execution request definition does not match harness")
+        history = self.store.load_run_history(
+            request.run_id,
+            tenant_id=request.tenant_id,
+        )
+        task = next(
+            (item for item in history.tasks if item.task_id == request.task_id),
+            None,
+        )
+        if task is None or task.run_id != request.run_id:
+            raise RuntimeContractError("execution request task does not belong to its run")
+        boundary = task.accepted_boundary
+        if boundary is not None:
+            matches_definition = (
+                boundary.workflow_id == request.workflow_id
+                and boundary.definition_digest == request.definition_digest
+            )
+        else:
+            matches_definition = (
+                history.definition.workflow_id == request.workflow_id
+                and history.run.definition_digest == request.definition_digest
+            )
+        if not matches_definition:
+            raise RuntimeContractError("execution request does not match its persisted run")
+        return cast(Task, task)
+
+    async def run_request(self, request: ExecutionRequest) -> bool:
+        """Run an already-delivered request under a non-expiring execution fence."""
+        task = self.validate_request(request)
+        if task.status is TaskStatus.SUCCEEDED and task.accepted_boundary is not None:
+            return True
+        execution = self.store.start_external_execution(
+            task,
+            execution_id=request.execution_id,
+            worker_id=self.worker_id,
+        )
+        if execution is None:
+            return True
+        boundary = await self._execute_boundary(execution)
+        if boundary is not None:
+            return True
+        history = self.store.load_run_history(
+            request.run_id,
+            tenant_id=request.tenant_id,
+        )
+        return any(
+            item.task_id == request.task_id and item.status is TaskStatus.SUCCEEDED
+            for item in history.tasks
+        )
+
+    async def _execute_boundary(
+        self,
+        execution: _BoundaryExecution,
+        *,
+        max_attempts: int | None = None,
+    ) -> BoundaryRecord | None:
+        task = execution.task
+        key = ReplayKey(task.module_id, task.logical_step)
+
+        def fail(diagnostic: dict[str, Any], *, retry: bool = False) -> None:
+            if isinstance(execution, ExternalExecution):
+                self.store.record_external_failure(execution, diagnostic)
+            else:
+                self.store.fail_task(execution, diagnostic, retry=retry)
+
+        if task.input_value is None:
+            fail({"reason": "ready task has no input reference"})
+            raise RuntimeContractError("ready task has no input reference")
+        try:
+            module = self.modules[key]
+        except KeyError as exc:
+            fail({"reason": f"no module registered for {key.as_string()}"})
+            raise RuntimeContractError(f"no module registered for {key.as_string()}") from exc
+        try:
+            input_data = _rehydrate(self.store.values.decode(task.input_value), module.input_type)
+        except Exception as exc:
+            fail({"reason": str(exc), "exception_type": type(exc).__qualname__})
+            raise RuntimeContractError("task input reference could not be resolved") from exc
+        if self.module_digests.get(key) != task.module_digest:
+            fail({"reason": f"module digest mismatch for pinned task {key.as_string()}"})
+            raise RuntimeContractError(f"module digest mismatch for pinned task {key.as_string()}")
+        if not value_matches_type(input_data, module.input_type):
+            diagnostic = {"reason": "persisted task input violates the module input contract"}
+            fail(diagnostic)
+            raise RuntimeContractError(diagnostic["reason"])
+        interaction_resolution: dict[str, Any] | None = None
+        if isinstance(module, _InteractionModule):
+            request = module._request_data(
+                run_id=task.run_id,
+                task_id=task.task_id,
+                step_instance_id=task.step_instance_id,
+            )
+            interaction_resolution = self.store.load_interaction_resolution(
+                execution,
+                request_id=cast(str, request["request_id"]),
+                kind=module.interaction_kind,
+            )
+            if interaction_resolution is None:
+                if isinstance(execution, ExternalExecution):
+                    self.store.park_external_execution(execution, request)
+                else:
+                    self.store.park_task(execution, request)
+                return None
+        metadata: dict[str, Any] = {}
+        meter = _LiveBudgetMeter(self.store, execution)
+        attempt_id = str(execution.attempt.attempt_id)
+        try:
+            broker = AccessBroker(
+                self.connectors,
+                declarations=cast(tuple[Capability[Any, Any], ...], module.capabilities),
+                effects=cast(tuple[EffectSpec[Any, Any], ...], module.effects),
+                grant=task.capability_grant,
+                run_id=task.run_id,
+                task_id=task.task_id,
+                attempt_id=attempt_id,
+                module_id=task.module_id,
+                logical_step=task.logical_step,
+                policy=self.access_policy,
+                audit=lambda event_type, payload: self.store.append_access_event(
+                    task.run_id,
+                    event_type,
+                    payload,
+                    task_id=task.task_id,
+                    attempt_id=attempt_id,
+                ),
+                metadata=metadata,
+                _effect_operations=self.store,
+                _claim=execution,
+                _budget_meter=meter,
+            )
+        except Exception as exc:
+            fail(
+                {
+                    "reason": "task access contract could not be bound",
+                    "exception_type": type(exc).__qualname__,
+                }
+            )
+            raise RuntimeContractError("task access contract could not be bound") from exc
+        model_broker = ModelBroker(
+            self.model_adapters,
+            cast(tuple[ModelSpec[Any, Any], ...], module.models),
+            meter=meter,
+            metadata=metadata,
+            audit=lambda event_type, payload: self.store.append_access_event(
+                task.run_id,
+                event_type,
+                payload,
+                task_id=task.task_id,
+                attempt_id=attempt_id,
+            ),
+        )
+        context = ExecutionContext(
+            run_id=task.run_id,
+            task_id=task.task_id,
+            step_instance_id=task.step_instance_id,
+            broker=broker,
+            models=model_broker,
+            metadata=metadata,
+        )
+        started = time.perf_counter()
+        try:
+
+            async def invoke() -> Any:
+                return (
+                    module._resolve_data(interaction_resolution)
+                    if isinstance(module, _InteractionModule) and interaction_resolution is not None
+                    else await module.execute(input_data, context)
+                )
+
+            if task.budget.wall_time is None:
+                output = await invoke()
+            else:
+                try:
+                    async with asyncio.timeout(task.budget.wall_time.total_seconds()):
+                        output = await invoke()
+                except TimeoutError:
+                    raise BudgetExceededError("wall_time budget was exceeded") from None
+            if not value_matches_type(output, module.output_type):
+                raise RuntimeContractError(
+                    f"module {key.as_string()} returned a value outside its output contract"
+                )
+        except Exception as exc:
+            retry = (
+                not isinstance(execution, ExternalExecution)
+                and max_attempts is not None
+                and not isinstance(exc, BudgetExceededError)
+                and execution.attempt.attempt_number < max_attempts
+                and (not isinstance(exc, AccessContractError) or exc.retryable)
+            )
+            fail(
+                {"reason": str(exc), "exception_type": type(exc).__qualname__},
+                retry=retry,
+            )
+            raise
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        output_value = self.store.values.encode(
+            output,
+            schema_digest=schema_digest(module.output_type),
+        )
+        usage_data = dict(metadata.get("usage", {}))
+        usage_data.setdefault("latency_ms", elapsed_ms)
+        effects = [_coerce_effect(item) for item in broker._boundary_effect_records()]
+        if module.effectful and not module.effects and not broker._effect_called:
+            effects.extend(
+                (
+                    EffectRecord(
+                        EffectKind.ATTEMPTED,
+                        task.module_id,
+                        "execute",
+                        task.input_value.digest,
+                    ),
+                    EffectRecord(
+                        EffectKind.COMMITTED,
+                        task.module_id,
+                        "execute",
+                        task.input_value.digest,
+                        output_value.digest,
+                    ),
+                )
+            )
+        now = datetime.now(UTC).isoformat()
+        boundary = BoundaryRecord(
+            workflow_id=self.workflow_id,
+            definition_digest=self.definition_digest,
+            module_id=task.module_id,
+            logical_step=task.logical_step,
+            step_instance_id=task.step_instance_id,
+            module_digest=task.module_digest,
+            dependency_instance_keys=task.dependency_instance_keys,
+            input_value=task.input_value,
+            output_value=output_value,
+            input_schema_digest=task.input_value.schema_digest,
+            output_schema_digest=output_value.schema_digest,
+            accepted_attempt=AcceptedAttemptProvenance(
+                execution.attempt.attempt_id,
+                execution.attempt.attempt_number,
+                execution.worker_id,
+                (execution.attempt.started_at.isoformat() if execution.attempt.started_at else now),
+                now,
+            ),
+            trajectories=tuple(
+                _coerce_trajectory(item) for item in metadata.get("trajectories", [])
+            ),
+            usage=Usage(**usage_data),
+            branch_decisions=task.branch_decisions,
+            map_decisions=task.map_decisions,
+            effects=tuple(effects),
+        )
+        if isinstance(execution, ExternalExecution):
+            return self.store.complete_external_execution(execution, boundary)
+        return self.store.complete_task(execution, boundary)
+
+
 class TaskWorker:
     """Claim and execute durable module tasks without replay substitution.
 
@@ -584,6 +914,19 @@ class TaskWorker:
         self.access_policy = access_policy
         self.model_adapters = model_adapters or ModelAdapterRegistry()
 
+    def _boundary_harness(self) -> BoundaryHarness:
+        return BoundaryHarness(
+            self.store,
+            workflow_id=self.workflow_id,
+            definition_digest=self.definition_digest,
+            modules=self.modules,
+            worker_id=self.worker_id,
+            connectors=self.connectors,
+            access_policy=self.access_policy,
+            model_adapters=self.model_adapters,
+            _module_digests=self.module_digests,
+        )
+
     def claim(
         self,
         *,
@@ -602,34 +945,7 @@ class TaskWorker:
 
     def validate_request(self, request: ExecutionRequest) -> Task:
         """Resolve an exact transport request without crossing run or tenant scope."""
-        if request.workflow_id != self.workflow_id:
-            raise RuntimeContractError("execution request workflow does not match worker")
-        if request.definition_digest != self.definition_digest:
-            raise RuntimeContractError("execution request definition does not match worker")
-        history = self.store.load_run_history(
-            request.run_id,
-            tenant_id=request.tenant_id,
-        )
-        task = next(
-            (item for item in history.tasks if item.task_id == request.task_id),
-            None,
-        )
-        if task is None or task.run_id != request.run_id:
-            raise RuntimeContractError("execution request task does not belong to its run")
-        boundary = task.accepted_boundary
-        if boundary is not None:
-            matches_definition = (
-                boundary.workflow_id == request.workflow_id
-                and boundary.definition_digest == request.definition_digest
-            )
-        else:
-            matches_definition = (
-                history.definition.workflow_id == request.workflow_id
-                and history.run.definition_digest == request.definition_digest
-            )
-        if not matches_definition:
-            raise RuntimeContractError("execution request does not match its persisted run")
-        return cast(Task, task)
+        return self._boundary_harness().validate_request(request)
 
     async def run_request(self, request: ExecutionRequest) -> bool:
         """Execute one validated backend request or accept an idempotent redelivery."""
@@ -734,33 +1050,9 @@ class TaskWorker:
         heartbeat = asyncio.create_task(self._heartbeat_loop(envelope, lease_for, interval))
         try:
             claim = envelope._claim()
-            key = ReplayKey(claim.task.module_id, claim.task.logical_step)
-            try:
-                module = self.modules[key]
-            except KeyError as exc:
-                self.fail(
-                    envelope,
-                    {"reason": f"no module registered for {key.as_string()}"},
-                    retry=False,
-                )
-                raise RuntimeContractError(f"no module registered for {key.as_string()}") from exc
-            try:
-                input_data = _rehydrate(
-                    self.store.values.decode(envelope.input_ref), module.input_type
-                )
-            except Exception as exc:
-                self.fail(
-                    envelope,
-                    {"reason": str(exc), "exception_type": type(exc).__qualname__},
-                    retry=False,
-                )
-                raise RuntimeContractError("task input reference could not be resolved") from exc
-            return await self._execute_claim(
-                module,
+            return await self._boundary_harness()._execute_boundary(
                 claim,
-                input_data,
-                branch_decisions=claim.task.branch_decisions,
-                map_decisions=claim.task.map_decisions,
+                max_attempts=self.max_attempts,
             )
         finally:
             heartbeat.cancel()
@@ -775,194 +1067,6 @@ class TaskWorker:
         while True:
             await asyncio.sleep(interval.total_seconds())
             self.heartbeat(envelope, lease_for=lease_for)
-
-    async def _execute_claim(
-        self,
-        module: Module[Any, Any],
-        claim: ClaimedTask,
-        input_data: Any,
-        *,
-        branch_decisions: tuple[dict[str, Any], ...] = (),
-        map_decisions: tuple[dict[str, Any], ...] = (),
-    ) -> BoundaryRecord | None:
-        key = key_for(claim)
-        envelope = TaskEnvelope.from_claim(claim)
-        if claim.task.input_value is None:
-            self.fail(envelope, {"reason": "ready task has no input reference"}, retry=False)
-            raise RuntimeContractError("ready task has no input reference")
-        if self.module_digests.get(key) != claim.task.module_digest:
-            self.fail(
-                envelope,
-                {"reason": f"module digest mismatch for pinned task {key.as_string()}"},
-                retry=False,
-            )
-            raise RuntimeContractError(f"module digest mismatch for pinned task {key.as_string()}")
-        if not value_matches_type(input_data, module.input_type):
-            diagnostic = {"reason": "persisted task input violates the module input contract"}
-            self.fail(envelope, diagnostic, retry=False)
-            raise RuntimeContractError(diagnostic["reason"])
-        interaction_resolution: dict[str, Any] | None = None
-        if isinstance(module, _InteractionModule):
-            request = module._request_data(
-                run_id=claim.task.run_id,
-                task_id=claim.task.task_id,
-                step_instance_id=claim.task.step_instance_id,
-            )
-            interaction_resolution = self.store.load_interaction_resolution(
-                claim,
-                request_id=cast(str, request["request_id"]),
-                kind=module.interaction_kind,
-            )
-            if interaction_resolution is None:
-                self.store.park_task(claim, request)
-                return None
-        metadata: dict[str, Any] = {}
-        meter = _LiveBudgetMeter(self.store, claim)
-        try:
-            broker = AccessBroker(
-                self.connectors,
-                declarations=cast(tuple[Capability[Any, Any], ...], module.capabilities),
-                effects=cast(tuple[EffectSpec[Any, Any], ...], module.effects),
-                grant=claim.task.capability_grant,
-                run_id=claim.task.run_id,
-                task_id=claim.task.task_id,
-                attempt_id=str(claim.attempt.attempt_id),
-                module_id=claim.task.module_id,
-                logical_step=claim.task.logical_step,
-                policy=self.access_policy,
-                audit=lambda event_type, payload: self.store.append_access_event(
-                    claim.task.run_id,
-                    event_type,
-                    payload,
-                    task_id=claim.task.task_id,
-                    attempt_id=str(claim.attempt.attempt_id),
-                ),
-                metadata=metadata,
-                _effect_operations=self.store,
-                _claim=claim,
-                _budget_meter=meter,
-            )
-        except Exception as exc:
-            self.fail(
-                envelope,
-                {
-                    "reason": "task access contract could not be bound",
-                    "exception_type": type(exc).__qualname__,
-                },
-                retry=False,
-            )
-            raise RuntimeContractError("task access contract could not be bound") from exc
-        model_broker = ModelBroker(
-            self.model_adapters,
-            cast(tuple[ModelSpec[Any, Any], ...], module.models),
-            meter=meter,
-            metadata=metadata,
-            audit=lambda event_type, payload: self.store.append_access_event(
-                claim.task.run_id,
-                event_type,
-                payload,
-                task_id=claim.task.task_id,
-                attempt_id=str(claim.attempt.attempt_id),
-            ),
-        )
-        context = ExecutionContext(
-            run_id=claim.task.run_id,
-            task_id=claim.task.task_id,
-            step_instance_id=claim.task.step_instance_id,
-            broker=broker,
-            models=model_broker,
-            metadata=metadata,
-        )
-        started = time.perf_counter()
-        try:
-
-            async def invoke() -> Any:
-                return (
-                    module._resolve_data(interaction_resolution)
-                    if isinstance(module, _InteractionModule) and interaction_resolution is not None
-                    else await module.execute(input_data, context)
-                )
-
-            if claim.task.budget.wall_time is None:
-                output = await invoke()
-            else:
-                try:
-                    async with asyncio.timeout(claim.task.budget.wall_time.total_seconds()):
-                        output = await invoke()
-                except TimeoutError:
-                    raise BudgetExceededError("wall_time budget was exceeded") from None
-            if not value_matches_type(output, module.output_type):
-                raise RuntimeContractError(
-                    f"module {key_for(claim).as_string()} returned a value outside "
-                    "its output contract"
-                )
-        except Exception as exc:
-            retry = (
-                not isinstance(exc, BudgetExceededError)
-                and claim.attempt.attempt_number < self.max_attempts
-                and (not isinstance(exc, AccessContractError) or exc.retryable)
-            )
-            self.fail(
-                envelope,
-                {"reason": str(exc), "exception_type": type(exc).__qualname__},
-                retry=retry,
-            )
-            raise
-        elapsed_ms = (time.perf_counter() - started) * 1000
-        output_value = self.store.values.encode(
-            output,
-            schema_digest=schema_digest(module.output_type),
-        )
-        usage_data = dict(metadata.get("usage", {}))
-        usage_data.setdefault("latency_ms", elapsed_ms)
-        effects = [_coerce_effect(item) for item in broker._boundary_effect_records()]
-        if module.effectful and not module.effects and not broker._effect_called:
-            effects.extend(
-                (
-                    EffectRecord(
-                        EffectKind.ATTEMPTED,
-                        claim.task.module_id,
-                        "execute",
-                        claim.task.input_value.digest,
-                    ),
-                    EffectRecord(
-                        EffectKind.COMMITTED,
-                        claim.task.module_id,
-                        "execute",
-                        claim.task.input_value.digest,
-                        output_value.digest,
-                    ),
-                )
-            )
-        now = datetime.now(UTC).isoformat()
-        boundary = BoundaryRecord(
-            workflow_id=self.workflow_id,
-            definition_digest=self.definition_digest,
-            module_id=claim.task.module_id,
-            logical_step=claim.task.logical_step,
-            step_instance_id=claim.task.step_instance_id,
-            module_digest=claim.task.module_digest,
-            dependency_instance_keys=claim.task.dependency_instance_keys,
-            input_value=claim.task.input_value,
-            output_value=output_value,
-            input_schema_digest=claim.task.input_value.schema_digest,
-            output_schema_digest=output_value.schema_digest,
-            accepted_attempt=AcceptedAttemptProvenance(
-                claim.attempt.attempt_id,
-                claim.attempt.attempt_number,
-                claim.worker_id,
-                claim.attempt.started_at.isoformat() if claim.attempt.started_at else now,
-                now,
-            ),
-            trajectories=tuple(
-                _coerce_trajectory(item) for item in metadata.get("trajectories", [])
-            ),
-            usage=Usage(**usage_data),
-            branch_decisions=branch_decisions,
-            map_decisions=map_decisions,
-            effects=tuple(effects),
-        )
-        return self.complete(envelope, boundary)
 
 
 class LocalExecutor:
@@ -980,11 +1084,6 @@ class LocalExecutor:
     async def execute(self, request: ExecutionRequest) -> bool:
         """Execute the exact requested task and report durable acceptance."""
         return await self.worker.run_request(request)
-
-
-def key_for(claim: ClaimedTask) -> ReplayKey:
-    """Return the exact replay key carried by a claimed task."""
-    return ReplayKey(claim.task.module_id, claim.task.logical_step)
 
 
 class WorkflowScheduler:

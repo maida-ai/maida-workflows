@@ -1,7 +1,7 @@
 """Run the generated-plan example through the real Celery adapter offline.
 
 The tiny eager task below stands in only for Celery's broker and worker pool.
-It JSON-round-trips the exact payload and invokes the same worker-side handler
+It JSON-round-trips the exact payload and invokes the same boundary handler
 an application registers as a Celery task; Maida's plan, trust checks, module
 execution, and durable history are all real.
 """
@@ -12,10 +12,15 @@ import json
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from maida.workflows import CeleryBackend, ExecutionRequest, RunResult, WorkflowRunner
+from maida.workflows import (
+    BoundaryHarness,
+    CeleryBackend,
+    ExecutionRequest,
+    RunResult,
+    WorkflowRunner,
+)
 from maida.workflows.ir import ReplayKey
 from maida.workflows.persistence import PostgresStore
-from maida.workflows.runtime import TaskWorker
 
 from . import generated_plan
 
@@ -61,7 +66,7 @@ async def run_example(
     """Execute one accepted generated plan through the Celery transport seam."""
     planner = type(generated_plan.planner)()
 
-    def worker_for(request: ExecutionRequest) -> TaskWorker:
+    def harness_for(request: ExecutionRequest) -> BoundaryHarness:
         history = store.load_run_history(request.run_id, tenant_id=request.tenant_id)
         task = next(task for task in history.tasks if task.task_id == request.task_id)
         module = (
@@ -69,7 +74,7 @@ async def run_example(
             if task.module_id == planner.module_id
             else generated_plan.registry.resolve_exact(task.module_id, task.module_digest)
         )
-        return TaskWorker(
+        return BoundaryHarness(
             store,
             workflow_id=request.workflow_id,
             definition_digest=request.definition_digest,
@@ -78,7 +83,7 @@ async def run_example(
             connectors=generated_plan.connectors,
         )
 
-    task = _EagerTask(CeleryBackend.task_handler(worker_for))
+    task = _EagerTask(CeleryBackend.task_handler(harness_for))
     return await WorkflowRunner(store, backend=CeleryBackend(task)).run_generated(
         planner,
         value,

@@ -16,7 +16,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import psycopg
 from psycopg.rows import dict_row
@@ -144,6 +144,18 @@ class ClaimedTask:
     attempt: Attempt
     worker_id: str
     lease_expires_at: datetime
+
+
+@dataclass(frozen=True)
+class ExternalExecution:
+    """Non-expiring boundary reservation owned by an external substrate."""
+
+    task: Task
+    attempt: Attempt
+    worker_id: str
+
+
+_BoundaryExecution = ClaimedTask | ExternalExecution
 
 
 def _migration_files(directory: Path | None = None) -> tuple[Path, ...]:
@@ -818,6 +830,117 @@ class PostgresStore:
             claim.lease_expires_at,
         )
 
+    def start_external_execution(
+        self,
+        task: Task,
+        *,
+        execution_id: str,
+        worker_id: str,
+    ) -> ExternalExecution | None:
+        """Reserve an externally delivered boundary without a task lease.
+
+        The stable ``execution_id`` is the non-expiring idempotency fence. The
+        external substrate owns delivery and retry policy, so this operation
+        neither leases the task nor changes it from ``READY`` while code runs.
+        ``None`` means the same logical task was accepted concurrently.
+        """
+        if len(execution_id) != 64 or any(
+            character not in "0123456789abcdef" for character in execution_id
+        ):
+            raise ValueError("execution_id must be a lowercase sha256 digest")
+        if not worker_id.strip():
+            raise ValueError("worker_id must be non-empty")
+        attempt_id = uuid5(NAMESPACE_URL, f"maida-boundary:{execution_id}")
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT t.*, r.status AS run_status
+                FROM workflow_tasks t
+                JOIN workflow_runs r ON r.run_id = t.run_id
+                WHERE t.task_id = %s
+                FOR UPDATE OF t
+                """,
+                (task.task_id,),
+            )
+            task_row = cursor.fetchone()
+            if task_row is None or str(task_row["run_id"]) != task.run_id:
+                raise InvalidRunStateError("external execution task was not found in its run")
+            cursor.execute(
+                "SELECT * FROM workflow_attempts WHERE execution_id = %s FOR UPDATE",
+                (execution_id,),
+            )
+            existing = cursor.fetchone()
+            if existing is not None and str(existing["task_id"]) != task.task_id:
+                raise PersistenceError("execution_id is already reserved for another task")
+            if task_row["status"] == TaskStatus.SUCCEEDED.value:
+                return None
+            if task_row["run_status"] != RunStatus.RUNNING.value:
+                raise InvalidRunStateError("external execution run is not active")
+            if task_row["status"] != TaskStatus.READY.value:
+                raise InvalidRunStateError("external execution task is not ready")
+            if (
+                task_row.get("lease_owner") is not None
+                or task_row.get("lease_token") is not None
+                or task_row.get("lease_expires_at") is not None
+            ):
+                raise InvalidRunStateError("external execution task unexpectedly has a lease")
+            if existing is None:
+                cursor.execute(
+                    "SELECT COALESCE(MAX(attempt_number), 0) + 1 AS number "
+                    "FROM workflow_attempts WHERE task_id = %s",
+                    (task.task_id,),
+                )
+                number_row = cursor.fetchone()
+                attempt_number = int(number_row["number"] if number_row else 1)
+                cursor.execute(
+                    """
+                    INSERT INTO workflow_attempts (
+                        attempt_id, task_id, attempt_number, lease_token, status,
+                        worker_id, claimed_at, started_at, execution_id
+                    ) VALUES (%s, %s, %s, NULL, 'RUNNING', %s, now(), now(), %s)
+                    RETURNING *
+                    """,
+                    (attempt_id, task.task_id, attempt_number, worker_id, execution_id),
+                )
+                existing = cursor.fetchone()
+                self._append_event(
+                    cursor,
+                    task.run_id,
+                    "BOUNDARY_EXECUTION_STARTED",
+                    {"execution_id": execution_id, "worker_id": worker_id},
+                    task_id=task.task_id,
+                    attempt_id=str(attempt_id),
+                )
+            elif existing["status"] == AttemptStatus.PARKED.value:
+                cursor.execute(
+                    """
+                    UPDATE workflow_attempts
+                    SET status = 'RUNNING', diagnostic = NULL,
+                        started_at = now(), completed_at = NULL
+                    WHERE attempt_id = %s
+                    RETURNING *
+                    """,
+                    (attempt_id,),
+                )
+                existing = cursor.fetchone()
+                self._append_event(
+                    cursor,
+                    task.run_id,
+                    "BOUNDARY_EXECUTION_RESUMED",
+                    {"execution_id": execution_id},
+                    task_id=task.task_id,
+                    attempt_id=str(attempt_id),
+                )
+            elif existing["status"] != AttemptStatus.RUNNING.value:
+                raise InvalidRunStateError("external execution reservation is not active")
+        if existing is None:  # pragma: no cover - INSERT/UPDATE always returns a row
+            raise PersistenceError("external execution reservation disappeared")
+        return ExternalExecution(
+            self._task_from_row(task_row),
+            self._attempt_from_row(existing),
+            str(existing["worker_id"]),
+        )
+
     def heartbeat_task(
         self,
         claim: ClaimedTask,
@@ -872,7 +995,7 @@ class PostgresStore:
 
     def _lookup_effect(
         self,
-        claim: ClaimedTask,
+        claim: _BoundaryExecution,
         *,
         effect_name: str,
         ordinal: int,
@@ -884,7 +1007,7 @@ class PostgresStore:
         result_schema_digest: str,
     ) -> _EffectOperation | None:
         with self.connect() as connection, connection.cursor() as cursor:
-            self._lock_effect_claim(cursor, claim)
+            self._lock_boundary_execution(cursor, claim)
             cursor.execute(
                 """
                 SELECT * FROM workflow_effect_operations
@@ -916,7 +1039,7 @@ class PostgresStore:
 
     def _reserve_effect(
         self,
-        claim: ClaimedTask,
+        claim: _BoundaryExecution,
         *,
         effect_name: str,
         ordinal: int,
@@ -936,7 +1059,7 @@ class PostgresStore:
             }
         )
         with self.connect() as connection, connection.cursor() as cursor:
-            self._lock_effect_claim(cursor, claim)
+            self._lock_boundary_execution(cursor, claim)
             cursor.execute(
                 """
                 SELECT COALESCE(MAX(reservation_order) + 1, 0) AS reservation_order
@@ -1004,7 +1127,7 @@ class PostgresStore:
 
     def _mark_effect_attempted(
         self,
-        claim: ClaimedTask,
+        claim: _BoundaryExecution,
         operation: _EffectOperation,
         *,
         policy_id: str,
@@ -1016,7 +1139,7 @@ class PostgresStore:
         if operation.task_id != claim.task.task_id:
             raise _EffectOperationConflict("effect operation belongs to a different task")
         with self.connect() as connection, connection.cursor() as cursor:
-            self._lock_effect_claim(cursor, claim)
+            self._lock_boundary_execution(cursor, claim)
             cursor.execute(
                 """
                 SELECT * FROM workflow_effect_operations
@@ -1080,7 +1203,7 @@ class PostgresStore:
     @staticmethod
     def _validate_effect_approval(
         cursor: psycopg.Cursor[Any],
-        claim: ClaimedTask,
+        claim: _BoundaryExecution,
         row: dict[str, Any],
         *,
         required: bool,
@@ -1171,7 +1294,7 @@ class PostgresStore:
 
     def _commit_effect(
         self,
-        claim: ClaimedTask,
+        claim: _BoundaryExecution,
         operation: _EffectOperation,
         result: StoredValue,
         *,
@@ -1180,7 +1303,7 @@ class PostgresStore:
         if operation.task_id != claim.task.task_id:
             raise _EffectOperationConflict("effect operation belongs to a different task")
         with self.connect() as connection, connection.cursor() as cursor:
-            self._lock_effect_claim(cursor, claim)
+            self._lock_boundary_execution(cursor, claim)
             cursor.execute(
                 """
                 SELECT * FROM workflow_effect_operations
@@ -1237,31 +1360,51 @@ class PostgresStore:
             return self._effect_operation_from_row(updated)
 
     @staticmethod
-    def _lock_effect_claim(cursor: psycopg.Cursor[Any], claim: ClaimedTask) -> None:
-        cursor.execute(
-            """
-            SELECT t.task_id FROM workflow_tasks t
-            JOIN workflow_attempts a ON a.task_id = t.task_id
-            JOIN workflow_runs r ON r.run_id = t.run_id
-            WHERE t.task_id = %s AND t.status = 'RUNNING'
-              AND t.lease_token = %s AND t.lease_expires_at > now()
-              AND a.attempt_id = %s AND a.status = 'RUNNING'
-              AND a.lease_token = %s AND r.status IN ('RUNNING', 'PAUSED')
-            FOR UPDATE OF t
-            """,
-            (
-                claim.task.task_id,
-                claim.attempt.lease_token,
-                claim.attempt.attempt_id,
-                claim.attempt.lease_token,
-            ),
-        )
+    def _lock_boundary_execution(cursor: psycopg.Cursor[Any], claim: _BoundaryExecution) -> None:
+        if claim.attempt.lease_token is None:
+            cursor.execute(
+                """
+                SELECT t.task_id FROM workflow_tasks t
+                JOIN workflow_attempts a ON a.task_id = t.task_id
+                JOIN workflow_runs r ON r.run_id = t.run_id
+                WHERE t.task_id = %s AND t.status = 'READY'
+                  AND t.lease_token IS NULL
+                  AND a.attempt_id = %s AND a.status = 'RUNNING'
+                  AND a.execution_id = %s
+                  AND r.status IN ('RUNNING', 'PAUSED')
+                FOR UPDATE OF t
+                """,
+                (
+                    claim.task.task_id,
+                    claim.attempt.attempt_id,
+                    claim.attempt.execution_id,
+                ),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT t.task_id FROM workflow_tasks t
+                JOIN workflow_attempts a ON a.task_id = t.task_id
+                JOIN workflow_runs r ON r.run_id = t.run_id
+                WHERE t.task_id = %s AND t.status = 'RUNNING'
+                  AND t.lease_token = %s AND t.lease_expires_at > now()
+                  AND a.attempt_id = %s AND a.status = 'RUNNING'
+                  AND a.lease_token = %s AND r.status IN ('RUNNING', 'PAUSED')
+                FOR UPDATE OF t
+                """,
+                (
+                    claim.task.task_id,
+                    claim.attempt.lease_token,
+                    claim.attempt.attempt_id,
+                    claim.attempt.lease_token,
+                ),
+            )
         if cursor.fetchone() is None:
-            raise StaleLeaseError(f"lease for task {claim.task.task_id} is stale")
+            raise StaleLeaseError(f"execution fence for task {claim.task.task_id} is stale")
 
     def _reserve_budget_usage(
         self,
-        claim: ClaimedTask,
+        claim: _BoundaryExecution,
         *,
         charge_key: str,
         kind: str,
@@ -1271,7 +1414,7 @@ class PostgresStore:
         if kind not in {"model", "tool"}:
             raise ValueError("budget charge kind must be model or tool")
         with self.connect() as connection, connection.cursor() as cursor:
-            self._lock_effect_claim(cursor, claim)
+            self._lock_boundary_execution(cursor, claim)
             cursor.execute(
                 """
                 SELECT * FROM workflow_budget_usage
@@ -1329,14 +1472,14 @@ class PostgresStore:
 
     def _commit_budget_usage(
         self,
-        claim: ClaimedTask,
+        claim: _BoundaryExecution,
         *,
         charge_key: str,
         usage: BudgetUsage,
     ) -> None:
         """Commit measured usage without permitting estimate overruns."""
         with self.connect() as connection, connection.cursor() as cursor:
-            self._lock_effect_claim(cursor, claim)
+            self._lock_boundary_execution(cursor, claim)
             cursor.execute(
                 """
                 SELECT * FROM workflow_budget_usage
@@ -1425,14 +1568,30 @@ class PostgresStore:
         )
 
     def complete_task(self, claim: ClaimedTask, boundary: BoundaryRecord) -> BoundaryRecord:
-        """Accept one logical task result using lease-token compare-and-swap.
+        """Accept one locally claimed result using lease-token compare-and-swap."""
+        return self._complete_boundary(claim, boundary)
+
+    def complete_external_execution(
+        self,
+        execution: ExternalExecution,
+        boundary: BoundaryRecord,
+    ) -> BoundaryRecord:
+        """Accept an external result using its non-expiring execution fence."""
+        return self._complete_boundary(execution, boundary)
+
+    def _complete_boundary(
+        self,
+        claim: _BoundaryExecution,
+        boundary: BoundaryRecord,
+    ) -> BoundaryRecord:
+        """Persist one authoritative boundary for either execution posture.
 
         Raises
         ------
         ValueError
             If boundary identity differs from the claimed task.
         StaleLeaseError
-            If another worker has already replaced or completed the lease.
+            If the execution no longer owns the accepted-result fence.
         PersistenceError
             If a broker-managed effect has not reached its durable committed
             state. The task and attempt are failed in the same transaction.
@@ -1466,18 +1625,39 @@ class PostgresStore:
         with self.connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT status, lease_token FROM workflow_tasks
+                SELECT status, lease_token, accepted_boundary FROM workflow_tasks
                 WHERE task_id = %s FOR UPDATE
                 """,
                 (task.task_id,),
             )
             task_row = cursor.fetchone()
+            external = claim.attempt.lease_token is None
+            if (
+                external
+                and task_row is not None
+                and task_row["status"] == TaskStatus.SUCCEEDED.value
+                and task_row.get("accepted_boundary") is not None
+            ):
+                return BoundaryRecord.from_data(task_row["accepted_boundary"])
             if (
                 task_row is None
-                or task_row["status"] != TaskStatus.RUNNING.value
-                or str(task_row["lease_token"]) != str(claim.attempt.lease_token)
+                or (
+                    external
+                    and (
+                        task_row["status"] != TaskStatus.READY.value
+                        or task_row["lease_token"] is not None
+                    )
+                )
+                or (
+                    not external
+                    and (
+                        task_row["status"] != TaskStatus.RUNNING.value
+                        or str(task_row["lease_token"]) != str(claim.attempt.lease_token)
+                    )
+                )
             ):
-                raise StaleLeaseError(f"lease for task {task.task_id} is stale")
+                raise StaleLeaseError(f"execution fence for task {task.task_id} is stale")
+            self._lock_boundary_execution(cursor, claim)
             cursor.execute(
                 """
                 SELECT * FROM workflow_effect_operations
@@ -1599,27 +1779,45 @@ class PostgresStore:
                     boundary_data = boundary.to_data()
                 self._register_value_artifact(cursor, boundary.input_value)
                 self._register_value_artifact(cursor, boundary.output_value)
-                cursor.execute(
-                    """
-                    UPDATE workflow_tasks
-                    SET status = 'SUCCEEDED', accepted_attempt_id = %s,
-                        accepted_boundary = %s, completed_at = %s,
-                        lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL
-                    WHERE task_id = %s AND status = 'RUNNING' AND lease_token = %s
-                    """,
-                    (
-                        claim.attempt.attempt_id,
-                        Jsonb(boundary_data),
-                        completed_at,
-                        task.task_id,
-                        claim.attempt.lease_token,
-                    ),
-                )
+                if external:
+                    cursor.execute(
+                        """
+                        UPDATE workflow_tasks
+                        SET status = 'SUCCEEDED', accepted_attempt_id = %s,
+                            accepted_boundary = %s, completed_at = %s
+                        WHERE task_id = %s AND status = 'READY'
+                          AND lease_token IS NULL
+                        """,
+                        (
+                            claim.attempt.attempt_id,
+                            Jsonb(boundary_data),
+                            completed_at,
+                            task.task_id,
+                        ),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE workflow_tasks
+                        SET status = 'SUCCEEDED', accepted_attempt_id = %s,
+                            accepted_boundary = %s, completed_at = %s,
+                            lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL
+                        WHERE task_id = %s AND status = 'RUNNING' AND lease_token = %s
+                        """,
+                        (
+                            claim.attempt.attempt_id,
+                            Jsonb(boundary_data),
+                            completed_at,
+                            task.task_id,
+                            claim.attempt.lease_token,
+                        ),
+                    )
                 if cursor.rowcount != 1:  # pragma: no cover - row is locked and validated
-                    raise StaleLeaseError(f"lease for task {task.task_id} is stale")
+                    raise StaleLeaseError(f"execution fence for task {task.task_id} is stale")
                 cursor.execute(
                     """
-                    UPDATE workflow_attempts SET status = 'SUCCEEDED', completed_at = %s
+                    UPDATE workflow_attempts
+                    SET status = 'SUCCEEDED', completed_at = %s, diagnostic = NULL
                     WHERE attempt_id = %s AND status = 'RUNNING'
                     """,
                     (completed_at, claim.attempt.attempt_id),
@@ -1637,6 +1835,37 @@ class PostgresStore:
         if uncommitted_budget:
             raise PersistenceError("task cannot complete with uncommitted live budget usage")
         return boundary
+
+    def record_external_failure(
+        self,
+        execution: ExternalExecution,
+        diagnostic: dict[str, Any],
+    ) -> None:
+        """Record a delivery failure without choosing retry or task readiness.
+
+        The external substrate decides whether and when to redeliver the same
+        ``execution_id``. The logical task therefore stays ``READY`` and the
+        non-expiring reservation stays active until a boundary is accepted.
+        """
+        with self.connect() as connection, connection.cursor() as cursor:
+            self._lock_boundary_execution(cursor, execution)
+            cursor.execute(
+                """
+                UPDATE workflow_attempts SET diagnostic = %s
+                WHERE attempt_id = %s AND status = 'RUNNING'
+                """,
+                (Jsonb(diagnostic), execution.attempt.attempt_id),
+            )
+            if cursor.rowcount != 1:
+                raise StaleLeaseError(f"execution fence for task {execution.task.task_id} is stale")
+            self._append_event(
+                cursor,
+                execution.task.run_id,
+                "BOUNDARY_EXECUTION_FAILED",
+                diagnostic,
+                task_id=execution.task.task_id,
+                attempt_id=execution.attempt.attempt_id,
+            )
 
     def fail_task(
         self,
@@ -1683,12 +1912,29 @@ class PostgresStore:
             )
 
     def park_task(self, claim: ClaimedTask, request: dict[str, Any]) -> None:
-        """Relinquish a running attempt while awaiting a durable command.
+        """Relinquish a local claim while awaiting a durable command."""
+        self._park_boundary(claim, request)
+
+    def park_external_execution(
+        self,
+        execution: ExternalExecution,
+        request: dict[str, Any],
+    ) -> None:
+        """Park an external boundary reservation without creating a lease."""
+        self._park_boundary(execution, request)
+
+    def _park_boundary(
+        self,
+        claim: _BoundaryExecution,
+        request: dict[str, Any],
+    ) -> None:
+        """Park either execution posture while awaiting a durable command.
 
         The request becomes an append-only event and the logical task enters a
         non-claimable state. No worker or Python stack remains allocated. A
         matching accepted userplane command later returns the task to
-        ``READY`` for a new physical attempt.
+        ``READY``; the local path creates a fresh attempt, while the external
+        path resumes its stable execution reservation.
 
         Raises
         ------
@@ -1719,24 +1965,45 @@ class PostgresStore:
             raise ValueError("signal interaction requires a signal_name")
         next_status, event_type = transitions[str(kind)]
         with self.connect() as connection, connection.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE workflow_tasks
-                SET status = %s, lease_owner = NULL, lease_token = NULL,
-                    lease_expires_at = NULL
-                WHERE task_id = %s AND status = 'RUNNING' AND lease_token = %s
-                """,
-                (next_status.value, claim.task.task_id, claim.attempt.lease_token),
-            )
+            external = claim.attempt.lease_token is None
+            self._lock_boundary_execution(cursor, claim)
+            if external:
+                cursor.execute(
+                    """
+                    UPDATE workflow_tasks SET status = %s
+                    WHERE task_id = %s AND status = 'READY' AND lease_token IS NULL
+                    """,
+                    (next_status.value, claim.task.task_id),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE workflow_tasks
+                    SET status = %s, lease_owner = NULL, lease_token = NULL,
+                        lease_expires_at = NULL
+                    WHERE task_id = %s AND status = 'RUNNING' AND lease_token = %s
+                    """,
+                    (next_status.value, claim.task.task_id, claim.attempt.lease_token),
+                )
             if cursor.rowcount != 1:
-                raise StaleLeaseError(f"lease for task {claim.task.task_id} is stale")
-            cursor.execute(
-                """
-                UPDATE workflow_attempts SET status = 'PARKED', completed_at = now()
-                WHERE attempt_id = %s AND status = 'RUNNING' AND lease_token = %s
-                """,
-                (claim.attempt.attempt_id, claim.attempt.lease_token),
-            )
+                raise StaleLeaseError(f"execution fence for task {claim.task.task_id} is stale")
+            if external:
+                cursor.execute(
+                    """
+                    UPDATE workflow_attempts SET status = 'PARKED', completed_at = now()
+                    WHERE attempt_id = %s AND status = 'RUNNING'
+                      AND lease_token IS NULL AND execution_id = %s
+                    """,
+                    (claim.attempt.attempt_id, claim.attempt.execution_id),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE workflow_attempts SET status = 'PARKED', completed_at = now()
+                    WHERE attempt_id = %s AND status = 'RUNNING' AND lease_token = %s
+                    """,
+                    (claim.attempt.attempt_id, claim.attempt.lease_token),
+                )
             if cursor.rowcount != 1:  # pragma: no cover - task CAS protects the paired attempt
                 raise StaleLeaseError(f"attempt {claim.attempt.attempt_id} cannot park")
             self._append_event(
@@ -1750,7 +2017,7 @@ class PostgresStore:
 
     def load_interaction_resolution(
         self,
-        claim: ClaimedTask,
+        claim: _BoundaryExecution,
         *,
         request_id: str,
         kind: str,
@@ -2379,7 +2646,7 @@ class PostgresStore:
             attempt_id=str(row["attempt_id"]),
             task_id=str(row["task_id"]),
             attempt_number=row["attempt_number"],
-            lease_token=str(row["lease_token"]),
+            lease_token=str(row["lease_token"]) if row.get("lease_token") else None,
             status=AttemptStatus(row["status"]),
             checkpoint=StoredValue.from_data(row["checkpoint_ref"])
             if row.get("checkpoint_ref")
@@ -2388,6 +2655,7 @@ class PostgresStore:
             claimed_at=row.get("claimed_at"),
             started_at=row["started_at"],
             completed_at=row["completed_at"],
+            execution_id=str(row["execution_id"]) if row.get("execution_id") else None,
         )
 
     @staticmethod

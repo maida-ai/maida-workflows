@@ -106,6 +106,7 @@ from .replay import (
     ReplayResult,
 )
 from .runtime import (
+    BoundaryHarness,
     ExecutionBackend,
     ExecutionRequest,
     LocalExecutor,
@@ -147,6 +148,7 @@ __all__ = [
     "BindingIR",
     "BoundModuleCall",
     "BoundWorkflow",
+    "BoundaryHarness",
     "BoundaryRecord",
     "Budget",
     "BudgetExceededError",

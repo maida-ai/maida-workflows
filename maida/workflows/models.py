@@ -54,7 +54,7 @@ class TaskStatus(StrEnum):
 
 
 class AttemptStatus(StrEnum):
-    """Outcome or current state of one leased task attempt."""
+    """Outcome or current state of one task-boundary execution."""
 
     CLAIMED = "CLAIMED"
     RUNNING = "RUNNING"
@@ -749,18 +749,19 @@ class Task:
 
 @dataclass(frozen=True)
 class Attempt:
-    """One leased execution attempt for a durable task."""
+    """One durable execution reservation for a task boundary."""
 
     attempt_id: str
     task_id: str
     attempt_number: int
-    lease_token: str
+    lease_token: str | None
     status: AttemptStatus
     checkpoint: StoredValue | None = None
     diagnostic: dict[str, Any] | None = None
     claimed_at: datetime | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    execution_id: str | None = None
 
 
 @dataclass(frozen=True)
