@@ -1,7 +1,7 @@
-"""Graduated, deterministic examples for composing Maida Workflows.
+"""Deterministic examples of plans and the boundaries that make them reliable.
 
-The modules progress from a single typed boundary through sequential,
-branching, parallel, mapped, nested, and replay-addressable composition. Each
-exports ``workflow``, ``EXAMPLE_INPUT``, and ``EXPECTED_OUTPUT`` for direct CLI
-use and executable documentation tests.
+The generated-plan example comes first. The remaining modules each demonstrate
+one distinct reliability boundary: serialization, durable approval, or an
+external flow reached through a deployment-owned adapter. Documentation tests
+execute every module offline.
 """

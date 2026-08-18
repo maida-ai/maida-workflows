@@ -1,11 +1,11 @@
 # Maida Workflows
 
-Maida Workflows is the optional generated-plan backend for Maida, the
-behavioral regression gate for AI agents. It turns runtime planner output into
-a canonical plan, validates it against application-owned module contracts and
-the core Maida policy before execution, and proves what actually ran. Static
-workflow authoring remains a convenience path onto the same durable module
-machinery.
+Maida Workflows makes runtime-generated plans verifiable before they run. It
+resolves minimal planner output against application-owned module contracts,
+checks the resulting plan with the core Maida policy, and records evidence at
+typed module boundaries so the reliability contract survives distribution onto
+someone else's execution substrate. The bundled runner is the offline,
+standalone reference path; it is not a hosted scheduler or control plane.
 
 See the pre-execution gate refuse a simulated generated plan in one local,
 credential-free command:
@@ -14,53 +14,28 @@ credential-free command:
 maida demo --plan
 ```
 
-The package supports:
+The generated plan becomes the run's root definition. Planner bytes can choose
+only topology and allowlisted aliases; trusted code supplies identities,
+schemas, grants, budgets, limits, and execution requirements. An accepted plan
+runs through durable workers, while an untrusted or policy-breaking plan fails
+closed before generated child insertion.
 
-- typed modules, branches, stable-key maps, parallel joins, and nested workflows;
-- portable data-authored specs, explainable diagnostics, and safe workflow bundles;
-- durable approval, typed input, and external-signal boundaries;
-- durable PostgreSQL scheduling, tasks, attempts, events, definitions, and leases;
-- process, container, VM, and microVM execution requirements with executor matching;
-- content-addressed artifacts and replay-complete accepted boundary records;
-- structural diff, zero-live-call full-stub replay, and isolated selective replay;
-- allowlisted generated DAG materialization and replay;
-- provider-neutral external-flow, connector, trigger, and import contracts;
-- install as the `maida.workflows` namespace subpackage (`from maida import workflows`).
+Python 3.12 and 3.13 are supported. Install the package as the
+`maida.workflows` namespace subpackage (`from maida import workflows`).
 
-Python 3.12 and 3.13 are supported.
+## Run the real path
 
-## Quick start
+The command above is the shortest gate demonstration. To execute accepted
+input-dependent plans locally, start with
+[`examples/workflow_creation/generated_plan.py`](examples/workflow_creation/generated_plan.py)
+and its [copy-pasteable PostgreSQL setup](examples/workflow_creation/README.md#run-the-examples-locally).
+The same guide covers the three other shipped examples: canonical serialized
+plan data, durable approval, and an external trust boundary. Every one is
+executed offline by the test suite.
 
-```python
-from maida.workflows import ExecutionContext, Module, Workflow, compile_workflow
-
-
-class Upper(Module[str, str]):
-    input_type = str
-    output_type = str
-
-    async def execute(self, value: str, ctx: ExecutionContext) -> str:
-        return value.upper()
-
-
-class Greeting(Workflow[str, str]):
-    workflow_id = "greeting"
-    input_type = str
-    output_type = str
-    upper = Upper()
-
-    def build(self, value):
-        return self.upper(value)
-
-
-plan = compile_workflow(Greeting())
-print(plan.canonical_json())
-```
-
-For a PyTorch-style progression from one module through sequential, branching,
-parallel, keyed-map, nested, data-authored, serialized, interactive, generated,
-external, and replay-ready composition styles, see the
-[workflow creation examples](examples/workflow_creation/README.md).
+Static `Workflow.build()` authoring remains a convenience for application-owned
+graphs. The generated-plan path is the primary example because runtime plans
+are the gap this package closes.
 
 Use `maida-workflows --help` for compile, database, fixture, diff, replay, and
 verification commands. Fixture export is explicit and writes private local

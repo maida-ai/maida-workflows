@@ -1,8 +1,8 @@
 """Compose a durable approval as an ordinary typed graph boundary.
 
 The approval task relinquishes its worker while it waits. An application sends
-an ``ApproveCommand`` or ``RejectCommand`` later, and an unrelated worker
-reclaims the task. The explicit ``when`` keeps both outcomes visible before the
+an ``ApproveCommand`` or ``RejectCommand`` later, and any compatible worker can
+reclaim the task. The explicit ``when`` keeps both outcomes visible before the
 workflow runs.
 """
 
@@ -11,12 +11,20 @@ from __future__ import annotations
 from maida.workflows import (
     Approval,
     ApprovalDecision,
+    ApproveCommand,
     ExecutionContext,
     Module,
+    RunResult,
+    RunStatus,
     RuntimeValue,
+    TaskWorker,
     Workflow,
+    WorkflowRun,
+    WorkflowScheduler,
+    bind_workflow,
     when,
 )
+from maida.workflows.persistence import PostgresStore
 
 
 class _Prepare(Module[str, dict[str, str]]):
@@ -72,3 +80,48 @@ class ReviewChange(Workflow[str, str]):
 
 workflow = ReviewChange()
 EXAMPLE_INPUT = "rotate the signing key"
+EXPECTED_OUTPUT = "approved by example-approval"
+
+
+async def run_example(
+    store: PostgresStore,
+    value: str = EXAMPLE_INPUT,
+) -> RunResult:
+    """Execute the workflow and supply one deterministic durable approval."""
+    bound = bind_workflow(workflow)
+    scheduler = WorkflowScheduler.submit(store, bound, value)
+    worker = TaskWorker(
+        store,
+        workflow_id=bound.plan.workflow_id,
+        definition_digest=bound.plan.digest,
+        modules=bound.modules,
+        worker_id="approval-example-worker",
+    )
+    approval_sent = False
+
+    for _step in range(20):
+        progress = scheduler.advance()
+        if progress.status is RunStatus.SUCCEEDED:
+            return RunResult(scheduler.run_id, progress.output, bound.plan.digest)
+        if progress.status is RunStatus.FAILED:
+            raise RuntimeError("approval example failed")
+
+        boundary = await worker.run_once()
+        if boundary is not None or approval_sent:
+            continue
+        history = store.load_run_history(scheduler.run_id, tenant_id="local")
+        request = next(
+            (event for event in history.events if event.event_type == "APPROVAL_REQUIRED"),
+            None,
+        )
+        if request is None:
+            continue
+        WorkflowRun(store, scheduler.run_id).send(
+            ApproveCommand(
+                request_id=str(request.payload["request_id"]),
+                command_id="example-approval",
+            )
+        )
+        approval_sent = True
+
+    raise RuntimeError("approval example did not complete")

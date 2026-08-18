@@ -18,10 +18,13 @@ from maida.workflows import (
     ModuleRegistry,
     ModuleTemplate,
     NodeSpec,
+    RunResult,
     WorkflowBundle,
+    WorkflowRunner,
     WorkflowSpec,
 )
 from maida.workflows._canonical import type_schema
+from maida.workflows.persistence import PostgresStore
 
 
 class _Title(Module[str, str]):
@@ -89,3 +92,11 @@ def save_and_restore(path: Path) -> WorkflowBundle:
     restored = WorkflowBundle.load(path)
     restored.bind(module_registry=registry)
     return restored
+
+
+async def run_example(
+    store: PostgresStore,
+    value: str = EXAMPLE_INPUT,
+) -> RunResult:
+    """Execute the registry-bound plan through the ordinary durable runner."""
+    return await WorkflowRunner(store).run(workflow, value)

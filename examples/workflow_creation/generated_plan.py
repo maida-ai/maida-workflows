@@ -1,4 +1,4 @@
-"""Generate and execute an input-dependent root plan with no network access.
+"""Generate, verify, and execute an input-dependent plan with no network access.
 
 The planner emits only node keys, allowlisted aliases, dependencies, and one
 output. A trusted ``PlanBoundary`` supplies every module identity, schema,
@@ -191,6 +191,8 @@ class _LocalAdapter:
 
 planner = _Planner()
 connectors = ConnectorRegistry((_LocalAdapter(),))
+BRIEF_INPUT = "brief request"
+BRIEF_EXPECTED_OUTPUT = "draft:BRIEF REQUEST"
 EXAMPLE_INPUT = "thorough request"
 EXPECTED_OUTPUT = "delivered:draft:THOROUGH REQUEST | context:thorough request"
 

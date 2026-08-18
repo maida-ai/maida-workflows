@@ -8,7 +8,17 @@ account, or credential is stored in this workflow.
 
 from __future__ import annotations
 
-from maida.workflows import ExternalWorkflow, RuntimeValue, Workflow
+from typing import Any
+
+from maida.workflows import (
+    ConnectorRegistry,
+    ExternalWorkflow,
+    RunResult,
+    RuntimeValue,
+    Workflow,
+    WorkflowRunner,
+)
+from maida.workflows.persistence import PostgresStore
 
 
 class SendWelcome(Workflow[dict[str, str], dict[str, str]]):
@@ -27,7 +37,6 @@ class SendWelcome(Workflow[dict[str, str], dict[str, str]]):
             input_type=dict[str, str],
             output_type=dict[str, str],
             effectful=True,
-            approval_required=True,
             policy_tags=("customer-communication",),
         )
 
@@ -38,3 +47,36 @@ class SendWelcome(Workflow[dict[str, str], dict[str, str]]):
 
 workflow = SendWelcome()
 EXAMPLE_INPUT = {"email": "ada@example.com", "name": "Ada"}
+EXPECTED_OUTPUT = {"email": "ada@example.com", "name": "Ada", "status": "sent"}
+
+
+class _LocalAdapter:
+    connector = "customer-messaging"
+    connector_version = "workflow-2026-08"
+    operations: frozenset[str] = frozenset()
+    effect_operations = frozenset({"send-welcome"})
+    idempotent_effects = frozenset({"send-welcome"})
+
+    async def read(self, operation: str, request: Any) -> Any:
+        raise AssertionError("the welcome flow is effect-only")
+
+    async def effect(
+        self,
+        operation: str,
+        request: dict[str, str],
+        *,
+        idempotency_key: str,
+    ) -> dict[str, str]:
+        return {**request, "status": "sent"}
+
+
+connectors = ConnectorRegistry((_LocalAdapter(),))
+
+
+async def run_example(
+    store: PostgresStore,
+    value: dict[str, str] | None = None,
+) -> RunResult:
+    """Execute the boundary through a deterministic deployment-owned adapter."""
+    request = EXAMPLE_INPUT if value is None else value
+    return await WorkflowRunner(store, connectors=connectors).run(workflow, request)

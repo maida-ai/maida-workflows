@@ -35,17 +35,10 @@ PUBLIC_MODULES = (
     "examples.native_replay_demo",
     "examples.userplane_quickstart",
     "examples.workflow_creation",
-    "examples.workflow_creation.easy_first_workflow",
-    "examples.workflow_creation.easy_sequential",
-    "examples.workflow_creation.intermediate_branching",
-    "examples.workflow_creation.intermediate_parallel",
-    "examples.workflow_creation.advanced_stable_map",
-    "examples.workflow_creation.advanced_nested",
-    "examples.workflow_creation.advanced_portable_workflow",
-    "examples.workflow_creation.advanced_interactive",
-    "examples.workflow_creation.expert_replay_ready",
-    "examples.workflow_creation.expert_generated_workflow",
-    "examples.workflow_creation.expert_external_workflow",
+    "examples.workflow_creation.approval_boundary",
+    "examples.workflow_creation.external_boundary",
+    "examples.workflow_creation.generated_plan",
+    "examples.workflow_creation.serialized_plan",
 )
 
 

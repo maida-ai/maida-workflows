@@ -82,9 +82,9 @@ async def test_cli_exports_replays_diffs_and_baselines_native_history(
         [
             "submit",
             "--workflow",
-            "examples.workflow_creation.easy_first_workflow:workflow",
+            "examples.adversarial_workflows:AdversarialBranchWorkflow",
             "--input",
-            '"Ada"',
+            '{"escalated":true}',
             *common,
         ],
     )
@@ -97,7 +97,7 @@ async def test_cli_exports_replays_diffs_and_baselines_native_history(
             "schedule",
             submitted_data["run_id"],
             "--workflow",
-            "examples.workflow_creation.easy_first_workflow:workflow",
+            "examples.adversarial_workflows:AdversarialBranchWorkflow",
             *common,
         ],
     )
