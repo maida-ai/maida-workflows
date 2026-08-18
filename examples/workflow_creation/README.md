@@ -83,6 +83,7 @@ Then pass a store to the example you want to run:
 
 ```python
 import asyncio
+import json
 import os
 from pathlib import Path
 
@@ -97,17 +98,33 @@ async def main() -> None:
         ValueCodec(ArtifactStore(Path("/tmp/maida-workflows-example-artifacts"))),
     )
     result = await run_example(store, "thorough request")
-    print(result.output)
+    history = store.load_run_history(result.run_id, tenant_id="local")
+    proof = next(event for event in history.events if event.event_type == "PLAN_EXECUTION_VERIFIED")
+    print(f"output={result.output}")
+    print(f"status={history.run.status.value}")
+    print(f"plan_proof={proof.event_type} {json.dumps(proof.payload, sort_keys=True)}")
+    print(
+        "accepted_boundary_instances="
+        + ",".join(boundary.instance_key for boundary in history.accepted_boundaries)
+    )
 
 
 asyncio.run(main())
 ```
 
-The output is deterministic:
+The output shows the result, terminal status, post-execution plan proof, and
+the exact module-boundary instances whose typed results were accepted:
 
 ```text
-delivered:draft:THOROUGH REQUEST | context:thorough request
+output=delivered:draft:THOROUGH REQUEST | context:thorough request
+status=SUCCEEDED
+plan_proof=PLAN_EXECUTION_VERIFIED {"artifact_id": "...", "region_instance_id": "request-plan-root"}
+accepted_boundary_instances=demo.planner@bootstrap/planner#...,demo.normalize@dynamic/request-plan/nodes/normalize#...,...
 ```
+
+The abbreviated values above keep the guide readable; the command prints the
+real content-addressed artifact ID and every accepted boundary instance. A
+successful return without `PLAN_EXECUTION_VERIFIED` is not verified execution.
 
 Change the import to `celery_backend`, `serialized_plan`, `approval_boundary`,
 or `external_boundary` to execute the other examples with the same store.

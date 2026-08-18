@@ -105,9 +105,11 @@ The command above is the shortest gate demonstration. To execute accepted
 input-dependent plans locally, start with
 [`examples/workflow_creation/generated_plan.py`](examples/workflow_creation/generated_plan.py)
 and its [copy-pasteable PostgreSQL setup](examples/workflow_creation/README.md#run-the-examples-locally).
-The same guide covers the four other shipped examples: Celery-backed dispatch,
-canonical serialized plan data, durable approval, and an external trust
-boundary. Every one is executed offline by the test suite.
+That setup also prints the durable `PLAN_EXECUTION_VERIFIED` event and the
+accepted typed-boundary instances, so post-execution proof does not require
+source reading. The same guide covers the four other shipped examples:
+Celery-backed dispatch, canonical serialized plan data, durable approval, and
+an external trust boundary. Every one is executed offline by the test suite.
 
 Static `Workflow.build()` authoring remains a convenience for application-owned
 graphs. The generated-plan path is the primary example because runtime plans

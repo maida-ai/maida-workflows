@@ -313,7 +313,7 @@ wheels = [
 
 [[package]]
 name = "maida-ai"
-version = "0.5.2"
+version = "0.5.2.post1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "fastapi" },
@@ -325,9 +325,9 @@ dependencies = [
     { name = "typer" },
     { name = "uvicorn" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/42/49/6f8b7967668af92d66484429e75ed0983a836c965a3fc62724ed7bda8fcd/maida_ai-0.5.2.tar.gz", hash = "sha256:dc45eda1e4673a3e9fd09e30fd7f021961b9dccefdcbc2b8f9ae056bbdf97d4e", size = 9151161, upload-time = "2026-08-17T06:57:37.711Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/46/ef/a01d1e81db8dcc6350edabf0a87602322a237d0f78f05bf10e143f79a96c/maida_ai-0.5.2.post1.tar.gz", hash = "sha256:ee48a2b12b48d88f1cb6f04dff7a481aa33222fca76e40cca0a734b68f4506bb", size = 9153649, upload-time = "2026-08-17T19:13:05.756Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e6/60/a16da5db8ef9a5edf0b1fbed547c72a0ae4e4189e014b02b777536b9a66a/maida_ai-0.5.2-py3-none-any.whl", hash = "sha256:3c5ad694e445880ba100def964a01fbace56c616923bc27499728e657ab25630", size = 203283, upload-time = "2026-08-17T06:57:35.688Z" },
+    { url = "https://files.pythonhosted.org/packages/d6/92/22b78372e158b2c205a9523c0b96ad6d630719e869f9faf42f1ccadecf0b/maida_ai-0.5.2.post1-py3-none-any.whl", hash = "sha256:7b6bd5cbb4000e422838fbeaac6def29b249b1247cb1b6b610d4ac49d67dd40a", size = 204625, upload-time = "2026-08-17T19:13:04.002Z" },
 ]
 
 [[package]]
@@ -352,7 +352,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "maida-ai", specifier = ">=0.5.2" },
+    { name = "maida-ai", specifier = ">=0.5.2.post1" },
     { name = "opentelemetry-api", specifier = ">=1.42" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<4" },
     { name = "typer", specifier = ">=0.26,<0.27" },

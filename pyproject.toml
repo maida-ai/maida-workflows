@@ -7,7 +7,7 @@ requires-python = ">=3.12,<3.14"
 license = "Apache-2.0"
 authors = [{ name = "Maida.AI" }]
 dependencies = [
-    "maida-ai>=0.5.2",
+    "maida-ai>=0.5.2.post1",
     "opentelemetry-api>=1.42",
     "psycopg[binary]>=3.2,<4",
     "typer>=0.26,<0.27",
