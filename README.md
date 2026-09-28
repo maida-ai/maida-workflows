@@ -1,5 +1,14 @@
 # Maida Workflows
 
+## Start with the released Maida gate
+
+```bash
+uv tool install "maida-ai==0.5.3"
+maida demo --regression
+```
+
+Expect a deliberate FAIL and PR-comment preview. First-time users should follow the [coding-agent walkthrough](https://maida.ai/docs/getting-started/) to capture one task, review a few checks, and prove pass/fail/repair. This repository is an additional integration or development surface; it is not required for that first gate. Runnable examples and demos live in [maida-tutorials](https://github.com/maida-ai/maida-tutorials).
+
 Maida Workflows makes runtime-generated plans verifiable before they run. It
 resolves minimal planner output against application-owned module contracts,
 checks the resulting plan with the core Maida policy, and records evidence at
