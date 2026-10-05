@@ -10,7 +10,7 @@ It is the optional generated-plan backend for the `maida` product.
 
 ```bash
 uv tool install --force --python 3.12 \
-  --with "maida-workflows>=0.1.0" "maida-ai>=0.5.2.post1"
+  --with "maida-workflows>=0.1.0" "maida-ai>=0.6.0"
 
 maida demo --plan
 ```
@@ -73,6 +73,6 @@ compute placement belong to whichever runtime you already operate.
 
 - Python 3.12 or 3.13
 - PostgreSQL for durable runs (the repository ships a Compose service)
-- `maida-ai>=0.5.2.post1`
+- `maida-ai>=0.6.0`
 
 Installs as the `maida.workflows` namespace subpackage: `from maida import workflows`.

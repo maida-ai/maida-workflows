@@ -3,7 +3,7 @@
 ## Start with the released Maida gate
 
 ```bash
-uv tool install "maida-ai==0.5.3"
+uv tool install "maida-ai==0.6.0"
 maida demo --regression
 ```
 
@@ -31,6 +31,10 @@ closed before generated child insertion.
 
 Python 3.12 and 3.13 are supported. Install the package as the
 `maida.workflows` namespace subpackage (`from maida import workflows`).
+
+## Versioning
+
+This package uses the Maida engine's tested `MAJOR.MINOR` compatibility line and its own `PATCH` number. Immutable full `vMAJOR.MINOR.PATCH` Git tags supply the Python package version through `uv-dynamic-versioning`; do not edit the generated version by hand. State and test the supported core package and plan-contract versions before adopting a new engine line. Historical tags remain unchanged; do not publish an empty release solely to match the engine. See the [Maida versioning policy](https://github.com/maida-ai/maida/blob/main/CONTRIBUTING.md#versioning-and-compatibility).
 
 ## Execution backends: bring your own engine
 

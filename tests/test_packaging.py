@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tomllib
 from pathlib import Path
 
@@ -14,5 +15,7 @@ def test_core_dependency_floor_requires_plan_demo_release() -> None:
     requirements = [Requirement(value) for value in project["dependencies"]]
     core = next(requirement for requirement in requirements if requirement.name == "maida-ai")
 
-    assert Version("0.5.2") not in core.specifier
-    assert Version("0.5.2.post1") in core.specifier
+    contract = json.loads((Path(__file__).parent / "contracts/current-main.json").read_text())
+    release = Version(contract["engine_ref"].removeprefix("v"))
+    assert release in core.specifier
+    assert Version("0.5.3") not in core.specifier
