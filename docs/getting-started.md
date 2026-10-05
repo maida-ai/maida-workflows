@@ -8,7 +8,7 @@ Requires Python 3.12 or 3.13.
 
 ```bash
 uv tool install --force --python 3.12 \
-  --with "maida-workflows>=0.1.0" "maida-ai>=0.5.2.post1"
+  --with "maida-workflows>=0.1.0" "maida-ai>=0.6.0"
 ```
 
 **As a dependency:**
@@ -17,9 +17,7 @@ uv tool install --force --python 3.12 \
 uv add "maida-workflows>=0.1.0"
 ```
 
-The `maida-ai>=0.5.2.post1` pin is exact on purpose. Version `0.5.2` exists on
-PyPI but its `maida` command has no `--plan`, and under PEP 440 a `>0.5.2`
-specifier would exclude the post-release that does.
+The `maida-ai>=0.6.0` requirement selects the released plan contract and CLI. Keep the core package and this extension in the same environment.
 
 Installs as the `maida.workflows` namespace subpackage: `from maida import workflows`.
 
